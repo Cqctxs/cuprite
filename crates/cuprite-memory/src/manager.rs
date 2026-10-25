@@ -1,5 +1,5 @@
 use crate::{
-    backend::MemoryBackend,
+    backend::{DefaultBackend, MemoryBackend},
     session::{Resources, Session},
     validate_len, MemoryConfig, MemoryError, ResidentSlice,
 };
@@ -14,41 +14,44 @@ pub struct MemoryStats {
     pub downloaded_bytes: u64,
 }
 
-/// Public entry point. Not yet connected to a backend, so it cannot open a
-/// working GPU session; `Manager<B>` below holds the implemented logic.
-#[derive(Debug)]
-#[allow(dead_code)]
+/// Public entry point: a [`Manager`] over the CUDA backend.
 pub struct GpuMemory {
-    pub(crate) config: MemoryConfig,
-    pub(crate) stats: MemoryStats,
-    pub(crate) active: bool,
-    pub(crate) poisoned: bool,
+    inner: Manager<DefaultBackend>,
 }
 
 impl GpuMemory {
-    pub fn open(_config: MemoryConfig) -> Result<Self, MemoryError> {
+    /// Open the configured CUDA device.
+    ///
+    /// # Errors
+    /// Returns [`MemoryError::Unavailable`] when built without the `cuda`
+    /// feature, or when no usable CUDA driver or device is found.
+    pub fn open(config: MemoryConfig) -> Result<Self, MemoryError> {
         #[cfg(not(feature = "cuda"))]
         {
+            let _ = config;
             Err(MemoryError::Unavailable(
                 "build with --features cuda to enable the CUDA backend".into(),
             ))
         }
         #[cfg(feature = "cuda")]
         {
-            Err(MemoryError::NotImplemented("GpuMemory::open"))
+            let backend = crate::cuda::CudaBackend::open(config)?;
+            Ok(Self {
+                inner: Manager::new(backend, config),
+            })
         }
     }
 
     /// Borrow both the manager and original slice for the session's lifetime.
     pub fn begin_mut<'a>(
         &'a mut self,
-        _host: &'a mut [u32],
+        host: &'a mut [u32],
     ) -> Result<ResidentSlice<'a>, MemoryError> {
-        Err(MemoryError::NotImplemented("GpuMemory::begin_mut"))
+        self.inner.begin_mut(host).map(ResidentSlice::new)
     }
 
     pub fn stats(&self) -> MemoryStats {
-        self.stats
+        self.inner.stats()
     }
 
     pub fn trim(&mut self) -> Result<(), MemoryError> {
@@ -59,20 +62,24 @@ impl GpuMemory {
 /// The memory manager: owns the backend and enforces the session rules.
 ///
 /// `B` is the backend type, so the same logic runs on any backend: tests use
-/// `Manager<FakeBackend>`, and the real GPU will use a CUDA backend.
-#[allow(dead_code)] // Only tests use this until `GpuMemory` is connected.
+/// `Manager<FakeBackend>`, and the real GPU uses `CudaBackend`.
 pub(crate) struct Manager<B: MemoryBackend> {
     pub(crate) backend: B,
     pub(crate) config: MemoryConfig,
     pub(crate) stats: MemoryStats,
-    /// Reserved for tracking an open session; not used yet.
+    /// Set while a nonempty session exists. Still being set when the next
+    /// session begins means the last one was forgotten without cleanup.
     pub(crate) active: bool,
-    /// Reserved for refusing work after an unrecoverable failure; not used yet.
+    /// Once set, every new session is refused with `Poisoned`.
     pub(crate) poisoned: bool,
+    /// Resources whose completion could not be established. They are never
+    /// freed or reused; dropping the manager leaks them deliberately.
+    pub(crate) quarantined: Option<Resources<B::Buffer>>,
 }
 
-#[allow(dead_code)] // Only tests use this until `GpuMemory` is connected.
 impl<B: MemoryBackend> Manager<B> {
+    // Only the CUDA build and tests construct a manager.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn new(backend: B, config: MemoryConfig) -> Self {
         Self {
             backend,
@@ -80,6 +87,7 @@ impl<B: MemoryBackend> Manager<B> {
             stats: MemoryStats::default(),
             active: false,
             poisoned: false,
+            quarantined: None,
         }
     }
 
@@ -90,11 +98,20 @@ impl<B: MemoryBackend> Manager<B> {
     /// anything is allocated, `host` is copied into session-owned staging,
     /// and the device buffer is filled from staging, never from `host`.
     ///
-    /// Errors return early with `?`; cleanup on those paths is not handled yet.
+    /// A failure after the upload is issued releases the session's storage
+    /// only once completion is established; otherwise it is quarantined.
     pub(crate) fn begin_mut<'a>(
         &'a mut self,
         host: &'a mut [u32],
     ) -> Result<Session<'a, B>, MemoryError> {
+        if self.active {
+            // The previous session was forgotten, so its cleanup never ran.
+            self.poisoned = true;
+        }
+        if self.poisoned {
+            return Err(MemoryError::Poisoned);
+        }
+
         if host.is_empty() {
             return Ok(Session {
                 // `self` is already `&'a mut Manager<B>`: the session takes
@@ -119,11 +136,22 @@ impl<B: MemoryBackend> Manager<B> {
             .map_err(|error| MemoryError::HostAllocation(error.to_string()))?;
         staging.extend_from_slice(host);
 
-        let mut device = self.backend.allocate(host.len())?;
+        let device = self.backend.allocate(host.len())?;
         self.stats.device_allocations += 1;
+        let mut resources = Resources { staging, device };
 
-        self.backend.upload(&mut device, &staging)?;
-        self.backend.synchronize()?;
+        // Set before any transfer so a forgotten session is detected.
+        self.active = true;
+        let uploaded = self
+            .backend
+            .upload(&mut resources.device, &resources.staging)
+            .and_then(|()| self.backend.synchronize());
+        if let Err(error) = uploaded {
+            // The upload may still be reading staging.
+            self.release(resources, true);
+            self.active = false;
+            return Err(error);
+        }
         // Count the upload only once completion is confirmed.
         self.stats.uploads += 1;
         self.stats.uploaded_bytes += bytes as u64; // `usize` to `u64`: never implicit in Rust.
@@ -131,12 +159,40 @@ impl<B: MemoryBackend> Manager<B> {
         Ok(Session {
             manager: self,
             host,
-            resources: Some(Resources { staging, device }),
+            resources: Some(resources),
             may_have_writes: false,
         })
     }
 
     pub(crate) fn stats(&self) -> MemoryStats {
         self.stats
+    }
+
+    /// Free a session's storage once no queued work can still use it.
+    ///
+    /// `pending` means work may have been queued since the last completed
+    /// synchronize. If completion then cannot be established, the storage is
+    /// quarantined and the manager is poisoned.
+    pub(crate) fn release(&mut self, resources: Resources<B::Buffer>, pending: bool) {
+        if pending && self.backend.synchronize().is_err() {
+            self.poisoned = true;
+            if self.quarantined.is_none() {
+                self.quarantined = Some(resources);
+            } else {
+                // Unreachable while poisoning refuses new sessions; leak
+                // rather than free storage that may still be in use.
+                std::mem::forget(resources);
+            }
+        }
+    }
+}
+
+impl<B: MemoryBackend> Drop for Manager<B> {
+    fn drop(&mut self) {
+        // Completion was never established, so freeing could release storage
+        // the GPU still uses. Leaking is bounded to one bundle per manager.
+        if let Some(resources) = self.quarantined.take() {
+            std::mem::forget(resources);
+        }
     }
 }

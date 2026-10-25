@@ -3,7 +3,7 @@ name = "cuprite-memory"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
-description = "Learning scaffold for scoped CPU/GPU memory ownership"
+description = "Scoped CPU/GPU memory ownership for Cuprite"
 
 [features]
 default = []

@@ -1,12 +1,13 @@
 //! Scoped GPU memory: upload a slice once, work on it on the GPU, copy it back once.
 //!
-//! The backend-generic manager and session are implemented and tested with a
-//! fake backend. The CUDA backend, the public `GpuMemory` wiring, and the
-//! buffer pool are not written yet; their fallible operations return
+//! The backend-generic manager and session hold the ownership and cleanup
+//! rules; the `cuda` feature connects them to a real GPU through cudarc.
+//! The buffer pool is not written yet, so `trim` returns
 //! [`MemoryError::NotImplemented`].
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod backend;
 mod config;
 mod error;
 mod manager;
@@ -15,16 +16,12 @@ mod size;
 
 // Not reachable from the public API yet, so silence unused-code warnings.
 #[allow(dead_code)]
-mod backend;
-#[allow(dead_code)]
 mod pool;
 
 #[cfg(feature = "cuda")]
-#[allow(dead_code)]
 mod cuda;
 
 #[cfg(test)]
-#[allow(dead_code)]
 mod test_support;
 
 pub use config::MemoryConfig;

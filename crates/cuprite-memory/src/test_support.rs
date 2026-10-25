@@ -15,12 +15,42 @@ pub(crate) enum Event {
     Synchronize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Operation {
+    Allocate,
+    Upload,
+    Download,
+    Synchronize,
+}
+
 #[derive(Default)]
 pub(crate) struct FakeBackend {
     pub(crate) events: Vec<Event>,
+    /// Injected failures: each entry makes the next call of that operation
+    /// fail once. List an operation twice to make it fail twice.
+    pub(crate) failures: Vec<Operation>,
 }
 
 impl FakeBackend {
+    pub(crate) fn failing(failures: &[Operation]) -> Self {
+        Self {
+            failures: failures.to_vec(),
+            ..Self::default()
+        }
+    }
+
+    fn inject(&mut self, operation: Operation) -> Result<(), MemoryError> {
+        let Some(index) = self.failures.iter().position(|&f| f == operation) else {
+            return Ok(());
+        };
+        self.failures.remove(index);
+        Err(match operation {
+            Operation::Allocate => MemoryError::DeviceAllocation("injected".into()),
+            Operation::Upload | Operation::Download => MemoryError::Transfer("injected".into()),
+            Operation::Synchronize => MemoryError::Completion("injected".into()),
+        })
+    }
+
     fn reserve_event(&mut self) -> Result<(), MemoryError> {
         // Reserve before changing data so recording success cannot then fail.
         self.events
@@ -43,6 +73,7 @@ impl MemoryBackend for FakeBackend {
 
     fn allocate(&mut self, len: usize) -> Result<Self::Buffer, MemoryError> {
         checked_bytes(len)?;
+        self.inject(Operation::Allocate)?;
         let mut buffer = Vec::new();
         // Treat this allocation as device storage for the backend contract.
         buffer
@@ -56,6 +87,7 @@ impl MemoryBackend for FakeBackend {
 
     fn upload(&mut self, buffer: &mut Self::Buffer, input: &[u32]) -> Result<(), MemoryError> {
         validate_transfer_lengths(input.len(), buffer.len())?;
+        self.inject(Operation::Upload)?;
         self.reserve_event()?;
         buffer.copy_from_slice(input);
         self.events.push(Event::Upload(input.len()));
@@ -64,6 +96,7 @@ impl MemoryBackend for FakeBackend {
 
     fn download(&mut self, buffer: &Self::Buffer, output: &mut [u32]) -> Result<(), MemoryError> {
         validate_transfer_lengths(buffer.len(), output.len())?;
+        self.inject(Operation::Download)?;
         self.reserve_event()?;
         output.copy_from_slice(buffer);
         self.events.push(Event::Download(output.len()));
@@ -71,6 +104,7 @@ impl MemoryBackend for FakeBackend {
     }
 
     fn synchronize(&mut self) -> Result<(), MemoryError> {
+        self.inject(Operation::Synchronize)?;
         self.reserve_event()?;
         self.events.push(Event::Synchronize);
         Ok(())
@@ -153,6 +187,7 @@ mod tests {
         for input in [&[4][..], &[4, 5, 6][..]] {
             let mut backend = FakeBackend {
                 events: vec![Event::Synchronize],
+                ..FakeBackend::default()
             };
             let mut buffer = vec![9, 9];
 
@@ -182,6 +217,7 @@ mod tests {
         for buffer in [vec![9], vec![9, 9, 9]] {
             let mut backend = FakeBackend {
                 events: vec![Event::Synchronize],
+                ..FakeBackend::default()
             };
             let mut output = [4, 5];
 
