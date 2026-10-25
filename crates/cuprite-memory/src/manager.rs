@@ -1,5 +1,6 @@
 use crate::{
     backend::{DefaultBackend, MemoryBackend},
+    pool::BufferPool,
     session::{Resources, Session},
     validate_len, MemoryConfig, MemoryError, ResidentSlice,
 };
@@ -54,8 +55,10 @@ impl GpuMemory {
         self.inner.stats()
     }
 
+    /// Release idle pooled device storage and the reusable host staging.
     pub fn trim(&mut self) -> Result<(), MemoryError> {
-        Err(MemoryError::NotImplemented("GpuMemory::trim"))
+        self.inner.trim();
+        Ok(())
     }
 }
 
@@ -75,6 +78,11 @@ pub(crate) struct Manager<B: MemoryBackend> {
     /// Resources whose completion could not be established. They are never
     /// freed or reused; dropping the manager leaks them deliberately.
     pub(crate) quarantined: Option<Resources<B::Buffer>>,
+    /// Completed, healthy device storage kept for the next session.
+    pub(crate) pool: BufferPool<B::Buffer>,
+    /// Host staging from the last completed session, kept so the next one
+    /// reuses already-touched pages instead of faulting in new ones.
+    pub(crate) staging: Vec<u32>,
 }
 
 impl<B: MemoryBackend> Manager<B> {
@@ -88,6 +96,8 @@ impl<B: MemoryBackend> Manager<B> {
             active: false,
             poisoned: false,
             quarantined: None,
+            pool: BufferPool::new(),
+            staging: Vec::new(),
         }
     }
 
@@ -128,16 +138,33 @@ impl<B: MemoryBackend> Manager<B> {
         let bytes = validate_len(host.len(), self.config)?;
 
         // Copy into memory the session owns; transfers never touch `host`.
+        // CUDA only says a copy from pageable memory "might be synchronous",
+        // so uploading from `host` directly could leave the driver reading it
+        // after a failed session returns and releases the borrow.
+        // The previous session's staging is reused when it is large enough;
         // `try_reserve_exact` reports allocation failure instead of aborting,
         // and `map_err` turns its error into a `MemoryError` so `?` can return it.
-        let mut staging = Vec::new();
+        let mut staging = std::mem::take(&mut self.staging);
+        staging.clear();
         staging
             .try_reserve_exact(host.len())
             .map_err(|error| MemoryError::HostAllocation(error.to_string()))?;
         staging.extend_from_slice(host);
 
-        let device = self.backend.allocate(host.len())?;
-        self.stats.device_allocations += 1;
+        // Reuse the idle buffer only for an exact length match. Any other
+        // idle buffer is released first, so active plus idle storage stays
+        // within the budget checked above.
+        let device = match self.pool.take_matching(host.len()) {
+            Some(device) => {
+                self.stats.pool_hits += 1;
+                device
+            }
+            None => {
+                let device = self.backend.allocate(host.len())?;
+                self.stats.device_allocations += 1;
+                device
+            }
+        };
         let mut resources = Resources { staging, device };
 
         // Set before any transfer so a forgotten session is detected.
@@ -147,8 +174,9 @@ impl<B: MemoryBackend> Manager<B> {
             .upload(&mut resources.device, &resources.staging)
             .and_then(|()| self.backend.synchronize());
         if let Err(error) = uploaded {
-            // The upload may still be reading staging.
-            self.release(resources, true);
+            // The upload may still be reading staging. Storage from a failed
+            // operation is freed, not pooled.
+            drop(self.settle(resources, true));
             self.active = false;
             return Err(error);
         }
@@ -168,22 +196,40 @@ impl<B: MemoryBackend> Manager<B> {
         self.stats
     }
 
-    /// Free a session's storage once no queued work can still use it.
+    /// Wait for queued work that may still use `resources`.
     ///
     /// `pending` means work may have been queued since the last completed
-    /// synchronize. If completion then cannot be established, the storage is
-    /// quarantined and the manager is poisoned.
-    pub(crate) fn release(&mut self, resources: Resources<B::Buffer>, pending: bool) {
-        if pending && self.backend.synchronize().is_err() {
-            self.poisoned = true;
-            if self.quarantined.is_none() {
-                self.quarantined = Some(resources);
-            } else {
-                // Unreachable while poisoning refuses new sessions; leak
-                // rather than free storage that may still be in use.
-                std::mem::forget(resources);
-            }
+    /// synchronize. Returns the resources once completion is established;
+    /// otherwise quarantines them, poisons the manager, and returns `None`.
+    pub(crate) fn settle(
+        &mut self,
+        resources: Resources<B::Buffer>,
+        pending: bool,
+    ) -> Option<Resources<B::Buffer>> {
+        if !pending || self.backend.synchronize().is_ok() {
+            return Some(resources);
         }
+        self.poisoned = true;
+        if self.quarantined.is_none() {
+            self.quarantined = Some(resources);
+        } else {
+            // Unreachable while poisoning refuses new sessions; leak
+            // rather than free storage that may still be in use.
+            std::mem::forget(resources);
+        }
+        None
+    }
+
+    /// Keep a completed session's device buffer and staging for reuse.
+    pub(crate) fn recycle(&mut self, resources: Resources<B::Buffer>) {
+        let len = resources.staging.len();
+        self.pool.put_completed(len, resources.device);
+        self.staging = resources.staging;
+    }
+
+    pub(crate) fn trim(&mut self) {
+        self.pool.clear();
+        self.staging = Vec::new();
     }
 }
 

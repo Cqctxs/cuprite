@@ -11,3 +11,7 @@ cuda = ["dep:cudarc"]
 
 [dependencies]
 cudarc = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Multicore CPU baseline for the residency benchmark.
+rayon = "=1.12.0"

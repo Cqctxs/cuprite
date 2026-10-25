@@ -116,7 +116,8 @@ impl<B: MemoryBackend> Session<'_, B> {
         };
         if !self.may_have_writes {
             // Device copy is unchanged and no work is queued since the
-            // upload completed, so the bundle can be freed right away.
+            // upload completed, so the buffer can be reused right away.
+            self.manager.recycle(resources);
             return Ok(());
         }
         // Lengths were fixed in begin_mut; copy_from_slice relies on it.
@@ -127,7 +128,8 @@ impl<B: MemoryBackend> Session<'_, B> {
             .download(&resources.device, &mut resources.staging)
             .and_then(|()| backend.synchronize());
         if let Err(error) = downloaded {
-            self.manager.release(resources, true);
+            // Storage from a failed operation is freed, not pooled.
+            drop(self.manager.settle(resources, true));
             return Err(error);
         }
         // Count the download only once completion is confirmed.
@@ -135,16 +137,19 @@ impl<B: MemoryBackend> Session<'_, B> {
         self.manager.stats.downloaded_bytes += (resources.staging.len() * size_of::<u32>()) as u64;
 
         self.host.copy_from_slice(&resources.staging);
+        self.manager.recycle(resources);
         Ok(())
     }
 }
 
 impl<B: MemoryBackend> Drop for Session<'_, B> {
     /// Discard the session: no copy-back. Waits for queued work before
-    /// freeing storage, and quarantines it if that wait fails. Never panics.
+    /// reusing storage, and quarantines it if that wait fails. Never panics.
     fn drop(&mut self) {
         if let Some(resources) = self.resources.take() {
-            self.manager.release(resources, self.may_have_writes);
+            if let Some(resources) = self.manager.settle(resources, self.may_have_writes) {
+                self.manager.recycle(resources);
+            }
         }
         self.manager.active = false;
     }
@@ -477,6 +482,146 @@ mod tests {
 
         let mut values = [1, 2];
         manager.begin_mut(&mut values).unwrap().finish().unwrap();
+    }
+
+    /// Two same-length sessions share one allocation through the pool, but
+    /// each uploads the current CPU contents.
+    #[test]
+    fn same_length_sessions_reuse_the_pooled_buffer() {
+        let mut manager = fake_manager();
+        let mut values = [1, 2];
+
+        manager.begin_mut(&mut values).unwrap().finish().unwrap();
+        manager.begin_mut(&mut values).unwrap().finish().unwrap();
+
+        let stats = manager.stats();
+        assert_eq!(stats.device_allocations, 1);
+        assert_eq!(stats.pool_hits, 1);
+        assert_eq!(stats.uploads, 2);
+        assert_eq!(
+            manager.backend.events,
+            [
+                Event::Allocate(2),
+                Event::Upload(2),
+                Event::Synchronize,
+                Event::Upload(2),
+                Event::Synchronize,
+            ]
+        );
+    }
+
+    /// A pooled buffer that held another slice's GPU results is overwritten
+    /// by the next upload; stale device values never reach the CPU.
+    #[test]
+    fn a_pooled_buffer_never_leaks_stale_device_values() {
+        let mut manager = fake_manager();
+        let mut first = [1, 2];
+        let mut session = manager.begin_mut(&mut first).unwrap();
+        session.device_mut().unwrap().copy_from_slice(&[8, 9]);
+        session.finish().unwrap();
+
+        let mut second = [3, 4];
+        let mut session = manager.begin_mut(&mut second).unwrap();
+        assert_eq!(session.device_mut().unwrap(), &[3, 4]);
+        session.finish().unwrap();
+
+        assert_eq!(second, [3, 4]);
+        assert_eq!(manager.stats().pool_hits, 1);
+    }
+
+    /// A different length evicts the idle buffer before allocating, so idle
+    /// and active storage never coexist beyond the budget.
+    #[test]
+    fn a_different_length_evicts_and_allocates() {
+        let config = MemoryConfig {
+            max_device_bytes: 16,
+            ..MemoryConfig::default()
+        };
+        let mut manager = Manager::new(FakeBackend::default(), config);
+        let mut four = [1, 2, 3, 4];
+        let mut three = [5, 6, 7];
+
+        manager.begin_mut(&mut four).unwrap().finish().unwrap();
+        assert_eq!(manager.pool.idle_len(), Some(4));
+        manager.begin_mut(&mut three).unwrap().finish().unwrap();
+
+        assert_eq!(manager.pool.idle_len(), Some(3));
+        assert_eq!(manager.stats().device_allocations, 2);
+        assert_eq!(manager.stats().pool_hits, 0);
+    }
+
+    /// Host staging is reused across sessions, so a session no larger than
+    /// the last one allocates no new host memory; `trim` releases it.
+    #[test]
+    fn host_staging_is_reused_until_trimmed() {
+        let mut manager = fake_manager();
+        let mut four = [1, 2, 3, 4];
+        let mut three = [5, 6, 7];
+
+        let mut session = manager.begin_mut(&mut four).unwrap();
+        let first = session.resources.as_ref().unwrap().staging.as_ptr();
+        session.device_mut().unwrap();
+        session.finish().unwrap();
+        let mut session = manager.begin_mut(&mut three).unwrap();
+        assert_eq!(session.resources.as_ref().unwrap().staging.as_ptr(), first);
+        session.device_mut().unwrap().copy_from_slice(&[0, 0, 9]);
+        session.finish().unwrap();
+
+        assert_eq!(three, [0, 0, 9], "reused staging is resized to the slice");
+        manager.trim();
+        assert_eq!(manager.staging.capacity(), 0);
+    }
+
+    /// `trim` releases idle storage, so the next session allocates again.
+    #[test]
+    fn trim_releases_the_idle_buffer() {
+        let mut manager = fake_manager();
+        let mut values = [1, 2];
+
+        manager.begin_mut(&mut values).unwrap().finish().unwrap();
+        manager.trim();
+        assert_eq!(manager.pool.idle_len(), None);
+        manager.begin_mut(&mut values).unwrap().finish().unwrap();
+
+        assert_eq!(manager.stats().device_allocations, 2);
+        assert_eq!(manager.stats().pool_hits, 0);
+    }
+
+    /// A discarded session's buffer is pooled once its work has completed.
+    #[test]
+    fn a_dropped_session_returns_its_buffer_after_waiting() {
+        let mut manager = fake_manager();
+        let mut values = [1, 2];
+
+        let mut session = manager.begin_mut(&mut values).unwrap();
+        session.device_mut().unwrap();
+        drop(session);
+
+        assert_eq!(manager.pool.idle_len(), Some(2));
+    }
+
+    /// Buffers from failed operations, and quarantined buffers, are never
+    /// pooled.
+    #[test]
+    fn failed_or_quarantined_buffers_never_enter_the_pool() {
+        let mut manager = failing_manager(&[Operation::Download]);
+        let mut values = [1, 2];
+        let mut session = manager.begin_mut(&mut values).unwrap();
+        session.device_mut().unwrap();
+        session.finish().unwrap_err();
+        assert_eq!(manager.pool.idle_len(), None);
+
+        let mut manager = failing_manager(&[Operation::Upload]);
+        manager.begin_mut(&mut values).err().unwrap();
+        assert_eq!(manager.pool.idle_len(), None);
+
+        let mut manager = fake_manager();
+        let mut session = manager.begin_mut(&mut values).unwrap();
+        session.device_mut().unwrap();
+        session.manager.backend.failures = vec![Operation::Synchronize];
+        drop(session);
+        assert!(manager.quarantined.is_some());
+        assert_eq!(manager.pool.idle_len(), None);
     }
 
     /// Consecutive sessions on one manager upload fresh contents each time,

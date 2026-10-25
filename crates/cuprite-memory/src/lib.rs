@@ -2,8 +2,8 @@
 //!
 //! The backend-generic manager and session hold the ownership and cleanup
 //! rules; the `cuda` feature connects them to a real GPU through cudarc.
-//! The buffer pool is not written yet, so `trim` returns
-//! [`MemoryError::NotImplemented`].
+//! Completed device buffers are kept in a one-slot pool for the next
+//! session of the same length.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -11,12 +11,9 @@ mod backend;
 mod config;
 mod error;
 mod manager;
+mod pool;
 mod session;
 mod size;
-
-// Not reachable from the public API yet, so silence unused-code warnings.
-#[allow(dead_code)]
-mod pool;
 
 #[cfg(feature = "cuda")]
 mod cuda;

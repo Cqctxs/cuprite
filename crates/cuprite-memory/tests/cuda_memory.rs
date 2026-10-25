@@ -78,3 +78,19 @@ fn an_invalid_device_ordinal_is_unavailable() {
 
     assert!(matches!(result, Err(MemoryError::Unavailable(_))));
 }
+
+#[test]
+fn same_length_sessions_reuse_one_allocation_until_trimmed() {
+    let mut memory = GpuMemory::open(MemoryConfig::default()).unwrap();
+    let mut values = vec![3u32; 1025];
+
+    memory.begin_mut(&mut values).unwrap().finish().unwrap();
+    memory.begin_mut(&mut values).unwrap().finish().unwrap();
+    memory.trim().unwrap();
+    memory.begin_mut(&mut values).unwrap().finish().unwrap();
+
+    let stats = memory.stats();
+    assert_eq!(stats.device_allocations, 2);
+    assert_eq!(stats.pool_hits, 1);
+    assert_eq!(stats.uploads, 3);
+}
