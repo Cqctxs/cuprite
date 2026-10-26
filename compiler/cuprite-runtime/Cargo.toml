@@ -1,0 +1,11 @@
+[package]
+name = "cuprite-runtime"
+description = "Runtime entry points that Cuprite-rewritten functions call"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Built here by the pinned nightly: everything linked into a rewritten crate
+# must come from the same compiler as that crate.
+cuprite-memory = { path = "../../crates/cuprite-memory", features = ["cuda"] }

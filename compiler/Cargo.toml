@@ -1,0 +1,10 @@
+# Separate from the root workspace: everything here builds with the pinned
+# nightly in `rust-toolchain.toml`, while `cuprite-memory` stays on stable.
+[workspace]
+members = ["cuprite-driver", "cuprite-runtime", "probes"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false

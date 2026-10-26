@@ -1,0 +1,10 @@
+[package]
+name = "cuprite-probes"
+description = "Ordinary Rust functions used to study what the Cuprite driver sees"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Probe for library-provided parallel iteration.
+rayon = "=1.12.0"

@@ -1,4 +1,4 @@
-use crate::MemoryError;
+use crate::{MapStep, MemoryError};
 
 /// Private boundary between ownership logic and a GPU or test backend.
 ///
@@ -14,6 +14,8 @@ pub(crate) trait MemoryBackend {
     fn allocate(&mut self, len: usize) -> Result<Self::Buffer, MemoryError>;
     fn upload(&mut self, buffer: &mut Self::Buffer, input: &[u32]) -> Result<(), MemoryError>;
     fn download(&mut self, buffer: &Self::Buffer, output: &mut [u32]) -> Result<(), MemoryError>;
+    /// Queue `step` over every element of `buffer`, after earlier work.
+    fn map(&mut self, buffer: &mut Self::Buffer, step: MapStep) -> Result<(), MemoryError>;
     fn synchronize(&mut self) -> Result<(), MemoryError>;
 }
 
@@ -41,6 +43,10 @@ impl MemoryBackend for NoBackend {
     }
 
     fn download(&mut self, _buffer: &Self::Buffer, _output: &mut [u32]) -> Result<(), MemoryError> {
+        match *self {}
+    }
+
+    fn map(&mut self, _buffer: &mut Self::Buffer, _step: MapStep) -> Result<(), MemoryError> {
         match *self {}
     }
 

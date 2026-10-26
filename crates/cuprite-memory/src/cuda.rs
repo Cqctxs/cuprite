@@ -6,12 +6,62 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DriverError};
+use cudarc::{
+    driver::{
+        CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
+    },
+    nvrtc::Ptx,
+};
 
-use crate::{backend::MemoryBackend, MemoryConfig, MemoryError};
+use crate::{backend::MemoryBackend, MapStep, MemoryConfig, MemoryError};
+
+/// Handwritten PTX for [`MapStep`], compiled by the driver for the installed
+/// GPU when the backend opens, so no CUDA Toolkit is needed. Each thread
+/// handles one element: `values[i] = values[i] * mul + add` (`mad.lo` keeps
+/// the low 32 bits, which is wrapping arithmetic).
+const MAP_PTX: &str = r#"
+.version 7.0
+.target sm_50
+.address_size 64
+
+.visible .entry map_u32(
+    .param .u64 values,
+    .param .u64 len,
+    .param .u32 mul,
+    .param .u32 add
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [values];
+    ld.param.u64 %rd2, [len];
+    ld.param.u32 %r6, [mul];
+    ld.param.u32 %r7, [add];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    cvt.u64.u32 %rd3, %r3;
+    mad.wide.u32 %rd4, %r1, %r2, %rd3;
+    setp.ge.u64 %p1, %rd4, %rd2;
+    @%p1 bra DONE;
+    cvta.to.global.u64 %rd5, %rd1;
+    shl.b64 %rd6, %rd4, 2;
+    add.s64 %rd7, %rd5, %rd6;
+    ld.global.u32 %r4, [%rd7];
+    mad.lo.u32 %r5, %r4, %r6, %r7;
+    st.global.u32 [%rd7], %r5;
+DONE:
+    ret;
+}
+"#;
+
+const BLOCK_THREADS: u32 = 256;
 
 pub(crate) struct CudaBackend {
     pub(crate) stream: Arc<CudaStream>,
+    map: CudaFunction,
 }
 
 impl CudaBackend {
@@ -37,7 +87,11 @@ impl CudaBackend {
         let unavailable = |error: DriverError| MemoryError::Unavailable(error.to_string());
         let context = CudaContext::new(config.device_ordinal).map_err(unavailable)?;
         let stream = context.new_stream().map_err(unavailable)?;
-        Ok(Self { stream })
+        let map = context
+            .load_module(Ptx::from_src(MAP_PTX))
+            .and_then(|module| module.load_function("map_u32"))
+            .map_err(unavailable)?;
+        Ok(Self { stream, map })
     }
 }
 
@@ -73,6 +127,26 @@ impl MemoryBackend for CudaBackend {
         self.stream
             .memcpy_dtoh(buffer, output)
             .map_err(|error| MemoryError::Transfer(error.to_string()))
+    }
+
+    fn map(&mut self, buffer: &mut Self::Buffer, step: MapStep) -> Result<(), MemoryError> {
+        let len = buffer.len() as u64;
+        let blocks = u32::try_from(len.div_ceil(u64::from(BLOCK_THREADS)))
+            .map_err(|_| MemoryError::Launch(format!("{len} elements need too many blocks")))?;
+        let config = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (BLOCK_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.map);
+        launch.arg(buffer).arg(&len).arg(&step.mul).arg(&step.add);
+        // SAFETY: `map_u32` takes a u32 pointer, a u64 length and two u32
+        // values, matching the arguments pushed above. It writes only
+        // indices below `len`, the buffer's element count, and runs on the
+        // buffer's own stream after earlier work.
+        unsafe { launch.launch(config) }
+            .map(|_| ())
+            .map_err(|error| MemoryError::Launch(error.to_string()))
     }
 
     fn synchronize(&mut self) -> Result<(), MemoryError> {
@@ -246,7 +320,7 @@ DONE:
 #[cfg(test)]
 mod tests {
     use super::fixture::{add_seven, input, launch_in_session, lcg64, lcg_step, LCG_ROUNDS};
-    use crate::{GpuMemory, MemoryConfig};
+    use crate::{GpuMemory, MapStep, MemoryConfig};
 
     const LENGTHS: [usize; 6] = [0, 1, 255, 256, 257, 1025];
 
@@ -280,6 +354,36 @@ mod tests {
                 after.device_allocations - before.device_allocations,
                 nonempty
             );
+        }
+    }
+
+    #[test]
+    fn map_steps_match_the_cpu_reference() {
+        let mut memory = GpuMemory::open(MemoryConfig::default()).unwrap();
+        let steps = [
+            MapStep { mul: 3, add: 7 },
+            MapStep {
+                mul: u32::MAX,
+                add: u32::MAX,
+            },
+            MapStep { mul: 0, add: 1 },
+            MapStep { mul: 1, add: 0 },
+        ];
+
+        for len in LENGTHS {
+            let mut values = input(len);
+            let expected: Vec<u32> = values
+                .iter()
+                .map(|&v| steps.iter().fold(v, |x, step| step.apply(x)))
+                .collect();
+
+            let mut session = memory.begin_mut(&mut values).unwrap();
+            for step in steps {
+                session.map(step).unwrap();
+            }
+            session.finish().unwrap();
+
+            assert_eq!(values, expected, "length {len}");
         }
     }
 

@@ -1,0 +1,18 @@
+[package]
+name = "cuprite-driver"
+description = "rustc driver for Cuprite's compiler feasibility work"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[package.metadata.rust-analyzer]
+# Lets rust-analyzer resolve `extern crate rustc_*`.
+rustc_private = true
+
+[features]
+# Declares an NVIDIA GPU test host: the GPU-path tests run and must pass.
+gpu-tests = []
+
+[dev-dependencies]
+# Reads Cargo's JSON build messages to locate the runtime's artifacts.
+serde_json = "=1.0.140"

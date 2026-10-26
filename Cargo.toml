@@ -1,5 +1,7 @@
 [workspace]
 members = ["crates/cuprite-memory"]
+# Its own workspace, on a pinned nightly.
+exclude = ["compiler"]
 resolver = "2"
 
 [workspace.package]

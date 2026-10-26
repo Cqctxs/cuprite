@@ -5,13 +5,14 @@
 //! operations leave destination contents and the event log unchanged.
 //! This backend does not model queued work or real CUDA failure behavior.
 
-use crate::{backend::MemoryBackend, checked_bytes, MemoryError};
+use crate::{backend::MemoryBackend, checked_bytes, MapStep, MemoryError};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Event {
     Allocate(usize),
     Upload(usize),
     Download(usize),
+    Map(usize, MapStep),
     Synchronize,
 }
 
@@ -20,6 +21,7 @@ pub(crate) enum Operation {
     Allocate,
     Upload,
     Download,
+    Map,
     Synchronize,
 }
 
@@ -47,6 +49,7 @@ impl FakeBackend {
         Err(match operation {
             Operation::Allocate => MemoryError::DeviceAllocation("injected".into()),
             Operation::Upload | Operation::Download => MemoryError::Transfer("injected".into()),
+            Operation::Map => MemoryError::Launch("injected".into()),
             Operation::Synchronize => MemoryError::Completion("injected".into()),
         })
     }
@@ -100,6 +103,16 @@ impl MemoryBackend for FakeBackend {
         self.reserve_event()?;
         output.copy_from_slice(buffer);
         self.events.push(Event::Download(output.len()));
+        Ok(())
+    }
+
+    fn map(&mut self, buffer: &mut Self::Buffer, step: MapStep) -> Result<(), MemoryError> {
+        self.inject(Operation::Map)?;
+        self.reserve_event()?;
+        for value in buffer.iter_mut() {
+            *value = step.apply(*value);
+        }
+        self.events.push(Event::Map(buffer.len(), step));
         Ok(())
     }
 

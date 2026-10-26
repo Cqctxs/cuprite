@@ -14,7 +14,7 @@ use super::{
     fixture::{add_seven, launch_in_session, lcg64, lcg_step, LCG_ROUNDS},
     CudaBackend,
 };
-use crate::{manager::Manager, MemoryConfig};
+use crate::{manager::Manager, MapStep, MemoryConfig};
 
 #[derive(Clone, Copy, Debug)]
 enum Kernel {
@@ -115,6 +115,33 @@ fn kernels_match_the_cpu_on_random_inputs() {
             let mut session = gpu.manager.begin_mut(&mut values).unwrap();
             for _ in 0..reps {
                 launch_in_session(&mut session, &function);
+            }
+            session.finish().unwrap();
+
+            prop_assert_eq!(values, expected);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn map_steps_match_the_cpu_on_random_inputs() {
+    let gpu = RefCell::new(Gpu::open());
+    let step = (element(), element()).prop_map(|(mul, add)| MapStep { mul, add });
+    let strategy = (values(), prop::collection::vec(step, 1..=6));
+
+    runner(256)
+        .run(&strategy, |(input, steps)| {
+            let gpu = &mut *gpu.borrow_mut();
+            let expected: Vec<u32> = input
+                .iter()
+                .map(|&v| steps.iter().fold(v, |x, step| step.apply(x)))
+                .collect();
+
+            let mut values = input;
+            let mut session = gpu.manager.begin_mut(&mut values).unwrap();
+            for &step in &steps {
+                session.map(step).unwrap();
             }
             session.finish().unwrap();
 

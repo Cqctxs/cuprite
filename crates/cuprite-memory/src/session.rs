@@ -1,7 +1,7 @@
 use crate::{
     backend::{DefaultBackend, MemoryBackend},
     manager::Manager,
-    MemoryError,
+    MapStep, MemoryError,
 };
 
 /// A session exclusively borrows the manager and original CPU slice.
@@ -50,6 +50,16 @@ impl<'a> ResidentSlice<'a> {
         self.inner.finish()
     }
 
+    /// Queue `step` over the GPU copy, after earlier operations.
+    ///
+    /// # Errors
+    /// Returns [`MemoryError::Launch`] if the operation cannot be queued.
+    /// The session then cannot be committed: `finish` returns an error and
+    /// the original slice is left unchanged.
+    pub fn map(&mut self, step: MapStep) -> Result<(), MemoryError> {
+        self.inner.map(step)
+    }
+
     #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn inner_mut(&mut self) -> &mut Session<'a, DefaultBackend> {
         &mut self.inner
@@ -75,6 +85,9 @@ pub(crate) struct Session<'a, B: MemoryBackend> {
     pub(crate) resources: Option<Resources<B::Buffer>>,
     /// Set *before* handing out write access, even if no write happens.
     pub(crate) may_have_writes: bool,
+    /// Set when an operation failed to queue. The device copy is then
+    /// missing that operation, so `finish` must not commit it.
+    pub(crate) failed: bool,
 }
 
 // `'_` stands for the session's lifetime, which these methods never need to name.
@@ -94,13 +107,24 @@ impl<B: MemoryBackend> Session<'_, B> {
     ///
     /// Callers must queue work only on this backend's stream and must not
     /// keep anything derived from the buffer beyond the borrow.
-    // Only test fixtures launch kernels until generated launch code exists.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn write_parts(&mut self) -> Option<(&mut B, &mut B::Buffer)> {
         // Borrow the bundle rather than moving it: `finish` still needs it.
         let resources = self.resources.as_mut()?;
         self.may_have_writes = true;
         Some((&mut self.manager.backend, &mut resources.device))
+    }
+
+    /// Queue `step` over the device copy. An empty session has nothing to
+    /// map. After a failure, `finish` refuses to commit.
+    pub(crate) fn map(&mut self, step: MapStep) -> Result<(), MemoryError> {
+        let Some((backend, device)) = self.write_parts() else {
+            return Ok(());
+        };
+        let result = backend.map(device, step);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
     }
 
     /// Commit results to the original slice and consume the session.
@@ -110,6 +134,12 @@ impl<B: MemoryBackend> Session<'_, B> {
     /// staging, and only once that has completed is staging copied into
     /// `host`. A failed download or synchronize leaves `host` unchanged.
     pub(crate) fn finish(mut self) -> Result<(), MemoryError> {
+        if self.failed {
+            // `Drop` discards the device copy after waiting for queued work.
+            return Err(MemoryError::Launch(
+                "an operation in this session failed; results discarded".into(),
+            ));
+        }
         // Take the bundle; `Drop` then sees `None` and only ends the session.
         let Some(mut resources) = self.resources.take() else {
             return Ok(()); // Empty session: nothing was staged or allocated.
@@ -638,5 +668,66 @@ mod tests {
         session.finish().unwrap();
 
         assert_eq!(manager.stats().uploads, 2);
+    }
+
+    const STEP: MapStep = MapStep { mul: 3, add: 7 };
+
+    /// Maps run in order on the device copy, between one upload and one
+    /// download.
+    #[test]
+    fn maps_apply_in_order_between_one_upload_and_download() {
+        let mut manager = fake_manager();
+        let mut values = [0, u32::MAX];
+        let second = MapStep { mul: 2, add: 1 };
+
+        let mut session = manager.begin_mut(&mut values).unwrap();
+        session.map(STEP).unwrap();
+        session.map(second).unwrap();
+        session.finish().unwrap();
+
+        let expected = [0, u32::MAX].map(|v| second.apply(STEP.apply(v)));
+        assert_eq!(values, expected);
+        assert_eq!(
+            manager.backend.events,
+            [
+                Event::Allocate(2),
+                Event::Upload(2),
+                Event::Synchronize,
+                Event::Map(2, STEP),
+                Event::Map(2, second),
+                Event::Download(2),
+                Event::Synchronize,
+            ]
+        );
+    }
+
+    #[test]
+    fn mapping_an_empty_session_does_nothing() {
+        let mut manager = fake_manager();
+        let mut values: [u32; 0] = [];
+
+        let mut session = manager.begin_mut(&mut values).unwrap();
+        session.map(STEP).unwrap();
+        session.finish().unwrap();
+
+        assert!(manager.backend.events.is_empty());
+    }
+
+    /// A session missing a failed operation is never committed, even if
+    /// later operations succeed, and the manager stays usable.
+    #[test]
+    fn a_failed_map_discards_the_session() {
+        let mut manager = failing_manager(&[Operation::Map]);
+        let mut values = [1, 2];
+
+        let mut session = manager.begin_mut(&mut values).unwrap();
+        assert!(matches!(session.map(STEP), Err(MemoryError::Launch(_))));
+        session.map(STEP).unwrap();
+        assert!(matches!(session.finish(), Err(MemoryError::Launch(_))));
+
+        assert_eq!(values, [1, 2]);
+        assert_eq!(manager.stats().downloads, 0);
+        assert!(!manager.poisoned);
+        manager.begin_mut(&mut values).unwrap().finish().unwrap();
     }
 }

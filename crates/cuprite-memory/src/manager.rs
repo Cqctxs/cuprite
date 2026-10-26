@@ -131,6 +131,7 @@ impl<B: MemoryBackend> Manager<B> {
                 host,
                 resources: None,
                 may_have_writes: false,
+                failed: false,
             });
         }
 
@@ -189,6 +190,7 @@ impl<B: MemoryBackend> Manager<B> {
             host,
             resources: Some(resources),
             may_have_writes: false,
+            failed: false,
         })
     }
 
