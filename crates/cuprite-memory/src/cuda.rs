@@ -85,6 +85,8 @@ impl MemoryBackend for CudaBackend {
 
 #[cfg(test)]
 mod bench;
+#[cfg(test)]
+mod differential;
 
 /// Test kernel and launch helpers shared by the hardware tests and benchmark.
 #[cfg(test)]
