@@ -15,6 +15,45 @@ pub fn transform(values: &mut [u32]) {
     }
 }
 
+/// Same map through an explicit `iter_mut()`.
+pub fn transform_iter_mut(values: &mut [u32]) {
+    for value in values.iter_mut() {
+        *value = value.wrapping_mul(3).wrapping_add(7);
+    }
+}
+
+/// Several steps that compose into one map: `x * 15 + 33`.
+pub fn affine_chain(values: &mut [u32]) {
+    for value in values {
+        *value = value
+            .wrapping_mul(3)
+            .wrapping_add(7)
+            .wrapping_mul(5)
+            .wrapping_sub(2);
+    }
+}
+
+/// Plain operators: wrapping in release builds, panicking in debug ones.
+pub fn plain_ops(values: &mut [u32]) {
+    for value in values {
+        *value = *value * 3 + 7;
+    }
+}
+
+/// The element added to itself is still a map: `x * 2`.
+pub fn double(values: &mut [u32]) {
+    for value in values {
+        *value = value.wrapping_add(*value);
+    }
+}
+
+/// Overwrites every element: `x * 0 + 42`.
+pub fn fill(values: &mut [u32]) {
+    for value in values {
+        *value = 42;
+    }
+}
+
 /// The design's residency target: repeated calls to a visible helper.
 pub fn repeat(values: &mut [u32], passes: u32) {
     for _ in 0..passes {
@@ -101,6 +140,98 @@ pub fn apply(values: &mut [u32], f: fn(u32) -> u32) {
     }
 }
 
+/// Not a multiply-add map: the element is multiplied by itself.
+pub fn square(values: &mut [u32]) {
+    for value in values {
+        *value = value.wrapping_mul(*value);
+    }
+}
+
+/// A branch inside the loop.
+pub fn clamp(values: &mut [u32]) {
+    for value in values {
+        if *value > 9 {
+            *value = 9;
+        }
+    }
+}
+
+/// Division by the element panics when it is zero.
+pub fn reciprocal(values: &mut [u32]) {
+    for value in values {
+        *value = 100 / *value;
+    }
+}
+
+#[inline(never)]
+fn triple(value: u32) -> u32 {
+    value.wrapping_mul(3)
+}
+
+/// A call to a function the recognizer has no summary for.
+pub fn with_helper(values: &mut [u32]) {
+    for value in values {
+        *value = triple(*value);
+    }
+}
+
+/// A factor computed before the loop. A real map, but the first recognizer
+/// only follows values computed inside the loop body.
+pub fn outside_factor(values: &mut [u32]) {
+    let factor = 3;
+    for value in values {
+        *value = value.wrapping_mul(factor);
+    }
+}
+
+/// Two stores in one iteration still make one map: `(x + 1) * 2`.
+pub fn two_stores(values: &mut [u32]) {
+    for value in values {
+        *value = value.wrapping_add(1);
+        *value = value.wrapping_mul(2);
+    }
+}
+
+// Shapes that look close to a map but are not one, to check that the
+// recognizer refuses them.
+
+/// Stops at the first zero, leaving the rest unchanged.
+pub fn until_zero(values: &mut [u32]) {
+    for value in values {
+        if *value == 0 {
+            break;
+        }
+        *value = value.wrapping_mul(3);
+    }
+}
+
+/// Same map, through an iterator adapter the recognizer has no summary for.
+pub fn reversed(values: &mut [u32]) {
+    for value in values.iter_mut().rev() {
+        *value = value.wrapping_mul(3);
+    }
+}
+
+/// Two loops, which together are the map `x * 0 + 1`; the first recognizer
+/// handles only one.
+pub fn two_loops(values: &mut [u32]) {
+    for value in values.iter_mut() {
+        *value = value.wrapping_mul(0);
+    }
+    for value in values.iter_mut() {
+        *value = value.wrapping_add(1);
+    }
+}
+
+/// Each element depends on how many came before it.
+pub fn numbered(values: &mut [u32]) {
+    let mut count = 0u32;
+    for value in values {
+        *value = value.wrapping_add(count);
+        count = count.wrapping_add(1);
+    }
+}
+
 /// Number of calls `counted` has made, for tests.
 pub fn counted_calls() -> u32 {
     CALLS.load(Ordering::Relaxed)
@@ -121,7 +252,12 @@ mod tests {
     #[test]
     fn maps_agree() {
         let expected: Vec<u32> = input().into_iter().map(map).collect();
-        for f in [transform, transform_indexed, transform_rayon] {
+        for f in [
+            transform,
+            transform_iter_mut,
+            transform_indexed,
+            transform_rayon,
+        ] {
             let mut values = input();
             f(&mut values);
             assert_eq!(values, expected);
@@ -129,6 +265,38 @@ mod tests {
         let mut values = input();
         apply(&mut values, map);
         assert_eq!(values, expected);
+    }
+
+    fn mapped(f: fn(&mut [u32]), mut values: Vec<u32>) -> Vec<u32> {
+        f(&mut values);
+        values
+    }
+
+    #[test]
+    fn composed_maps() {
+        let chain = |v: u32| v.wrapping_mul(15).wrapping_add(33);
+        let expected: Vec<u32> = input().into_iter().map(chain).collect();
+        assert_eq!(mapped(affine_chain, input()), expected);
+
+        let expected: Vec<u32> = input().into_iter().map(|v| v.wrapping_mul(2)).collect();
+        assert_eq!(mapped(double, input()), expected);
+        assert_eq!(mapped(fill, input()), [42; 5]);
+        // Small inputs: `plain_ops` panics on overflow in debug builds.
+        assert_eq!(mapped(plain_ops, vec![0, 1, 2]), [7, 10, 13]);
+    }
+
+    #[test]
+    fn single_slice_rejections_behave_like_ordinary_rust() {
+        assert_eq!(mapped(square, vec![3, 1 << 16]), [9, 0]);
+        assert_eq!(mapped(clamp, vec![3, 10, 9]), [3, 9, 9]);
+        assert_eq!(mapped(reciprocal, vec![1, 3, 200]), [100, 33, 0]);
+        assert_eq!(mapped(with_helper, vec![1, u32::MAX]), [3, u32::MAX - 2]);
+        assert_eq!(mapped(outside_factor, vec![1, 2]), [3, 6]);
+        assert_eq!(mapped(two_stores, vec![0, u32::MAX]), [2, 0]);
+        assert_eq!(mapped(until_zero, vec![1, 0, 2]), [3, 0, 2]);
+        assert_eq!(mapped(reversed, vec![1, 2]), [3, 6]);
+        assert_eq!(mapped(two_loops, vec![5, 6]), [1, 1]);
+        assert_eq!(mapped(numbered, vec![10, 10, 10]), [10, 11, 12]);
     }
 
     #[test]

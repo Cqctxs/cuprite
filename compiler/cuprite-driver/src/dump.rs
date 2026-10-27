@@ -5,7 +5,6 @@
 
 use std::{collections::BTreeMap, fs, path::Path, sync::Mutex};
 
-use rustc_data_structures::steal::Steal;
 use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::{pretty::MirWriter, Body},
@@ -34,15 +33,13 @@ fn is_function(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
     )
 }
 
-/// Wraps rustc's own `mir_built`: records the body, then returns it
-/// unchanged.
-pub(crate) fn mir_built<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tcx Steal<Body<'tcx>> {
-    let built = (rustc_interface::DEFAULT_QUERY_PROVIDERS.queries.mir_built)(tcx, def_id);
+/// Records a function's built MIR, which is gone (stolen) by the time the
+/// dump is written.
+pub(crate) fn record<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &Body<'tcx>) {
     if is_function(tcx, def_id) {
-        let text = pretty(tcx, &built.borrow());
+        let text = pretty(tcx, body);
         BUILT.lock().unwrap().insert(tcx.def_path_str(def_id), text);
     }
-    built
 }
 
 /// Writes both stages for every function in the crate being compiled.
