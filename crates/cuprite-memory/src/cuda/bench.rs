@@ -300,7 +300,7 @@ fn phase_table(
 #[ignore = "benchmark: run in release with --ignored --nocapture"]
 fn residency() {
     let config = MemoryConfig::default();
-    let mut manager = Manager::new(CudaBackend::open(config).unwrap(), config);
+    let mut manager = Manager::new(CudaBackend::open(config).unwrap().0, config);
     let stream = manager.backend.stream.clone();
     println!("\nrayon threads: {}", rayon::current_num_threads());
 

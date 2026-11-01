@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::OnceLock,
@@ -11,7 +11,7 @@ use std::{
 
 /// Every variable the driver or runtime reads, cleared before each build or
 /// run so a developer's shell cannot change a test.
-const CUPRITE_VARS: [&str; 9] = [
+const CUPRITE_VARS: [&str; 10] = [
     "CUPRITE_DUMP_MIR",
     "CUPRITE_REPORT",
     "CUPRITE_AUTO",
@@ -19,9 +19,14 @@ const CUPRITE_VARS: [&str; 9] = [
     "CUPRITE_RUNTIME",
     "CUPRITE_RUNTIME_DEPS",
     "CUPRITE_GPU",
+    "CUPRITE_PROFILE",
     "CUPRITE_TRACE",
     "RUSTFLAGS",
 ];
+
+/// What the runtime reports when it declines because no profile is set,
+/// which is what happens when the GPU is not forced.
+pub const NO_PROFILE: &str = "-> cpu (no profile; set CUPRITE_PROFILE)";
 
 pub fn workspace() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
@@ -49,6 +54,8 @@ pub fn text(bytes: &[u8]) -> String {
 pub struct Runtime {
     pub files: OsString,
     pub dirs: OsString,
+    /// The `cuprite-calibrate` executable.
+    pub calibrate: PathBuf,
 }
 
 pub fn runtime() -> &'static Runtime {
@@ -70,10 +77,14 @@ pub fn runtime() -> &'static Runtime {
 
         let mut files = Vec::new();
         let mut dirs = Vec::new();
+        let mut calibrate = None;
         for line in text(&output.stdout).lines() {
             let message: serde_json::Value = serde_json::from_str(line).unwrap();
             if message["reason"] != "compiler-artifact" {
                 continue;
+            }
+            if message["target"]["name"] == "cuprite-calibrate" {
+                calibrate = message["executable"].as_str().map(PathBuf::from);
             }
             let runtime = message["target"]["name"] == "cuprite_runtime";
             for file in message["filenames"].as_array().unwrap() {
@@ -92,6 +103,7 @@ pub fn runtime() -> &'static Runtime {
         Runtime {
             files: std::env::join_paths(files).unwrap(),
             dirs: std::env::join_paths(dirs).unwrap(),
+            calibrate: calibrate.expect("no cuprite-calibrate executable reported"),
         }
     })
 }
@@ -213,15 +225,27 @@ impl Probes {
 }
 
 /// Runs a probe binary, which must succeed; returns its stderr, where the
-/// runtime's trace goes.
+/// runtime's trace goes. With `gpu`, the GPU is forced (`CUPRITE_GPU=1`);
+/// otherwise the policy runs without a profile, so everything stays on the
+/// CPU.
 pub fn run(exe: &Path, gpu: bool, args: &[&str]) -> String {
+    let env: &[(&str, &OsStr)] = if gpu {
+        &[("CUPRITE_GPU", OsStr::new("1"))]
+    } else {
+        &[]
+    };
+    run_with(exe, env, args)
+}
+
+/// Like `run`, with the runtime's environment set to `env`.
+pub fn run_with(exe: &Path, env: &[(&str, &OsStr)], args: &[&str]) -> String {
     let mut command = Command::new(exe);
     for name in CUPRITE_VARS {
         command.env_remove(name);
     }
     command.args(args).env("CUPRITE_TRACE", "1");
-    if gpu {
-        command.env("CUPRITE_GPU", "1");
+    for (name, value) in env {
+        command.env(name, value);
     }
     let output = command.output().unwrap();
     assert!(

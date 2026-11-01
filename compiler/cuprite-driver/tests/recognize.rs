@@ -5,7 +5,7 @@
 
 mod support;
 
-use support::{run, text, Probes};
+use support::{run, text, Probes, NO_PROFILE};
 
 /// Verdicts that do not depend on the build profile.
 const COMMON: &[(&str, &str)] = &[
@@ -133,7 +133,7 @@ fn rewritten_candidates_match_the_cpu_when_the_runtime_declines() {
     assert!(
         trace
             .lines()
-            .all(|line| line.ends_with("-> cpu (CUPRITE_GPU is not 1)")),
+            .all(|line| line.ends_with(NO_PROFILE) || line.ends_with("-> cpu (no work)")),
         "{trace}"
     );
     // The declined repeated maps fall back to their CPU bodies, which call

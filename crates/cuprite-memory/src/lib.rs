@@ -10,6 +10,7 @@
 
 mod backend;
 mod config;
+mod device;
 mod error;
 mod manager;
 mod pool;
@@ -24,6 +25,7 @@ mod cuda;
 mod test_support;
 
 pub use config::MemoryConfig;
+pub use device::DeviceInfo;
 pub use error::MemoryError;
 pub use manager::{GpuMemory, MemoryStats};
 pub use session::ResidentSlice;

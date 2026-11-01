@@ -2,7 +2,7 @@ use crate::{
     backend::{DefaultBackend, MemoryBackend},
     pool::BufferPool,
     session::{Resources, Session},
-    validate_len, MemoryConfig, MemoryError, ResidentSlice,
+    validate_len, DeviceInfo, MemoryConfig, MemoryError, ResidentSlice,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -18,6 +18,7 @@ pub struct MemoryStats {
 /// Public entry point: a [`Manager`] over the CUDA backend.
 pub struct GpuMemory {
     inner: Manager<DefaultBackend>,
+    device: DeviceInfo,
 }
 
 impl GpuMemory {
@@ -36,9 +37,10 @@ impl GpuMemory {
         }
         #[cfg(feature = "cuda")]
         {
-            let backend = crate::cuda::CudaBackend::open(config)?;
+            let (backend, device) = crate::cuda::CudaBackend::open(config)?;
             Ok(Self {
                 inner: Manager::new(backend, config),
+                device,
             })
         }
     }
@@ -53,6 +55,11 @@ impl GpuMemory {
 
     pub fn stats(&self) -> MemoryStats {
         self.inner.stats()
+    }
+
+    /// The open device and the versions its performance depends on.
+    pub fn device(&self) -> &DeviceInfo {
+        &self.device
     }
 
     /// Release idle pooled device storage and the reusable host staging.

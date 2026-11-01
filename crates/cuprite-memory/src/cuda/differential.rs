@@ -44,7 +44,7 @@ struct Gpu {
 impl Gpu {
     fn open() -> Self {
         let config = MemoryConfig::default();
-        let manager = Manager::new(CudaBackend::open(config).unwrap(), config);
+        let manager = Manager::new(CudaBackend::open(config).unwrap().0, config);
         let stream = &manager.backend.stream;
         let (add_seven, lcg) = (add_seven(stream), lcg64(stream));
         Self {

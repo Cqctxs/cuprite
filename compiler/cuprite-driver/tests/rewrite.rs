@@ -5,7 +5,7 @@
 
 mod support;
 
-use support::{run, text, Probes};
+use support::{run, text, Probes, NO_PROFILE};
 
 const REPEAT: &str = "cuprite_probes::repeat=3,7,arg2";
 
@@ -22,11 +22,20 @@ fn only_the_named_function_is_rewritten_and_the_cpu_body_still_runs() {
     let probes = demo("cpu");
 
     let trace = run(&probes.exe("repeat_demo"), false, &["1000", "4", "2"]);
-    assert_eq!(trace.matches("-> cpu (CUPRITE_GPU is not 1)").count(), 3);
+    assert_eq!(trace.matches(NO_PROFILE).count(), 3);
 
-    assert!(probes
-        .mir("repeat", "optimized")
-        .contains("cuprite_runtime::map_u32(copy _1, const 3_u32, const 7_u32, copy _2)"));
+    let repeat = probes.mir("repeat", "optimized");
+    assert!(
+        repeat.contains("cuprite_runtime::map_u32(copy _1, const 3_u32, const 7_u32, copy _2)"),
+        "{repeat}"
+    );
+    // The CPU body reports when it finishes, and nothing else returns
+    // without going through either the GPU or that report.
+    assert!(
+        repeat.contains("cuprite_runtime::map_u32_finished(copy "),
+        "{repeat}"
+    );
+    assert_eq!(repeat.matches("return;").count(), 1, "{repeat}");
     for untouched in ["transform", "add_into", "prefix_sum"] {
         assert!(
             !probes

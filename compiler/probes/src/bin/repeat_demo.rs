@@ -3,7 +3,8 @@
 //! with `repeat` rewritten, the same source can run on the GPU.
 //!
 //! Usage: `repeat_demo <elements> <passes> <samples>`. Prints the first
-//! (cold) call and the median of the following (warm) calls.
+//! (cold) call, the median of the following (warm) calls, and the total of
+//! all `samples + 1` calls.
 
 use std::{env, hint::black_box, time::Instant};
 
@@ -37,12 +38,14 @@ fn main() {
         assert!(values == expected, "repeat produced a wrong result");
     }
     let cold = times[0];
+    let total: std::time::Duration = times.iter().sum();
     let mut warm = times[1..].to_vec();
     warm.sort();
     let warm = warm.get(warm.len() / 2).copied().unwrap_or(cold);
     println!(
-        "elements={len} passes={passes} cold_us={:.1} warm_us={:.1}",
+        "elements={len} passes={passes} cold_us={:.1} warm_us={:.1} total_us={:.1}",
         cold.as_secs_f64() * 1e6,
-        warm.as_secs_f64() * 1e6
+        warm.as_secs_f64() * 1e6,
+        total.as_secs_f64() * 1e6
     );
 }

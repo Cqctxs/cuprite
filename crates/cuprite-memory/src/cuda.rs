@@ -13,7 +13,9 @@ use cudarc::{
     nvrtc::Ptx,
 };
 
-use crate::{backend::MemoryBackend, MapStep, MemoryConfig, MemoryError};
+use crate::{
+    backend::MemoryBackend, device::fnv1a, DeviceInfo, MapStep, MemoryConfig, MemoryError,
+};
 
 /// Handwritten PTX for [`MapStep`], compiled by the driver for the installed
 /// GPU when the backend opens, so no CUDA Toolkit is needed. Each thread
@@ -65,7 +67,7 @@ pub(crate) struct CudaBackend {
 }
 
 impl CudaBackend {
-    pub(crate) fn open(config: MemoryConfig) -> Result<Self, MemoryError> {
+    pub(crate) fn open(config: MemoryConfig) -> Result<(Self, DeviceInfo), MemoryError> {
         // cudarc panics on first use if the driver library cannot be loaded,
         // so probe for it to report a missing driver as an ordinary error.
         // SAFETY: this loads the CUDA driver library, whose initialization
@@ -91,7 +93,18 @@ impl CudaBackend {
             .load_module(Ptx::from_src(MAP_PTX))
             .and_then(|module| module.load_function("map_u32"))
             .map_err(unavailable)?;
-        Ok(Self { stream, map })
+        let mut driver_version = 0;
+        // SAFETY: the driver library is loaded (checked above), and the call
+        // writes one `c_int` through a valid pointer.
+        let status = unsafe { cudarc::driver::sys::cuDriverGetVersion(&mut driver_version) };
+        status.result().map_err(unavailable)?;
+        let device = DeviceInfo {
+            name: context.name().map_err(unavailable)?,
+            compute_capability: context.compute_capability().map_err(unavailable)?,
+            driver_version,
+            kernels: fnv1a(MAP_PTX.as_bytes()),
+        };
+        Ok((Self { stream, map }, device))
     }
 }
 
@@ -355,6 +368,19 @@ mod tests {
                 nonempty
             );
         }
+    }
+
+    #[test]
+    fn the_device_reports_its_identity() {
+        let memory = GpuMemory::open(MemoryConfig::default()).unwrap();
+        let device = memory.device();
+        assert!(!device.name.is_empty());
+        assert!(device.compute_capability.0 >= 5, "{device:?}");
+        assert!(device.driver_version >= 12000, "{device:?}");
+        assert_eq!(
+            device.kernels,
+            crate::device::fnv1a(super::MAP_PTX.as_bytes())
+        );
     }
 
     #[test]
