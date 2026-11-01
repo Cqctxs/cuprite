@@ -1,6 +1,7 @@
-//! M2: the recognizer finds the probe crate's maps on its own, rejects
-//! everything else with a reason, and `CUPRITE_AUTO=1` rewrites exactly the
-//! accepted functions, with results identical to the CPU's.
+//! M2 and M3: the recognizer finds the probe crate's maps and repeated maps
+//! on its own, rejects everything else with a reason, and `CUPRITE_AUTO=1`
+//! rewrites exactly the accepted functions, with results identical to the
+//! CPU's.
 
 mod support;
 
@@ -21,8 +22,17 @@ const COMMON: &[(&str, &str)] = &[
     ("numbered", "rejected: uses a value computed outside the loop body"),
     ("outside_factor", "candidate: x * 3 + 0"),
     ("prefix_sum", "rejected: calls `core::slice::<impl [u32]>::len`, which has no GPU summary"),
+    ("reassigned", "rejected: reassigns its parameter `values`"),
     ("reciprocal", "rejected: may panic: division by zero"),
-    ("repeat", "rejected: takes 2 parameters; only `fn(&mut [u32])` is supported"),
+    ("repeat", "candidate: x * 3 + 7, repeated `passes` times"),
+    ("repeat_after_first", "rejected: computes values in the loop body"),
+    ("repeat_composed", "candidate: x * 6 + 14, repeated `passes` times"),
+    ("repeat_fixed", "candidate: x * 3 + 7, repeated 4 times"),
+    ("repeat_from_one", "rejected: counts passes from 1, not 0"),
+    ("repeat_helper", "rejected: calls `with_helper`, which is not a recognized map"),
+    ("repeat_named", "candidate: x * 15 + 33, repeated `passes` times"),
+    ("repeat_nested", "rejected: calls `repeat`, which is not a recognized map"),
+    ("repeat_reassigned", "rejected: reassigns its parameter `passes`"),
     ("reversed", "rejected: calls `<std::slice::IterMut<'_, u32> as std::iter::Iterator>::rev`, which has no GPU summary"),
     ("smooth", "rejected: takes 2 parameters; only `fn(&mut [u32])` is supported"),
     ("square", "rejected: is not a multiply-add map (multiplies the element by itself)"),
@@ -111,19 +121,32 @@ fn differential(name: &'static str) -> std::path::PathBuf {
     probes.exe("candidates")
 }
 
-/// 9 functions times 9 non-empty lengths go to the runtime; empty slices
-/// are left to the CPU.
-const GPU_CALLS: usize = 81;
+/// Runtime calls the differential program makes with `passes` passes, for
+/// each of its 10 lengths (`probes/src/bin/candidates.rs`): 3 repeated maps
+/// with 13 passes, and `repeat_fixed` with 4.
+const REGIONS: [(u32, usize); 2] = [(13, 3), (4, 1)];
+const LENGTHS: usize = 10;
 
 #[test]
 fn rewritten_candidates_match_the_cpu_when_the_runtime_declines() {
     let trace = run(&differential("differential-cpu"), false, &[]);
-    assert_eq!(
-        trace.matches("-> cpu (CUPRITE_GPU is not 1)").count(),
-        GPU_CALLS + 9
+    assert!(
+        trace
+            .lines()
+            .all(|line| line.ends_with("-> cpu (CUPRITE_GPU is not 1)")),
+        "{trace}"
     );
+    // The declined repeated maps fall back to their CPU bodies, which call
+    // the (rewritten) single maps, so only the counted passes are exact.
+    for (passes, functions) in REGIONS {
+        let calls = trace.matches(&format!("passes={passes} ")).count();
+        assert_eq!(calls, functions * LENGTHS, "{passes} passes");
+    }
 }
 
+/// Every non-empty call runs on the GPU, and each repeated map is one call
+/// with all its passes: its CPU body, which would call the per-pass map
+/// once per pass, never runs.
 #[test]
 #[cfg_attr(
     not(feature = "gpu-tests"),
@@ -131,8 +154,20 @@ fn rewritten_candidates_match_the_cpu_when_the_runtime_declines() {
 )]
 fn rewritten_candidates_match_the_cpu_on_the_gpu() {
     let trace = run(&differential("differential-gpu"), true, &[]);
-    assert_eq!(trace.matches("-> gpu").count(), GPU_CALLS, "{trace}");
-    assert_eq!(trace.matches("-> cpu (no work)").count(), 9, "{trace}");
+    let non_empty = LENGTHS - 1;
+    // 9 maps; 3 repeated maps with 1 and 13 passes; `repeat_fixed`.
+    let gpu_calls = 9 * non_empty + 3 * 2 * non_empty + non_empty;
+    assert_eq!(trace.matches("-> gpu").count(), gpu_calls, "{trace}");
+    for (passes, functions) in REGIONS {
+        let calls = trace.matches(&format!("passes={passes} -> gpu")).count();
+        assert_eq!(calls, functions * non_empty, "{passes} passes");
+    }
+    assert!(
+        trace
+            .lines()
+            .all(|line| line.ends_with("-> gpu") || line.ends_with("-> cpu (no work)")),
+        "{trace}"
+    );
 }
 
 #[test]

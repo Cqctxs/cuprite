@@ -232,6 +232,79 @@ pub fn numbered(values: &mut [u32]) {
     }
 }
 
+/// Looks like a map over its parameter, but iterates over an empty slice:
+/// the caller's slice must stay unchanged.
+#[allow(unused_assignments)]
+pub fn reassigned(mut values: &mut [u32]) {
+    values = &mut [];
+    for value in values {
+        *value = value.wrapping_add(1);
+    }
+}
+
+// Repeated maps (M3): counted loops around calls to maps.
+
+/// A fixed number of passes.
+pub fn repeat_fixed(values: &mut [u32]) {
+    for _ in 0..4 {
+        transform(values);
+    }
+}
+
+/// Two maps per pass, which compose into `x * 6 + 14`.
+pub fn repeat_composed(values: &mut [u32], passes: u32) {
+    for _ in 0..passes {
+        transform(values);
+        double(values);
+    }
+}
+
+/// The pass number is bound but unused.
+pub fn repeat_named(values: &mut [u32], passes: u32) {
+    for _pass in 0..passes {
+        affine_chain(values);
+    }
+}
+
+/// Repeats a function that is not a map.
+pub fn repeat_helper(values: &mut [u32], passes: u32) {
+    for _ in 0..passes {
+        with_helper(values);
+    }
+}
+
+/// Runs one pass fewer than `passes`.
+pub fn repeat_from_one(values: &mut [u32], passes: u32) {
+    for _ in 1..passes {
+        transform(values);
+    }
+}
+
+/// The work depends on the pass number.
+pub fn repeat_after_first(values: &mut [u32], passes: u32) {
+    for pass in 0..passes {
+        if pass > 0 {
+            transform(values);
+        }
+    }
+}
+
+/// Changes the count before the loop.
+#[allow(unused_assignments)]
+pub fn repeat_reassigned(values: &mut [u32], mut passes: u32) {
+    passes = 2;
+    for _ in 0..passes {
+        transform(values);
+    }
+}
+
+/// Repeats a repeated map.
+pub fn repeat_nested(values: &mut [u32], passes: u32) {
+    for _ in 0..passes {
+        repeat(values, 2);
+    }
+}
+
 /// Number of calls `counted` has made, for tests.
 pub fn counted_calls() -> u32 {
     CALLS.load(Ordering::Relaxed)
@@ -297,6 +370,61 @@ mod tests {
         assert_eq!(mapped(reversed, vec![1, 2]), [3, 6]);
         assert_eq!(mapped(two_loops, vec![5, 6]), [1, 1]);
         assert_eq!(mapped(numbered, vec![10, 10, 10]), [10, 11, 12]);
+        assert_eq!(mapped(reassigned, vec![1, 2]), [1, 2]);
+    }
+
+    fn passes(f: fn(u32) -> u32, passes: u32, values: Vec<u32>) -> Vec<u32> {
+        values
+            .into_iter()
+            .map(|mut v| {
+                for _ in 0..passes {
+                    v = f(v);
+                }
+                v
+            })
+            .collect()
+    }
+
+    #[test]
+    fn repeated_maps_behave_like_ordinary_rust() {
+        let mut values = input();
+        repeat_fixed(&mut values);
+        assert_eq!(values, passes(map, 4, input()));
+
+        let composed = |v| map(v).wrapping_mul(2);
+        for count in [0, 1, 3] {
+            let mut values = input();
+            repeat_composed(&mut values, count);
+            assert_eq!(values, passes(composed, count, input()));
+        }
+
+        let chain = |v: u32| v.wrapping_mul(15).wrapping_add(33);
+        let mut values = input();
+        repeat_named(&mut values, 3);
+        assert_eq!(values, passes(chain, 3, input()));
+
+        let mut values = input();
+        repeat_helper(&mut values, 2);
+        assert_eq!(values, passes(|v| v.wrapping_mul(3), 2, input()));
+
+        let mut values = input();
+        repeat_from_one(&mut values, 3);
+        assert_eq!(values, passes(map, 2, input()));
+        let mut values = input();
+        repeat_from_one(&mut values, 0);
+        assert_eq!(values, input());
+
+        let mut values = input();
+        repeat_after_first(&mut values, 3);
+        assert_eq!(values, passes(map, 2, input()));
+
+        let mut values = input();
+        repeat_reassigned(&mut values, 5);
+        assert_eq!(values, passes(map, 2, input()));
+
+        let mut values = input();
+        repeat_nested(&mut values, 3);
+        assert_eq!(values, passes(map, 6, input()));
     }
 
     #[test]

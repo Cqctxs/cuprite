@@ -2,8 +2,8 @@
 //!
 //! Functions are chosen by the recognizer (`analyze`, with
 //! `CUPRITE_AUTO=1`) or by hand: `CUPRITE_REPLACE` names functions to
-//! rewrite and the map each computes, which also covers shapes the
-//! recognizer does not handle yet, such as `repeat`:
+//! rewrite and the map each computes, for shapes the recognizer does not
+//! handle:
 //!
 //! ```text
 //! CUPRITE_REPLACE=cuprite_probes::transform=3,7,1;cuprite_probes::repeat=3,7,arg2
@@ -83,8 +83,8 @@ pub(crate) fn parse(spec: &str) -> Result<Vec<Replacement>, String> {
 
 /// Wraps rustc's own `optimized_mir`. A function named in `CUPRITE_REPLACE`
 /// gets a rewritten copy; with `CUPRITE_AUTO=1`, so does every function the
-/// recognizer accepted, as a single pass of its map. Everything else is
-/// returned unchanged.
+/// recognizer accepted: a map as a single pass, a repeated map with its pass
+/// count. Everything else is returned unchanged.
 pub(crate) fn optimized_mir<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tcx Body<'tcx> {
     let body = (rustc_interface::DEFAULT_QUERY_PROVIDERS
         .queries
@@ -99,14 +99,18 @@ pub(crate) fn optimized_mir<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tc
         tcx.def_path_str(def_id)
     );
     let manual = settings.replacements.iter().find(|r| r.path == path);
-    let automatic = || match analyze::verdict(def_id) {
-        Some(Verdict::Candidate(map)) if settings.auto => Some(Replacement {
+    let automatic = || {
+        let (map, passes) = match analyze::verdict(tcx, def_id)? {
+            Verdict::Candidate(map) => (map, Passes::Const(1)),
+            Verdict::Repeated(map, passes) => (map, passes),
+            Verdict::Rejected(_) => return None,
+        };
+        settings.auto.then(|| Replacement {
             path: path.clone(),
             mul: map.mul,
             add: map.add,
-            passes: Passes::Const(1),
-        }),
-        _ => None,
+            passes,
+        })
     };
     let Some(replacement) = manual.cloned().or_else(automatic) else {
         return body;
