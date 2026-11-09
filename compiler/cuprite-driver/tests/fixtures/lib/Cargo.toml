@@ -1,0 +1,9 @@
+# A library used by the fixture application, outside its workspace.
+[package]
+name = "fixture-lib"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Its own workspace, so it can also be tested on its own.
+[workspace]

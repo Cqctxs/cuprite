@@ -1,6 +1,6 @@
 [package]
 name = "cuprite-driver"
-description = "rustc driver for Cuprite's compiler feasibility work"
+description = "rustc driver that rewrites GPU candidates, and `cargo cuprite`, which builds packages with it"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -13,6 +13,7 @@ rustc_private = true
 # Declares an NVIDIA GPU test host: the GPU-path tests run and must pass.
 gpu-tests = []
 
-[dev-dependencies]
-# Reads Cargo's JSON build messages to locate the runtime's artifacts.
+[dependencies]
+# Reads Cargo's JSON output: `cargo cuprite` and the tests use it to locate
+# the runtime's artifacts and the target directory.
 serde_json = "=1.0.140"

@@ -6,12 +6,16 @@
 //!   every candidate with `CUPRITE_AUTO=1`, or those named in
 //!   `CUPRITE_REPLACE`.
 //!
-//! Use it as Cargo's workspace wrapper so only workspace members, not
-//! dependencies, pass through Cuprite:
+//! `cargo cuprite` (`src/bin/cargo-cuprite.rs`) runs it as Cargo's `RUSTC`,
+//! so every crate passes through it. It can also be Cargo's workspace
+//! wrapper, so that only workspace members do:
 //!
 //! ```text
 //! RUSTC_WORKSPACE_WRAPPER=path/to/cuprite-driver CUPRITE_REPORT=out cargo build -p cuprite-probes
 //! ```
+//!
+//! Build scripts, procedural macros and Cuprite's own crates always compile
+//! as with plain rustc.
 
 #![feature(rustc_private)]
 
@@ -52,12 +56,17 @@ const TRACKED: [&str; 6] = [
     replace::RUNTIME_DEPS_VAR,
 ];
 
+/// Cuprite's own crates, which are never analyzed or linked to the runtime.
+const CUPRITE_CRATES: [&str; 2] = [replace::RUNTIME_CRATE, "cuprite_memory"];
+
 #[derive(Default)]
 pub(crate) struct Settings {
     pub(crate) dump: Option<PathBuf>,
     pub(crate) report: Option<PathBuf>,
     pub(crate) auto: bool,
     pub(crate) replacements: Vec<replace::Replacement>,
+    /// The runtime files this crate was given, which it is rebuilt after.
+    pub(crate) runtime: Vec<String>,
 }
 
 impl Settings {
@@ -101,11 +110,17 @@ impl Callbacks for Driver {
     fn config(&mut self, config: &mut interface::Config) {
         // Cargo does not know the driver reads these, so record them in
         // rustc's dependency info: changing one then triggers a rebuild.
+        // The runtime's files are inputs too: a rebuilt runtime must be
+        // linked again.
         config.track_state = Some(Box::new(|session| {
             let mut depinfo = session.env_depinfo.borrow_mut();
             for name in TRACKED {
                 let value = env::var(name).ok().map(|value| Symbol::intern(&value));
                 depinfo.insert((Symbol::intern(name), value));
+            }
+            let mut files = session.file_depinfo.borrow_mut();
+            for file in &settings().runtime {
+                files.insert(Symbol::intern(file));
             }
         }));
         if settings().active() {
@@ -141,35 +156,54 @@ fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .map(|pair| pair[1].as_str())
 }
 
+/// Whether this invocation compiles as plain rustc: Cargo's information
+/// queries, which compile nothing; build scripts and procedural macros,
+/// which run while building rather than in the program; and Cuprite's own
+/// crates, which must never call themselves.
+fn bypasses(args: &[String]) -> bool {
+    let info_query = args.iter().any(|arg| {
+        matches!(arg.as_str(), "-vV" | "-V" | "--version") || arg.starts_with("--print")
+    });
+    let crate_name = arg_value(args, "--crate-name").unwrap_or_default();
+    info_query
+        || crate_name.starts_with("build_script_")
+        || CUPRITE_CRATES.contains(&crate_name)
+        || arg_value(args, "--crate-type") == Some("proc-macro")
+}
+
 /// Makes the runtime crate visible to the crate being compiled without the
 /// crate declaring it, and lets the final link find its dependencies.
-fn add_runtime_args(args: &mut Vec<String>) {
-    let Some(runtime) = env::var_os(replace::RUNTIME_VAR) else {
-        return;
+/// Returns the runtime files.
+fn add_runtime_args(early_dcx: &EarlyDiagCtxt, args: &mut Vec<String>) -> Vec<String> {
+    // rustc's arguments are UTF-8, so other paths can't be passed on.
+    let utf8 = |path: PathBuf| match path.into_os_string().into_string() {
+        Ok(path) => path,
+        Err(path) => early_dcx.early_fatal(format!(
+            "cuprite: runtime path {} is not UTF-8",
+            Path::new(&path).display()
+        )),
     };
-    if arg_value(args, "--crate-name") == Some(replace::RUNTIME_CRATE) {
-        return; // Never make the runtime depend on itself.
-    }
+    let Some(runtime) = env::var_os(replace::RUNTIME_VAR) else {
+        return Vec::new();
+    };
     args.push("-Zunstable-options".into());
     // Cargo may store metadata in a separate `.rmeta` next to a stub
     // `.rlib`; rustc needs both, so the variable is a path list.
-    for file in env::split_paths(&runtime) {
+    let files: Vec<String> = env::split_paths(&runtime).map(utf8).collect();
+    for file in &files {
         args.push("--extern".into());
-        args.push(format!(
-            "force:{}={}",
-            replace::RUNTIME_CRATE,
-            file.display()
-        ));
+        args.push(format!("force:{}={file}", replace::RUNTIME_CRATE));
     }
     if let Some(deps) = env::var_os(replace::RUNTIME_DEPS_VAR) {
         for dir in env::split_paths(&deps) {
             args.push("-L".into());
-            args.push(format!("dependency={}", dir.display()));
+            args.push(format!("dependency={}", utf8(dir)));
         }
     }
+    files
 }
 
-fn read_settings(early_dcx: &EarlyDiagCtxt) -> Settings {
+fn read_settings(early_dcx: &EarlyDiagCtxt, runtime: Vec<String>) -> Settings {
     let replacements = match env::var(replace::VAR).map(|spec| replace::parse(&spec)) {
         Ok(Ok(replacements)) => replacements,
         Ok(Err(message)) => early_dcx.early_fatal(message),
@@ -180,6 +214,7 @@ fn read_settings(early_dcx: &EarlyDiagCtxt) -> Settings {
         report: env::var_os(analyze::REPORT_VAR).map(PathBuf::from),
         auto: env::var_os(analyze::AUTO_VAR).is_some_and(|value| value == "1"),
         replacements,
+        runtime,
     }
 }
 
@@ -195,16 +230,11 @@ fn main() -> ExitCode {
             args.remove(1);
         }
 
-        // Cargo's information queries compile nothing, so they get plain
-        // rustc behavior.
-        let info_query = args
-            .iter()
-            .any(|arg| arg == "-vV" || arg.starts_with("--print"));
-        let settings = if info_query {
+        let settings = if bypasses(&args) {
             Settings::default()
         } else {
-            add_runtime_args(&mut args);
-            read_settings(&early_dcx)
+            let runtime = add_runtime_args(&early_dcx, &mut args);
+            read_settings(&early_dcx, runtime)
         };
         if SETTINGS.set(settings).is_err() {
             unreachable!("the driver compiles one crate per process");

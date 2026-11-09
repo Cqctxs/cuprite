@@ -1,0 +1,15 @@
+# An application built with `cargo cuprite` (`tests/packages.rs`). It knows
+# nothing about Cuprite.
+[package]
+name = "cuprite-fixture-app"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Its own workspace, apart from Cuprite's.
+[workspace]
+
+[dependencies]
+fixture-lib = { path = "../lib" }
+fixture-macros = { path = "../macros" }
+rayon = "=1.12.0"

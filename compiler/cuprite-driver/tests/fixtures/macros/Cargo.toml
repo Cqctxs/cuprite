@@ -1,0 +1,11 @@
+# A procedural macro used by the fixture application.
+[package]
+name = "fixture-macros"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+proc-macro = true
