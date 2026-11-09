@@ -129,7 +129,7 @@ fn run_app(env: &[(&str, &OsStr)]) -> (String, String) {
 
 /// What the application prints, computed independently: the library's
 /// `x * 5 + 1` for `PASSES` passes, then the application's `x * 7 + 42`,
-/// summed; then 7 from the build script.
+/// summed; then 36 from the build script (`7 * 5 + 1`, through the library).
 fn expected() -> String {
     let checksum: u64 = (0..LEN)
         .map(|mut x| {
@@ -139,7 +139,7 @@ fn expected() -> String {
             u64::from(x.wrapping_mul(7).wrapping_add(42))
         })
         .sum();
-    format!("{checksum} 7")
+    format!("{checksum} 36")
 }
 
 /// The calls the application makes: the library's region, then its own map.

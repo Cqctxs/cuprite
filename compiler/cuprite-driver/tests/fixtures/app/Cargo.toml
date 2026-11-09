@@ -9,6 +9,9 @@ publish = false
 # Its own workspace, apart from Cuprite's.
 [workspace]
 
+[build-dependencies]
+fixture-lib = { path = "../lib" }
+
 [dependencies]
 fixture-lib = { path = "../lib" }
 fixture-macros = { path = "../macros" }

@@ -32,8 +32,9 @@ const LIBRARY_PATH_VAR: &str = if cfg!(windows) {
 };
 
 /// Variables the driver reads, cleared for the runtime's own build.
-const DRIVER_VARS: [&str; 6] = [
+const DRIVER_VARS: [&str; 7] = [
     "CUPRITE_DUMP_MIR",
+    "CUPRITE_CENSUS",
     "CUPRITE_REPORT",
     "CUPRITE_AUTO",
     "CUPRITE_REPLACE",

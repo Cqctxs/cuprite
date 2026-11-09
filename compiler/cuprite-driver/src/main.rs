@@ -1,5 +1,6 @@
 //! A rustc driver: compiles exactly like rustc, and can additionally
 //! - dump MIR (`dump`, `CUPRITE_DUMP_MIR=<dir>`),
+//! - describe every loop, for surveys (`census`, `CUPRITE_CENSUS=<dir>`),
 //! - report which functions are GPU candidates (`analyze`,
 //!   `CUPRITE_REPORT=<dir>`),
 //! - rewrite functions to dispatch to the Cuprite runtime (`replace`):
@@ -29,6 +30,7 @@ extern crate rustc_session;
 extern crate rustc_span;
 
 mod analyze;
+mod census;
 mod dump;
 mod replace;
 
@@ -47,8 +49,9 @@ use rustc_session::{config::ErrorOutputType, EarlyDiagCtxt};
 use rustc_span::{def_id::LocalDefId, Symbol};
 
 /// Every setting the driver reads, recorded as build inputs.
-const TRACKED: [&str; 6] = [
+const TRACKED: [&str; 7] = [
     dump::VAR,
+    census::VAR,
     analyze::REPORT_VAR,
     analyze::AUTO_VAR,
     replace::VAR,
@@ -63,10 +66,12 @@ const CUPRITE_CRATES: [&str; 2] = [replace::RUNTIME_CRATE, "cuprite_memory"];
 pub(crate) struct Settings {
     pub(crate) dump: Option<PathBuf>,
     pub(crate) report: Option<PathBuf>,
+    pub(crate) census: Option<PathBuf>,
     pub(crate) auto: bool,
     pub(crate) replacements: Vec<replace::Replacement>,
-    /// The runtime files this crate was given, which it is rebuilt after.
-    pub(crate) runtime: Vec<String>,
+    /// Files this crate is rebuilt after: the driver itself, whose rules
+    /// decide what is rewritten, and the runtime it was given.
+    pub(crate) inputs: Vec<String>,
 }
 
 impl Settings {
@@ -75,7 +80,10 @@ impl Settings {
     }
 
     fn active(&self) -> bool {
-        self.dump.is_some() || self.analyzes() || !self.replacements.is_empty()
+        self.dump.is_some()
+            || self.census.is_some()
+            || self.analyzes()
+            || !self.replacements.is_empty()
     }
 }
 
@@ -97,6 +105,9 @@ fn mir_built<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tcx Steal<Body<'t
         if settings.dump.is_some() {
             dump::record(tcx, def_id, &body);
         }
+        if settings.census.is_some() {
+            census::record(tcx, def_id, &body);
+        }
         if settings.analyzes() {
             analyze::record(tcx, def_id, &body);
         }
@@ -110,8 +121,8 @@ impl Callbacks for Driver {
     fn config(&mut self, config: &mut interface::Config) {
         // Cargo does not know the driver reads these, so record them in
         // rustc's dependency info: changing one then triggers a rebuild.
-        // The runtime's files are inputs too: a rebuilt runtime must be
-        // linked again.
+        // `Settings::inputs` are recorded too: Cargo sees only the driver's
+        // version, which is rustc's, and not the runtime at all.
         config.track_state = Some(Box::new(|session| {
             let mut depinfo = session.env_depinfo.borrow_mut();
             for name in TRACKED {
@@ -119,7 +130,7 @@ impl Callbacks for Driver {
                 depinfo.insert((Symbol::intern(name), value));
             }
             let mut files = session.file_depinfo.borrow_mut();
-            for file in &settings().runtime {
+            for file in &settings().inputs {
                 files.insert(Symbol::intern(file));
             }
         }));
@@ -146,6 +157,9 @@ impl Callbacks for Driver {
         if let Some(dir) = &settings.report {
             analyze::write_report(tcx, dir);
         }
+        if let Some(dir) = &settings.census {
+            census::write(tcx, dir);
+        }
         Compilation::Continue
     }
 }
@@ -156,54 +170,66 @@ fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .map(|pair| pair[1].as_str())
 }
 
-/// Whether this invocation compiles as plain rustc: Cargo's information
-/// queries, which compile nothing; build scripts and procedural macros,
-/// which run while building rather than in the program; and Cuprite's own
+/// Cargo's information queries, which compile nothing.
+fn is_info_query(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "-vV" | "-V" | "--version") || arg.starts_with("--print"))
+}
+
+/// Crates compiled without analysis: build scripts and procedural macros,
+/// which run while building rather than in the program, and Cuprite's own
 /// crates, which must never call themselves.
 fn bypasses(args: &[String]) -> bool {
-    let info_query = args.iter().any(|arg| {
-        matches!(arg.as_str(), "-vV" | "-V" | "--version") || arg.starts_with("--print")
-    });
     let crate_name = arg_value(args, "--crate-name").unwrap_or_default();
-    info_query
-        || crate_name.starts_with("build_script_")
+    crate_name.starts_with("build_script_")
         || CUPRITE_CRATES.contains(&crate_name)
         || arg_value(args, "--crate-type") == Some("proc-macro")
+}
+
+/// rustc's arguments are UTF-8, so other paths can't be passed on.
+fn utf8(early_dcx: &EarlyDiagCtxt, path: PathBuf) -> String {
+    match path.into_os_string().into_string() {
+        Ok(path) => path,
+        Err(path) => early_dcx.early_fatal(format!(
+            "cuprite: runtime path {} is not UTF-8",
+            Path::new(&path).display()
+        )),
+    }
+}
+
+/// Lets the crate find the runtime and its dependencies when a crate it
+/// links depends on them.
+fn add_runtime_dirs(early_dcx: &EarlyDiagCtxt, args: &mut Vec<String>) {
+    if let Some(deps) = env::var_os(replace::RUNTIME_DEPS_VAR) {
+        for dir in env::split_paths(&deps) {
+            args.push("-L".into());
+            args.push(format!("dependency={}", utf8(early_dcx, dir)));
+        }
+    }
 }
 
 /// Makes the runtime crate visible to the crate being compiled without the
 /// crate declaring it, and lets the final link find its dependencies.
 /// Returns the runtime files.
 fn add_runtime_args(early_dcx: &EarlyDiagCtxt, args: &mut Vec<String>) -> Vec<String> {
-    // rustc's arguments are UTF-8, so other paths can't be passed on.
-    let utf8 = |path: PathBuf| match path.into_os_string().into_string() {
-        Ok(path) => path,
-        Err(path) => early_dcx.early_fatal(format!(
-            "cuprite: runtime path {} is not UTF-8",
-            Path::new(&path).display()
-        )),
-    };
     let Some(runtime) = env::var_os(replace::RUNTIME_VAR) else {
         return Vec::new();
     };
     args.push("-Zunstable-options".into());
     // Cargo may store metadata in a separate `.rmeta` next to a stub
     // `.rlib`; rustc needs both, so the variable is a path list.
-    let files: Vec<String> = env::split_paths(&runtime).map(utf8).collect();
+    let files: Vec<String> = env::split_paths(&runtime)
+        .map(|file| utf8(early_dcx, file))
+        .collect();
     for file in &files {
         args.push("--extern".into());
         args.push(format!("force:{}={file}", replace::RUNTIME_CRATE));
     }
-    if let Some(deps) = env::var_os(replace::RUNTIME_DEPS_VAR) {
-        for dir in env::split_paths(&deps) {
-            args.push("-L".into());
-            args.push(format!("dependency={}", utf8(dir)));
-        }
-    }
+    add_runtime_dirs(early_dcx, args);
     files
 }
 
-fn read_settings(early_dcx: &EarlyDiagCtxt, runtime: Vec<String>) -> Settings {
+fn read_settings(early_dcx: &EarlyDiagCtxt, inputs: Vec<String>) -> Settings {
     let replacements = match env::var(replace::VAR).map(|spec| replace::parse(&spec)) {
         Ok(Ok(replacements)) => replacements,
         Ok(Err(message)) => early_dcx.early_fatal(message),
@@ -212,9 +238,10 @@ fn read_settings(early_dcx: &EarlyDiagCtxt, runtime: Vec<String>) -> Settings {
     Settings {
         dump: env::var_os(dump::VAR).map(PathBuf::from),
         report: env::var_os(analyze::REPORT_VAR).map(PathBuf::from),
+        census: env::var_os(census::VAR).map(PathBuf::from),
         auto: env::var_os(analyze::AUTO_VAR).is_some_and(|value| value == "1"),
         replacements,
-        runtime,
+        inputs,
     }
 }
 
@@ -230,11 +257,19 @@ fn main() -> ExitCode {
             args.remove(1);
         }
 
-        let settings = if bypasses(&args) {
+        let settings = if is_info_query(&args) {
+            Settings::default()
+        } else if bypasses(&args) {
+            // A build script or procedural macro may link libraries that were
+            // given the runtime, such as its build dependencies.
+            add_runtime_dirs(&early_dcx, &mut args);
             Settings::default()
         } else {
-            let runtime = add_runtime_args(&early_dcx, &mut args);
-            read_settings(&early_dcx, runtime)
+            let mut inputs = add_runtime_args(&early_dcx, &mut args);
+            if let Ok(driver) = env::current_exe() {
+                inputs.push(utf8(&early_dcx, driver));
+            }
+            read_settings(&early_dcx, inputs)
         };
         if SETTINGS.set(settings).is_err() {
             unreachable!("the driver compiles one crate per process");
