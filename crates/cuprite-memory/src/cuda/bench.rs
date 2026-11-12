@@ -19,14 +19,17 @@ use cudarc::driver::{CudaFunction, CudaStream};
 use rayon::prelude::*;
 
 use super::{
-    fixture::{add_seven, input, launch_in_session, launch_on, lcg64, lcg_step, LCG_ROUNDS},
+    fixture::{add_seven, input, launch_on, lcg64, lcg_step, raw_function, run_job, LCG_ROUNDS},
     CudaBackend,
 };
-use crate::{backend::MemoryBackend, manager::Manager, MemoryConfig};
+use crate::{backend::MemoryBackend, manager::Manager, Arg, Grid, Kernel, MemoryConfig};
 
 struct Workload {
     name: &'static str,
-    function: CudaFunction,
+    /// The kernel loaded directly through cudarc, for the raw baseline.
+    raw: CudaFunction,
+    /// The same kernel loaded by the manager.
+    kernel: Kernel,
     /// One CPU pass over a slice, equivalent to one kernel launch.
     cpu_pass: fn(&mut [u32]),
     /// Relative CPU cost per element, used only to pick sample counts.
@@ -129,7 +132,7 @@ fn region_table(manager: &mut Manager<CudaBackend>, stream: &Arc<CudaStream>, wo
         "per-op/res",
         "rayon/res"
     );
-    let function = &workload.function;
+    let (raw, kernel) = (&workload.raw, workload.kernel);
     let pass = workload.cpu_pass;
     for &len in workload.lengths {
         let base = input(len);
@@ -160,37 +163,27 @@ fn region_table(manager: &mut Manager<CudaBackend>, stream: &Arc<CudaStream>, wo
             let raw = measure(&base, &expected, samples, |values| {
                 stream.memcpy_htod(&*values, &mut raw_buffer).unwrap();
                 for _ in 0..reps {
-                    launch_on(stream, function, &mut raw_buffer);
+                    launch_on(stream, raw, &mut raw_buffer);
                 }
                 stream.memcpy_dtoh(&raw_buffer, values).unwrap();
                 stream.synchronize().unwrap();
             });
 
             let resident = measure(&base, &expected, samples, |values| {
-                let mut session = manager.begin_mut(values).unwrap();
-                for _ in 0..reps {
-                    launch_in_session(&mut session, function);
-                }
-                session.finish().unwrap();
+                run_job(manager, values, kernel, reps, true);
             });
 
             // Same, but with no reuse: `trim` frees the pooled device buffer
             // and host staging, so every session allocates both afresh.
             let allocating = measure(&base, &expected, samples, |values| {
                 manager.trim();
-                let mut session = manager.begin_mut(values).unwrap();
-                for _ in 0..reps {
-                    launch_in_session(&mut session, function);
-                }
-                session.finish().unwrap();
+                run_job(manager, values, kernel, reps, true);
             });
 
             // No residency: upload and download around every operation.
             let per_op = measure(&base, &expected, samples, |values| {
                 for _ in 0..reps {
-                    let mut session = manager.begin_mut(values).unwrap();
-                    launch_in_session(&mut session, function);
-                    session.finish().unwrap();
+                    run_job(manager, values, kernel, 1, true);
                 }
             });
 
@@ -211,18 +204,14 @@ fn region_table(manager: &mut Manager<CudaBackend>, stream: &Arc<CudaStream>, wo
     }
 }
 
-fn phase_table(
-    manager: &mut Manager<CudaBackend>,
-    stream: &Arc<CudaStream>,
-    function: &CudaFunction,
-) {
-    println!("\nPhases of one resident add_seven session with 8 kernels (median)\n");
+fn phase_table(manager: &mut Manager<CudaBackend>, stream: &Arc<CudaStream>, kernel: Kernel) {
+    println!("\nPhases of one resident add_seven job with 8 kernels (median)\n");
     println!(
         "{:>10} | {:>10} {:>10} {:>10} | {:>10} {:>10} {:>10} | {:>8} {:>8}",
         "elements",
         "host copy",
         "raw up",
-        "begin_mut",
+        "upload",
         "8 kernels",
         "raw down",
         "finish",
@@ -256,18 +245,21 @@ fn phase_table(
             let raw_down = start.elapsed();
 
             let start = Instant::now();
-            let mut session = manager.begin_mut(&mut values).unwrap();
+            let mut job = manager.job().unwrap();
+            let buffer = job.in_out(&mut values).unwrap();
+            job.manager.backend.synchronize().unwrap();
             let begin = start.elapsed();
 
             let start = Instant::now();
+            let args = [Arg::Buffer(buffer), Arg::U64(len as u64)];
             for _ in 0..8 {
-                launch_in_session(&mut session, function);
+                job.launch(kernel, Grid::Linear(len as u64), &args).unwrap();
             }
-            session.write_parts().unwrap().0.synchronize().unwrap();
+            job.manager.backend.synchronize().unwrap();
             let kernels = start.elapsed();
 
             let start = Instant::now();
-            session.finish().unwrap();
+            job.finish().unwrap();
             let finish = start.elapsed();
 
             if sample > 0 {
@@ -307,7 +299,8 @@ fn residency() {
     let workloads = [
         Workload {
             name: "add_seven (memory-bound)",
-            function: add_seven(&stream),
+            raw: raw_function(&stream, "add_seven"),
+            kernel: add_seven(&mut manager),
             cpu_pass: add_seven_pass,
             weight: 1,
             lengths: &[1, 257, 4096, 65_536, 1_048_576, 16_777_216],
@@ -315,7 +308,8 @@ fn residency() {
         },
         Workload {
             name: "lcg64 (compute-bound, 64 multiply-adds per element)",
-            function: lcg64(&stream),
+            raw: raw_function(&stream, "lcg64"),
+            kernel: lcg64(&mut manager),
             cpu_pass: lcg_pass,
             weight: 16,
             lengths: &[4096, 65_536, 1_048_576, 16_777_216],
@@ -325,7 +319,7 @@ fn residency() {
     for workload in &workloads {
         region_table(&mut manager, &stream, workload);
     }
-    phase_table(&mut manager, &stream, &workloads[0].function);
+    phase_table(&mut manager, &stream, workloads[0].kernel);
 
     let stats = manager.stats();
     println!(

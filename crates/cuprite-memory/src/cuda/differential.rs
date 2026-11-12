@@ -4,17 +4,18 @@
 
 use std::cell::RefCell;
 
-use cudarc::driver::CudaFunction;
 use proptest::{
     prelude::*,
     test_runner::{Config, TestRunner},
 };
 
 use super::{
-    fixture::{add_seven, launch_in_session, lcg64, lcg_step, LCG_ROUNDS},
+    fixture::{add_seven, lcg64, lcg_step, run_job, LCG_ROUNDS},
     CudaBackend,
 };
 use crate::{manager::Manager, MapStep, MemoryConfig};
+
+type Loaded = crate::Kernel;
 
 #[derive(Clone, Copy, Debug)]
 enum Kernel {
@@ -37,16 +38,15 @@ impl Kernel {
 
 struct Gpu {
     manager: Manager<CudaBackend>,
-    add_seven: CudaFunction,
-    lcg: CudaFunction,
+    add_seven: Loaded,
+    lcg: Loaded,
 }
 
 impl Gpu {
     fn open() -> Self {
         let config = MemoryConfig::default();
-        let manager = Manager::new(CudaBackend::open(config).unwrap().0, config);
-        let stream = &manager.backend.stream;
-        let (add_seven, lcg) = (add_seven(stream), lcg64(stream));
+        let mut manager = Manager::new(CudaBackend::open(config).unwrap().0, config);
+        let (add_seven, lcg) = (add_seven(&mut manager), lcg64(&mut manager));
         Self {
             manager,
             add_seven,
@@ -54,10 +54,10 @@ impl Gpu {
         }
     }
 
-    fn function(&self, kernel: Kernel) -> CudaFunction {
+    fn function(&self, kernel: Kernel) -> Loaded {
         match kernel {
-            Kernel::AddSeven => self.add_seven.clone(),
-            Kernel::Lcg => self.lcg.clone(),
+            Kernel::AddSeven => self.add_seven,
+            Kernel::Lcg => self.lcg,
         }
     }
 }
@@ -112,11 +112,7 @@ fn kernels_match_the_cpu_on_random_inputs() {
             kernel.apply_cpu(&mut expected, reps);
 
             let mut values = input;
-            let mut session = gpu.manager.begin_mut(&mut values).unwrap();
-            for _ in 0..reps {
-                launch_in_session(&mut session, &function);
-            }
-            session.finish().unwrap();
+            run_job(&mut gpu.manager, &mut values, function, reps, true);
 
             prop_assert_eq!(values, expected);
             Ok(())
@@ -139,7 +135,8 @@ fn map_steps_match_the_cpu_on_random_inputs() {
                 .collect();
 
             let mut values = input;
-            let mut session = gpu.manager.begin_mut(&mut values).unwrap();
+            let mut session =
+                crate::session::Resident::begin(&mut gpu.manager, &mut values).unwrap();
             for &step in &steps {
                 session.map(step).unwrap();
             }
@@ -191,15 +188,13 @@ fn random_session_sequences_match_a_cpu_model() {
                 let before = gpu.manager.stats();
 
                 let mut values = step.input;
-                let mut session = gpu.manager.begin_mut(&mut values).unwrap();
-                for _ in 0..step.reps {
-                    launch_in_session(&mut session, &function);
-                }
-                if step.commit {
-                    session.finish().unwrap();
-                } else {
-                    drop(session);
-                }
+                run_job(
+                    &mut gpu.manager,
+                    &mut values,
+                    function,
+                    step.reps,
+                    step.commit,
+                );
 
                 prop_assert_eq!(&values, &expected);
                 let after = gpu.manager.stats();

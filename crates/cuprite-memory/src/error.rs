@@ -15,6 +15,8 @@ pub enum MemoryError {
     /// A GPU operation could not be queued. The session's results are
     /// discarded, since they would be missing that operation.
     Launch(String),
+    /// The driver rejected a kernel's PTX, or it has no such entry.
+    Kernel(String),
     Poisoned,
     /// Marks an operation that has not been written yet.
     NotImplemented(&'static str),
@@ -33,6 +35,7 @@ impl fmt::Display for MemoryError {
             Self::Transfer(message) => write!(formatter, "memory transfer: {message}"),
             Self::Completion(message) => write!(formatter, "GPU completion: {message}"),
             Self::Launch(message) => write!(formatter, "GPU launch: {message}"),
+            Self::Kernel(message) => write!(formatter, "GPU kernel: {message}"),
             Self::Poisoned => write!(formatter, "memory manager cannot safely accept more work"),
             Self::NotImplemented(operation) => write!(formatter, "not implemented: {operation}"),
         }

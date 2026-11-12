@@ -1,8 +1,15 @@
+use std::{
+    collections::HashMap,
+    hash::{DefaultHasher, Hash, Hasher},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
 use crate::{
     backend::{DefaultBackend, MemoryBackend},
+    job::{JobCore, Storage},
     pool::BufferPool,
-    session::{Resources, Session},
-    validate_len, DeviceInfo, MemoryConfig, MemoryError, ResidentSlice,
+    session::Resident,
+    step, DeviceInfo, Job, Kernel, MemoryConfig, MemoryError, ResidentSlice,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -45,12 +52,32 @@ impl GpuMemory {
         }
     }
 
-    /// Borrow both the manager and original slice for the session's lifetime.
+    /// Load the PTX entry `name` from `ptx`, compiling it for this GPU. The
+    /// same PTX and name load once; later calls return the same kernel.
+    ///
+    /// # Errors
+    /// Returns [`MemoryError::Kernel`] if the driver rejects the PTX or it
+    /// has no such entry.
+    pub fn kernel(&mut self, ptx: &str, name: &str) -> Result<Kernel, MemoryError> {
+        self.inner.kernel(ptx, name)
+    }
+
+    /// Start a job: buffers on the GPU, kernels over them, one commit.
+    ///
+    /// # Errors
+    /// Returns [`MemoryError::Poisoned`] if earlier work could not be
+    /// cleaned up safely.
+    pub fn job(&mut self) -> Result<Job<'_>, MemoryError> {
+        self.inner.job().map(Job::new)
+    }
+
+    /// A job over one `u32` slice, uploaded now and committed by `finish`,
+    /// for [`MapStep`](crate::MapStep)s.
     pub fn begin_mut<'a>(
         &'a mut self,
         host: &'a mut [u32],
     ) -> Result<ResidentSlice<'a>, MemoryError> {
-        self.inner.begin_mut(host).map(ResidentSlice::new)
+        Resident::begin(&mut self.inner, host).map(ResidentSlice::new)
     }
 
     pub fn stats(&self) -> MemoryStats {
@@ -69,7 +96,20 @@ impl GpuMemory {
     }
 }
 
-/// The memory manager: owns the backend and enforces the session rules.
+/// Distinguishes managers, so a kernel is only used with the one that
+/// loaded it.
+static NEXT_MANAGER: AtomicU64 = AtomicU64::new(0);
+
+/// How many spare staging buffers are kept at most.
+const SPARE_STAGING: usize = 8;
+
+struct Loaded<K> {
+    ptx: Box<str>,
+    name: Box<str>,
+    kernel: K,
+}
+
+/// The memory manager: owns the backend and enforces the job rules.
 ///
 /// `B` is the backend type, so the same logic runs on any backend: tests use
 /// `Manager<FakeBackend>`, and the real GPU uses `CudaBackend`.
@@ -77,19 +117,24 @@ pub(crate) struct Manager<B: MemoryBackend> {
     pub(crate) backend: B,
     pub(crate) config: MemoryConfig,
     pub(crate) stats: MemoryStats,
-    /// Set while a nonempty session exists. Still being set when the next
-    /// session begins means the last one was forgotten without cleanup.
+    /// Set while a job holds storage. Still being set when the next job
+    /// begins means the last one was forgotten without cleanup.
     pub(crate) active: bool,
-    /// Once set, every new session is refused with `Poisoned`.
+    /// Once set, every new job is refused with `Poisoned`.
     pub(crate) poisoned: bool,
-    /// Resources whose completion could not be established. They are never
-    /// freed or reused; dropping the manager leaks them deliberately.
-    pub(crate) quarantined: Option<Resources<B::Buffer>>,
-    /// Completed, healthy device storage kept for the next session.
+    /// Storage whose completion could not be established. It is never
+    /// freed or reused; dropping the manager leaks it deliberately.
+    pub(crate) quarantined: Option<Vec<Storage<B::Buffer>>>,
+    /// Completed, healthy device storage kept for later jobs.
     pub(crate) pool: BufferPool<B::Buffer>,
-    /// Host staging from the last completed session, kept so the next one
-    /// reuses already-touched pages instead of faulting in new ones.
-    pub(crate) staging: Vec<u32>,
+    /// Host staging from completed jobs, kept so later ones reuse
+    /// already-touched pages instead of faulting in new ones.
+    pub(crate) staging: Vec<Vec<u8>>,
+    kernels: Vec<Loaded<B::Kernel>>,
+    /// Indices into `kernels`, by a hash of their PTX.
+    by_hash: HashMap<u64, Vec<usize>>,
+    pub(crate) id: u64,
+    next_job: u64,
 }
 
 impl<B: MemoryBackend> Manager<B> {
@@ -105,135 +150,153 @@ impl<B: MemoryBackend> Manager<B> {
             quarantined: None,
             pool: BufferPool::new(),
             staging: Vec::new(),
+            kernels: Vec::new(),
+            by_hash: HashMap::new(),
+            id: NEXT_MANAGER.fetch_add(1, Ordering::Relaxed),
+            next_job: 0,
         }
     }
 
-    /// Open a session over `host`: validate, stage, upload, and wait.
-    ///
-    /// Empty input returns an inert session that allocates and transfers
-    /// nothing. Otherwise the request is checked against the budget before
-    /// anything is allocated, `host` is copied into session-owned staging,
-    /// and the device buffer is filled from staging, never from `host`.
-    ///
-    /// A failure after the upload is issued releases the session's storage
-    /// only once completion is established; otherwise it is quarantined.
-    pub(crate) fn begin_mut<'a>(
-        &'a mut self,
-        host: &'a mut [u32],
-    ) -> Result<Session<'a, B>, MemoryError> {
+    pub(crate) fn job(&mut self) -> Result<JobCore<'_, B>, MemoryError> {
         if self.active {
-            // The previous session was forgotten, so its cleanup never ran.
+            // The previous job was forgotten, so its cleanup never ran.
             self.poisoned = true;
         }
         if self.poisoned {
             return Err(MemoryError::Poisoned);
         }
+        let id = self.next_job;
+        self.next_job += 1;
+        Ok(JobCore::new(self, id))
+    }
 
-        if host.is_empty() {
-            return Ok(Session {
-                // `self` is already `&'a mut Manager<B>`: the session takes
-                // over this borrow, so the caller can't use the manager until
-                // the session is gone.
-                manager: self,
-                host,
-                resources: None,
-                may_have_writes: false,
-                failed: false,
+    pub(crate) fn kernel(&mut self, ptx: &str, name: &str) -> Result<Kernel, MemoryError> {
+        if self.poisoned {
+            return Err(MemoryError::Poisoned);
+        }
+        let mut hasher = DefaultHasher::new();
+        ptx.hash(&mut hasher);
+        let hash = hasher.finish();
+        // The hash only narrows the search: a match must have the same PTX.
+        let mut known = self.by_hash.get(&hash).into_iter().flatten();
+        if let Some(&index) =
+            known.find(|&&i| &*self.kernels[i].ptx == ptx && &*self.kernels[i].name == name)
+        {
+            return Ok(Kernel {
+                owner: self.id,
+                index,
             });
         }
+        let kernel = self.backend.load(ptx, name)?;
+        let index = self.kernels.len();
+        self.kernels.push(Loaded {
+            ptx: ptx.into(),
+            name: name.into(),
+            kernel,
+        });
+        self.by_hash.entry(hash).or_default().push(index);
+        Ok(Kernel {
+            owner: self.id,
+            index,
+        })
+    }
 
-        // Reject oversized requests before allocating anything.
-        let bytes = validate_len(host.len(), self.config)?;
+    /// The kernel for [`MapStep`](crate::MapStep), loaded on first use.
+    pub(crate) fn map_kernel(&mut self) -> Result<Kernel, MemoryError> {
+        self.kernel(step::MAP_PTX, step::MAP_NAME)
+    }
 
-        // Copy into memory the session owns; transfers never touch `host`.
-        // CUDA only says a copy from pageable memory "might be synchronous",
-        // so uploading from `host` directly could leave the driver reading it
-        // after a failed session returns and releases the borrow.
-        // The previous session's staging is reused when it is large enough;
-        // `try_reserve_exact` reports allocation failure instead of aborting,
-        // and `map_err` turns its error into a `MemoryError` so `?` can return it.
-        let mut staging = std::mem::take(&mut self.staging);
+    /// The backend and a kernel it loaded, borrowed together for a launch.
+    pub(crate) fn launch_parts(
+        &mut self,
+        kernel: Kernel,
+    ) -> Result<(&mut B, &B::Kernel), MemoryError> {
+        if kernel.owner != self.id {
+            return Err(MemoryError::Launch(
+                "the kernel was loaded by another GpuMemory".into(),
+            ));
+        }
+        Ok((&mut self.backend, &self.kernels[kernel.index].kernel))
+    }
+
+    /// Device storage for `bytes` more while a job holds `held`: an idle
+    /// buffer of exactly that size, or a new one once enough idle storage is
+    /// released to stay within the budget. Returns whether it is new, and
+    /// so zero-filled.
+    pub(crate) fn device_storage(
+        &mut self,
+        held: usize,
+        bytes: usize,
+    ) -> Result<(B::Buffer, bool), MemoryError> {
+        if let Some(buffer) = self.pool.take(bytes) {
+            self.stats.pool_hits += 1;
+            return Ok((buffer, false));
+        }
+        while held + bytes + self.pool.idle_bytes() > self.config.max_device_bytes
+            && self.pool.evict_oldest()
+        {}
+        let buffer = self.backend.allocate(bytes)?;
+        self.stats.device_allocations += 1;
+        Ok((buffer, true))
+    }
+
+    /// Empty staging that can hold `bytes`. Allocation failure is reported
+    /// instead of aborting.
+    pub(crate) fn take_staging(&mut self, bytes: usize) -> Result<Vec<u8>, MemoryError> {
+        let fitting = self
+            .staging
+            .iter()
+            .position(|spare| spare.capacity() >= bytes);
+        let mut staging = match fitting {
+            Some(index) => self.staging.swap_remove(index),
+            None => self.staging.pop().unwrap_or_default(),
+        };
         staging.clear();
         staging
-            .try_reserve_exact(host.len())
+            .try_reserve_exact(bytes)
             .map_err(|error| MemoryError::HostAllocation(error.to_string()))?;
-        staging.extend_from_slice(host);
-
-        // Reuse the idle buffer only for an exact length match. Any other
-        // idle buffer is released first, so active plus idle storage stays
-        // within the budget checked above.
-        let device = match self.pool.take_matching(host.len()) {
-            Some(device) => {
-                self.stats.pool_hits += 1;
-                device
-            }
-            None => {
-                let device = self.backend.allocate(host.len())?;
-                self.stats.device_allocations += 1;
-                device
-            }
-        };
-        let mut resources = Resources { staging, device };
-
-        // Set before any transfer so a forgotten session is detected.
-        self.active = true;
-        let uploaded = self
-            .backend
-            .upload(&mut resources.device, &resources.staging)
-            .and_then(|()| self.backend.synchronize());
-        if let Err(error) = uploaded {
-            // The upload may still be reading staging. Storage from a failed
-            // operation is freed, not pooled.
-            drop(self.settle(resources, true));
-            self.active = false;
-            return Err(error);
-        }
-        // Count the upload only once completion is confirmed.
-        self.stats.uploads += 1;
-        self.stats.uploaded_bytes += bytes as u64; // `usize` to `u64`: never implicit in Rust.
-
-        Ok(Session {
-            manager: self,
-            host,
-            resources: Some(resources),
-            may_have_writes: false,
-            failed: false,
-        })
+        Ok(staging)
     }
 
     pub(crate) fn stats(&self) -> MemoryStats {
         self.stats
     }
 
-    /// Wait for queued work that may still use `resources`.
+    /// Wait for queued work that may still use `storage`.
     ///
     /// `pending` means work may have been queued since the last completed
-    /// synchronize. Returns the resources once completion is established;
-    /// otherwise quarantines them, poisons the manager, and returns `None`.
+    /// synchronize. Returns the storage once completion is established;
+    /// otherwise quarantines it, poisons the manager, and returns `None`.
     pub(crate) fn settle(
         &mut self,
-        resources: Resources<B::Buffer>,
+        storage: Vec<Storage<B::Buffer>>,
         pending: bool,
-    ) -> Option<Resources<B::Buffer>> {
+    ) -> Option<Vec<Storage<B::Buffer>>> {
         if !pending || self.backend.synchronize().is_ok() {
-            return Some(resources);
+            return Some(storage);
         }
         self.poisoned = true;
         if self.quarantined.is_none() {
-            self.quarantined = Some(resources);
+            self.quarantined = Some(storage);
         } else {
-            // Unreachable while poisoning refuses new sessions; leak
-            // rather than free storage that may still be in use.
-            std::mem::forget(resources);
+            // Unreachable while poisoning refuses new jobs; leak rather
+            // than free storage that may still be in use.
+            std::mem::forget(storage);
         }
         None
     }
 
-    /// Keep a completed session's device buffer and staging for reuse.
-    pub(crate) fn recycle(&mut self, resources: Resources<B::Buffer>) {
-        let len = resources.staging.len();
-        self.pool.put_completed(len, resources.device);
-        self.staging = resources.staging;
+    /// Keep completed storage for reuse.
+    pub(crate) fn recycle(&mut self, storage: Storage<B::Buffer>) {
+        if let Some(device) = storage.device {
+            self.pool.put_completed(storage.bytes, device);
+        }
+        if storage.staging.capacity() > 0 {
+            if self.staging.len() == SPARE_STAGING {
+                self.staging.remove(0);
+            }
+            self.staging.push(storage.staging);
+        }
     }
 
     pub(crate) fn trim(&mut self) {
@@ -245,9 +308,9 @@ impl<B: MemoryBackend> Manager<B> {
 impl<B: MemoryBackend> Drop for Manager<B> {
     fn drop(&mut self) {
         // Completion was never established, so freeing could release storage
-        // the GPU still uses. Leaking is bounded to one bundle per manager.
-        if let Some(resources) = self.quarantined.take() {
-            std::mem::forget(resources);
+        // the GPU still uses. Leaking is bounded to one job per manager.
+        if let Some(storage) = self.quarantined.take() {
+            std::mem::forget(storage);
         }
     }
 }

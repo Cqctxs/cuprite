@@ -1,40 +1,58 @@
+/// How many idle buffers the pool keeps at most.
+const SLOTS: usize = 8;
+
 struct IdleBuffer<B> {
-    len: usize,
+    bytes: usize,
     buffer: B,
 }
 
-/// One slot of completed owned storage. The caller proves completion before
-/// insertion. This pool never associates buffers with CPU addresses.
+/// Completed owned storage kept for reuse, by exact byte length, oldest
+/// first. The caller proves completion before insertion. This pool never
+/// associates buffers with CPU addresses.
 pub(crate) struct BufferPool<B> {
-    idle: Option<IdleBuffer<B>>,
+    idle: Vec<IdleBuffer<B>>,
 }
 
 impl<B> BufferPool<B> {
     pub(crate) fn new() -> Self {
-        Self { idle: None }
+        Self { idle: Vec::new() }
     }
 
-    /// Take the idle buffer if it has exactly `len` elements. A buffer of any
-    /// other length is released, so it never counts against the budget
-    /// alongside the replacement the caller is about to allocate.
-    pub(crate) fn take_matching(&mut self, len: usize) -> Option<B> {
-        let idle = self.idle.take()?;
-        (idle.len == len).then_some(idle.buffer)
+    /// Take the most recently kept buffer of exactly `bytes`, if any.
+    pub(crate) fn take(&mut self, bytes: usize) -> Option<B> {
+        let index = self.idle.iter().rposition(|idle| idle.bytes == bytes)?;
+        Some(self.idle.remove(index).buffer)
     }
 
-    /// Keep a buffer whose queued work is known to be complete, replacing
-    /// any buffer already idle.
-    pub(crate) fn put_completed(&mut self, len: usize, buffer: B) {
-        self.idle = Some(IdleBuffer { len, buffer });
+    /// Keep a buffer whose queued work is known to be complete. Beyond the
+    /// pool's capacity, the oldest idle buffer is released.
+    pub(crate) fn put_completed(&mut self, bytes: usize, buffer: B) {
+        if self.idle.len() == SLOTS {
+            self.idle.remove(0);
+        }
+        self.idle.push(IdleBuffer { bytes, buffer });
+    }
+
+    pub(crate) fn idle_bytes(&self) -> usize {
+        self.idle.iter().map(|idle| idle.bytes).sum()
+    }
+
+    /// Release the oldest idle buffer; false if there was none.
+    pub(crate) fn evict_oldest(&mut self) -> bool {
+        if self.idle.is_empty() {
+            return false;
+        }
+        self.idle.remove(0);
+        true
     }
 
     pub(crate) fn clear(&mut self) {
-        self.idle = None;
+        self.idle.clear();
     }
 
     #[cfg(test)]
-    pub(crate) fn idle_len(&self) -> Option<usize> {
-        self.idle.as_ref().map(|idle| idle.len)
+    pub(crate) fn idle_sizes(&self) -> Vec<usize> {
+        self.idle.iter().map(|idle| idle.bytes).collect()
     }
 }
 
@@ -47,31 +65,48 @@ mod tests {
     fn returns_a_matching_buffer_only_once() {
         let mut pool = BufferPool::new();
         pool.put_completed(4, String::from("buffer-a"));
-        assert_eq!(pool.take_matching(4), Some(String::from("buffer-a")));
-        assert_eq!(pool.take_matching(4), None);
+        assert_eq!(pool.take(4), Some(String::from("buffer-a")));
+        assert_eq!(pool.take(4), None);
     }
 
     #[test]
-    fn evicts_a_buffer_with_the_wrong_length() {
+    fn keeps_buffers_of_several_sizes_and_matches_exactly() {
         let mut pool = BufferPool::new();
-        pool.put_completed(4, String::from("buffer-a"));
-        assert_eq!(pool.take_matching(5), None);
-        assert_eq!(pool.take_matching(4), None);
+        pool.put_completed(4, String::from("four"));
+        pool.put_completed(8, String::from("eight"));
+        assert_eq!(pool.take(5), None);
+        assert_eq!(pool.take(8), Some(String::from("eight")));
+        assert_eq!(pool.idle_sizes(), [4]);
     }
 
     #[test]
-    fn trimming_removes_idle_storage() {
+    fn the_most_recent_matching_buffer_is_reused_first() {
         let mut pool = BufferPool::new();
-        pool.put_completed(4, String::from("buffer-a"));
+        pool.put_completed(4, String::from("older"));
+        pool.put_completed(4, String::from("newer"));
+        assert_eq!(pool.take(4), Some(String::from("newer")));
+    }
+
+    #[test]
+    fn beyond_capacity_the_oldest_buffer_is_released() {
+        let mut pool = BufferPool::new();
+        for bytes in 1..=SLOTS + 1 {
+            pool.put_completed(bytes, bytes.to_string());
+        }
+        assert_eq!(pool.take(1), None);
+        assert_eq!(pool.idle_sizes().len(), SLOTS);
+    }
+
+    #[test]
+    fn eviction_and_clearing_release_idle_storage() {
+        let mut pool = BufferPool::new();
+        pool.put_completed(4, String::from("a"));
+        pool.put_completed(8, String::from("b"));
+        assert_eq!(pool.idle_bytes(), 12);
+        assert!(pool.evict_oldest());
+        assert_eq!(pool.idle_sizes(), [8]);
         pool.clear();
-        assert_eq!(pool.take_matching(4), None);
-    }
-
-    #[test]
-    fn a_new_buffer_replaces_the_idle_one() {
-        let mut pool = BufferPool::new();
-        pool.put_completed(4, String::from("buffer-a"));
-        pool.put_completed(4, String::from("buffer-b"));
-        assert_eq!(pool.take_matching(4), Some(String::from("buffer-b")));
+        assert!(!pool.evict_oldest());
+        assert_eq!(pool.idle_bytes(), 0);
     }
 }

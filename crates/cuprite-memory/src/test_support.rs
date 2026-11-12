@@ -1,18 +1,29 @@
 //! Test-only backend with separate CPU storage representing device memory.
 //!
-//! Copies complete immediately; synchronization records an explicit boundary.
-//! Successful operations record element counts, not byte counts. Failed
-//! operations leave destination contents and the event log unchanged.
-//! This backend does not model queued work or real CUDA failure behavior.
+//! Copies and kernels complete immediately; synchronization records an
+//! explicit boundary. Successful operations record byte counts or kernel
+//! names. Failed operations leave destination contents and the event log
+//! unchanged. This backend does not model queued work or real CUDA failure
+//! behavior.
+//!
+//! Kernels are Rust functions looked up by entry name; the PTX is ignored.
 
-use crate::{backend::MemoryBackend, checked_bytes, MapStep, MemoryError};
+use std::cell::RefCell;
+
+use crate::{
+    backend::{MemoryBackend, Value},
+    step::MAP_NAME,
+    Grid, MapStep, MemoryError,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Event {
     Allocate(usize),
     Upload(usize),
     Download(usize),
-    Map(usize, MapStep),
+    Zero(usize),
+    Load(String),
+    Launch(String),
     Synchronize,
 }
 
@@ -21,9 +32,70 @@ pub(crate) enum Operation {
     Allocate,
     Upload,
     Download,
-    Map,
+    Zero,
+    Load,
+    Launch,
     Synchronize,
 }
+
+/// Device storage: launches only get shared references, as with CUDA,
+/// where the same buffer may be passed twice.
+pub(crate) type FakeBuffer = RefCell<Vec<u8>>;
+
+type Run = fn(&[Value<'_, FakeBuffer>]);
+
+pub(crate) struct FakeKernel {
+    name: String,
+    run: Run,
+}
+
+fn buffer<'b>(value: &Value<'b, FakeBuffer>) -> &'b FakeBuffer {
+    match value {
+        Value::Buffer(Some(buffer)) => buffer,
+        _ => panic!("fake kernel expected a nonempty buffer"),
+    }
+}
+
+fn u32_at(value: &Value<'_, FakeBuffer>) -> u32 {
+    match value {
+        Value::U32(value) => *value,
+        _ => panic!("fake kernel expected a u32"),
+    }
+}
+
+fn update_u32s(buffer: &FakeBuffer, mut f: impl FnMut(u32) -> u32) {
+    for chunk in buffer.borrow_mut().as_chunks_mut::<4>().0 {
+        *chunk = f(u32::from_ne_bytes(*chunk)).to_ne_bytes();
+    }
+}
+
+/// `map_u32(values, len, mul, add)`, as on the GPU.
+fn map_u32(args: &[Value<'_, FakeBuffer>]) {
+    let step = MapStep {
+        mul: u32_at(&args[2]),
+        add: u32_at(&args[3]),
+    };
+    update_u32s(buffer(&args[0]), |value| step.apply(value));
+}
+
+/// `add_one_u32(values)`: every `u32` plus one, wrapping.
+fn add_one_u32(args: &[Value<'_, FakeBuffer>]) {
+    update_u32s(buffer(&args[0]), |value| value.wrapping_add(1));
+}
+
+/// `copy(source, destination)`: as many bytes as both hold.
+fn copy(args: &[Value<'_, FakeBuffer>]) {
+    let source = buffer(&args[0]).borrow().clone();
+    let mut destination = buffer(&args[1]).borrow_mut();
+    let len = source.len().min(destination.len());
+    destination[..len].copy_from_slice(&source[..len]);
+}
+
+const KERNELS: [(&str, Run); 3] = [
+    (MAP_NAME, map_u32),
+    ("add_one_u32", add_one_u32),
+    ("copy", copy),
+];
 
 #[derive(Default)]
 pub(crate) struct FakeBackend {
@@ -48,8 +120,11 @@ impl FakeBackend {
         self.failures.remove(index);
         Err(match operation {
             Operation::Allocate => MemoryError::DeviceAllocation("injected".into()),
-            Operation::Upload | Operation::Download => MemoryError::Transfer("injected".into()),
-            Operation::Map => MemoryError::Launch("injected".into()),
+            Operation::Upload | Operation::Download | Operation::Zero => {
+                MemoryError::Transfer("injected".into())
+            }
+            Operation::Load => MemoryError::Kernel("injected".into()),
+            Operation::Launch => MemoryError::Launch("injected".into()),
             Operation::Synchronize => MemoryError::Completion("injected".into()),
         })
     }
@@ -65,30 +140,31 @@ impl FakeBackend {
 fn validate_transfer_lengths(source: usize, destination: usize) -> Result<(), MemoryError> {
     if source != destination {
         return Err(MemoryError::Transfer(format!(
-            "source has {source} elements but destination has {destination}"
+            "source has {source} bytes but destination has {destination}"
         )));
     }
     Ok(())
 }
 
 impl MemoryBackend for FakeBackend {
-    type Buffer = Vec<u32>;
+    type Buffer = FakeBuffer;
+    type Kernel = FakeKernel;
 
-    fn allocate(&mut self, len: usize) -> Result<Self::Buffer, MemoryError> {
-        checked_bytes(len)?;
+    fn allocate(&mut self, bytes: usize) -> Result<Self::Buffer, MemoryError> {
         self.inject(Operation::Allocate)?;
         let mut buffer = Vec::new();
         // Treat this allocation as device storage for the backend contract.
         buffer
-            .try_reserve_exact(len)
+            .try_reserve_exact(bytes)
             .map_err(|error| MemoryError::DeviceAllocation(error.to_string()))?;
-        buffer.resize(len, 0);
+        buffer.resize(bytes, 0);
         self.reserve_event()?;
-        self.events.push(Event::Allocate(len));
-        Ok(buffer)
+        self.events.push(Event::Allocate(bytes));
+        Ok(RefCell::new(buffer))
     }
 
-    fn upload(&mut self, buffer: &mut Self::Buffer, input: &[u32]) -> Result<(), MemoryError> {
+    fn upload(&mut self, buffer: &mut Self::Buffer, input: &[u8]) -> Result<(), MemoryError> {
+        let buffer = buffer.get_mut();
         validate_transfer_lengths(input.len(), buffer.len())?;
         self.inject(Operation::Upload)?;
         self.reserve_event()?;
@@ -97,22 +173,49 @@ impl MemoryBackend for FakeBackend {
         Ok(())
     }
 
-    fn download(&mut self, buffer: &Self::Buffer, output: &mut [u32]) -> Result<(), MemoryError> {
+    fn download(&mut self, buffer: &Self::Buffer, output: &mut [u8]) -> Result<(), MemoryError> {
+        let buffer = buffer.borrow();
         validate_transfer_lengths(buffer.len(), output.len())?;
         self.inject(Operation::Download)?;
         self.reserve_event()?;
-        output.copy_from_slice(buffer);
+        output.copy_from_slice(&buffer);
         self.events.push(Event::Download(output.len()));
         Ok(())
     }
 
-    fn map(&mut self, buffer: &mut Self::Buffer, step: MapStep) -> Result<(), MemoryError> {
-        self.inject(Operation::Map)?;
+    fn zero(&mut self, buffer: &mut Self::Buffer) -> Result<(), MemoryError> {
+        self.inject(Operation::Zero)?;
         self.reserve_event()?;
-        for value in buffer.iter_mut() {
-            *value = step.apply(*value);
-        }
-        self.events.push(Event::Map(buffer.len(), step));
+        let buffer = buffer.get_mut();
+        buffer.fill(0);
+        self.events.push(Event::Zero(buffer.len()));
+        Ok(())
+    }
+
+    fn load(&mut self, _ptx: &str, name: &str) -> Result<Self::Kernel, MemoryError> {
+        self.inject(Operation::Load)?;
+        let Some(&(_, run)) = KERNELS.iter().find(|(known, _)| *known == name) else {
+            return Err(MemoryError::Kernel(format!("no fake kernel named {name}")));
+        };
+        self.reserve_event()?;
+        self.events.push(Event::Load(name.into()));
+        Ok(FakeKernel {
+            name: name.into(),
+            run,
+        })
+    }
+
+    fn launch(
+        &mut self,
+        kernel: &Self::Kernel,
+        grid: Grid,
+        args: &[Value<'_, Self::Buffer>],
+    ) -> Result<(), MemoryError> {
+        assert!(!grid.is_empty(), "jobs never launch an empty grid");
+        self.inject(Operation::Launch)?;
+        self.reserve_event()?;
+        (kernel.run)(args);
+        self.events.push(Event::Launch(kernel.name.clone()));
         Ok(())
     }
 
@@ -129,195 +232,81 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allocation_rejects_byte_count_overflow_without_recording_success() {
+    fn allocate_creates_zeroed_storage_of_the_byte_count() {
         let mut backend = FakeBackend::default();
 
-        assert_eq!(backend.allocate(usize::MAX), Err(MemoryError::SizeOverflow));
-        assert!(backend.events.is_empty());
+        let buffer = backend.allocate(3).unwrap();
+
+        assert_eq!(*buffer.borrow(), vec![0, 0, 0]);
+        assert_eq!(backend.events, [Event::Allocate(3)]);
     }
 
     #[test]
     fn allocation_rejects_unrepresentable_capacity_without_recording_success() {
         let mut backend = FakeBackend::default();
-        let len = isize::MAX as usize / size_of::<u32>() + 1;
 
         assert!(matches!(
-            backend.allocate(len),
+            backend.allocate(isize::MAX as usize + 1),
             Err(MemoryError::DeviceAllocation(_))
         ));
         assert!(backend.events.is_empty());
     }
 
     #[test]
-    fn transfer_error_reports_source_and_destination_lengths() {
+    fn transfers_copy_into_existing_storage_and_check_lengths() {
         let mut backend = FakeBackend::default();
-        let mut buffer = vec![0; 3];
-
-        let error = backend.upload(&mut buffer, &[1, 2]).unwrap_err();
-
-        let MemoryError::Transfer(message) = error else {
-            panic!("expected a transfer error");
-        };
-        assert!(message.contains("2"));
-        assert!(message.contains("3"));
-    }
-
-    #[test]
-    fn allocate_creates_initialized_storage() {
-        let mut backend = FakeBackend::default();
-
-        let buffer = backend.allocate(3).unwrap();
-
-        assert_eq!(buffer, vec![0, 0, 0]);
-        assert_eq!(backend.events, [Event::Allocate(3)]);
-    }
-
-    #[test]
-    fn allocate_accepts_zero_elements() {
-        let mut backend = FakeBackend::default();
-
-        let buffer = backend.allocate(0).unwrap();
-
-        assert!(buffer.is_empty());
-        assert_eq!(backend.events, [Event::Allocate(0)]);
-    }
-
-    #[test]
-    fn upload_copies_values_into_existing_storage() {
-        let mut backend = FakeBackend::default();
-        let mut buffer = vec![0, 0, 0];
-        let original_pointer = buffer.as_ptr();
+        let mut buffer = RefCell::new(vec![0, 0, 0]);
+        let original_pointer = buffer.borrow().as_ptr();
 
         backend.upload(&mut buffer, &[4, 5, 6]).unwrap();
-
-        assert_eq!(buffer, vec![4, 5, 6]);
-        assert_eq!(buffer.as_ptr(), original_pointer);
-        assert_eq!(backend.events, [Event::Upload(3)]);
-    }
-
-    #[test]
-    fn upload_rejects_mismatched_lengths_without_changing_storage() {
-        for input in [&[4][..], &[4, 5, 6][..]] {
-            let mut backend = FakeBackend {
-                events: vec![Event::Synchronize],
-                ..FakeBackend::default()
-            };
-            let mut buffer = vec![9, 9];
-
-            let result = backend.upload(&mut buffer, input);
-
-            assert!(matches!(result, Err(MemoryError::Transfer(_))));
-            assert_eq!(buffer, vec![9, 9]);
-            assert_eq!(backend.events, [Event::Synchronize]);
-        }
-    }
-
-    #[test]
-    fn download_copies_values_into_new_storage() {
-        let mut backend = FakeBackend::default();
-        let buffer = vec![4, 5, 6];
-        let mut output = [0, 0, 0];
-
+        let mut output = [0; 3];
         backend.download(&buffer, &mut output).unwrap();
 
         assert_eq!(output, [4, 5, 6]);
-        assert_eq!(buffer, vec![4, 5, 6]);
-        assert_eq!(backend.events, [Event::Download(3)]);
-    }
+        assert_eq!(buffer.borrow().as_ptr(), original_pointer);
+        assert_eq!(backend.events, [Event::Upload(3), Event::Download(3)]);
 
-    #[test]
-    fn download_rejects_mismatched_lengths_without_changing_storage() {
-        for buffer in [vec![9], vec![9, 9, 9]] {
-            let mut backend = FakeBackend {
-                events: vec![Event::Synchronize],
-                ..FakeBackend::default()
-            };
-            let mut output = [4, 5];
-
-            let result = backend.download(&buffer, &mut output);
-
-            assert!(matches!(result, Err(MemoryError::Transfer(_))));
-            assert_eq!(output, [4, 5]);
-            assert_eq!(backend.events, [Event::Synchronize]);
-        }
-    }
-
-    #[test]
-    fn download_error_reports_source_and_destination_lengths() {
-        let mut backend = FakeBackend::default();
-        let buffer = vec![1, 2];
-        let mut output = [0; 3];
-
-        let error = backend.download(&buffer, &mut output).unwrap_err();
-
+        let error = backend.upload(&mut buffer, &[1, 2]).unwrap_err();
         let MemoryError::Transfer(message) = error else {
             panic!("expected a transfer error");
         };
-        assert!(message.contains("2"));
-        assert!(message.contains("3"));
+        assert!(message.contains('2') && message.contains('3'));
+        assert_eq!(*buffer.borrow(), vec![4, 5, 6]);
+        assert!(backend.download(&buffer, &mut [0; 4]).is_err());
+        assert_eq!(backend.events.len(), 2);
     }
 
     #[test]
-    fn transfers_accept_empty_storage() {
+    fn kernels_are_found_by_name_and_run_on_shared_buffers() {
         let mut backend = FakeBackend::default();
-        let mut buffer = Vec::new();
-        let mut output = [];
+        let kernel = backend.load("ignored", "add_one_u32").unwrap();
+        let buffer = RefCell::new(5u32.to_ne_bytes().to_vec());
 
-        backend.upload(&mut buffer, &[]).unwrap();
-        backend.download(&buffer, &mut output).unwrap();
+        backend
+            .launch(&kernel, Grid::Linear(1), &[Value::Buffer(Some(&buffer))])
+            .unwrap();
 
-        assert!(buffer.is_empty());
-        assert_eq!(backend.events, [Event::Upload(0), Event::Download(0)]);
-    }
-
-    #[test]
-    fn synchronize_records_each_completion_boundary() {
-        let mut backend = FakeBackend::default();
-
-        backend.synchronize().unwrap();
-        backend.synchronize().unwrap();
-
-        assert_eq!(backend.events, [Event::Synchronize, Event::Synchronize]);
-    }
-
-    #[test]
-    fn round_trip_preserves_host_input_and_records_operations_in_order() {
-        let mut backend = FakeBackend::default();
-        let input = [1, 2];
-        let mut output = [0, 0];
-
-        let mut buffer = backend.allocate(2).unwrap();
-        backend.upload(&mut buffer, &input).unwrap();
-        // Simulate writes to the device working copy.
-        buffer.copy_from_slice(&[8, 9]);
-        backend.download(&buffer, &mut output).unwrap();
-        backend.synchronize().unwrap();
-
-        assert_eq!(input, [1, 2]);
-        assert_eq!(output, [8, 9]);
+        assert_eq!(*buffer.borrow(), 6u32.to_ne_bytes());
+        assert!(matches!(
+            backend.load("ignored", "missing"),
+            Err(MemoryError::Kernel(_))
+        ));
         assert_eq!(
             backend.events,
             [
-                Event::Allocate(2),
-                Event::Upload(2),
-                Event::Download(2),
-                Event::Synchronize,
+                Event::Load("add_one_u32".into()),
+                Event::Launch("add_one_u32".into())
             ]
         );
     }
 
     #[test]
-    fn rejected_transfer_does_not_prevent_a_later_successful_transfer() {
-        let mut backend = FakeBackend::default();
-        let mut buffer = vec![9, 9];
+    fn injected_failures_happen_once_each() {
+        let mut backend = FakeBackend::failing(&[Operation::Synchronize]);
 
-        assert!(matches!(
-            backend.upload(&mut buffer, &[4]),
-            Err(MemoryError::Transfer(_))
-        ));
-        backend.upload(&mut buffer, &[4, 5]).unwrap();
+        assert!(backend.synchronize().is_err());
+        backend.synchronize().unwrap();
 
-        assert_eq!(buffer, vec![4, 5]);
-        assert_eq!(backend.events, [Event::Upload(2)]);
+        assert_eq!(backend.events, [Event::Synchronize]);
     }
 }
