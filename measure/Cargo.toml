@@ -1,0 +1,26 @@
+# Measures what moving real code structures to the GPU could gain, before
+# the compiler is taught to do it (plans/2026-11-12-general-candidates.md).
+# CPU baselines are the real crates; GPU versions are ports of the same code
+# compiled to PTX (`build.rs`), checked bit for bit against the crates.
+[package]
+name = "cuprite-measure"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Its own workspace: it needs the nightly's nvptx target and heavy
+# dependencies that the others don't.
+[workspace]
+
+[dependencies]
+cuprite-memory = { path = "../crates/cuprite-memory", features = ["cuda"] }
+image = { version = "=0.25.10", default-features = false }
+imageproc = { version = "=0.25.1", default-features = false, features = ["rayon"] }
+noise = { version = "=0.9.0", default-features = false, features = ["std"] }
+glam = "=0.34.3"
+rayon = "=1.12.0"
+sdfu = { version = "=0.3.1-alpha.1", features = ["glam"] }
+sha2 = "=0.10.9"
+
+[profile.release]
+debug = 1

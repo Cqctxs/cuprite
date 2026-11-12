@@ -1,0 +1,6 @@
+# The same pin as `compiler/`: compiling the kernels needs the nightly's
+# nvptx64-nvidia-cuda target (`rustup target add nvptx64-nvidia-cuda`).
+[toolchain]
+channel = "nightly-2026-10-20"
+profile = "minimal"
+targets = ["nvptx64-nvidia-cuda"]
