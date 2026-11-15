@@ -7,8 +7,11 @@ use std::{f32::consts::FRAC_PI_2, sync::Mutex};
 use cuprite_measure::{
     hashes::{Algorithm, HashCase},
     images::{test_image, HueCase, Transform, WarpCase},
+    knn::KnnCase,
+    nbody::{NbodyCase, Precision},
     noises::{Noise, NoiseCase},
     sdfs::{Scene, SdfCase},
+    snps::SnpCase,
     Case, Gpu,
 };
 use image::Rgba;
@@ -232,6 +235,62 @@ fn hashes_match() {
             wrapping.first = u64::MAX - 100;
             wrapping.digests = true;
             check(&wrapping);
+        }
+    }
+}
+
+/// Every variant at sizes from one body up; some bodies massless, some
+/// softened, and some sitting exactly on others (the zero-distance branch).
+#[test]
+fn nbody_matches() {
+    for (precision, dims) in [
+        (Precision::F32, 3),
+        (Precision::F64, 3),
+        (Precision::F32, 2),
+    ] {
+        for n in [1usize, 2, 37, 300] {
+            for (massive, softening, coincident_every) in [
+                (n, 0.0, 0),
+                (n.div_ceil(3), 0.0, 0),
+                (n, 0.01, 0),
+                (n, 0.0, 7),
+                (n.div_ceil(2), 0.05, 5),
+            ] {
+                check(&NbodyCase {
+                    precision,
+                    dims,
+                    n,
+                    massive,
+                    softening,
+                    coincident_every,
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn snp_distances_match() {
+    for n in [1, 2, 9, 40] {
+        for len in [1, 64, 1000] {
+            check(&SnpCase { n, len });
+        }
+    }
+}
+
+/// Fewer points than `k`, `k` up to the kernel's 16, and 1 to 16 dimensions.
+#[test]
+fn nearest_neighbours_match() {
+    for (queries, points) in [(1, 1), (37, 5), (37, 300), (64, 2000)] {
+        for dims in [1, 3, 16] {
+            for k in [1, 8, 16] {
+                check(&KnnCase {
+                    queries,
+                    points,
+                    dims,
+                    k,
+                });
+            }
         }
     }
 }

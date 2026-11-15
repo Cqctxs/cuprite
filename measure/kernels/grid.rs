@@ -1021,3 +1021,187 @@ macro_rules! hash_kernel {
 
 hash_kernel!(sha256_candidates, sha256);
 hash_kernel!(sha512_candidates, sha512);
+
+// ---------------------------------------------------------------------------
+// All pairs. One thread per output element, looping over every partner.
+
+/// The float operations the n-body port needs, for `f32` and `f64`.
+trait Scalar:
+    Copy
+    + PartialEq
+    + PartialOrd
+    + core::ops::Add<Output = Self>
+    + core::ops::Sub<Output = Self>
+    + core::ops::Mul<Output = Self>
+    + core::ops::Div<Output = Self>
+{
+    const ZERO: Self;
+    fn root(self) -> Self;
+}
+
+impl Scalar for f32 {
+    const ZERO: Self = 0.0;
+    fn root(self) -> Self {
+        sqrt32(self)
+    }
+}
+
+impl Scalar for f64 {
+    const ZERO: Self = 0.0;
+    fn root(self) -> Self {
+        sqrt64(self)
+    }
+}
+
+/// particular 0.7.0's `BruteForceScalar` and `BruteForceSoftenedScalar` for
+/// one affected particle: `force_scalar::<true>` from each massive particle,
+/// in order, folded from zero.
+fn acceleration<S: Scalar, const D: usize>(
+    p1: [S; D],
+    massive: *const S,
+    masses: *const S,
+    n_massive: u32,
+    softening: S,
+) -> [S; D] {
+    let mut acceleration = [S::ZERO; D];
+    for j in 0..n_massive as usize {
+        // SAFETY: the host uploads `n_massive` positions and masses.
+        let (p2, mass) = unsafe {
+            let p2: [S; D] = core::array::from_fn(|k| *massive.add(j * D + k));
+            (p2, *masses.add(j))
+        };
+        let dir: [S; D] = core::array::from_fn(|k| p2[k] - p1[k]);
+        // ultraviolet's `mag_sq`: `(x * x) + (y * y) + (z * z)`.
+        let mut norm = dir[0] * dir[0];
+        for c in &dir[1..] {
+            norm = norm + *c * *c;
+        }
+        let norm_s = norm + (softening * softening);
+        let force = if norm == S::ZERO {
+            dir
+        } else {
+            let f = mass / (norm_s * norm_s.root());
+            core::array::from_fn(|k| dir[k] * f)
+        };
+        for k in 0..D {
+            acceleration[k] = acceleration[k] + force[k];
+        }
+    }
+    acceleration
+}
+
+/// The acceleration of each affected particle from every massive one.
+macro_rules! nbody_kernel {
+    ($name:ident, $s:ty, $d:literal) => {
+        #[no_mangle]
+        pub unsafe extern "ptx-kernel" fn $name(
+            out: *mut $s,
+            affected: *const $s,
+            n_affected: u32,
+            massive: *const $s,
+            masses: *const $s,
+            n_massive: u32,
+            softening: $s,
+        ) {
+            let i = linear_index() as usize;
+            if i >= n_affected as usize {
+                return;
+            }
+            // SAFETY: the host uploads `n_affected` positions, and the output
+            // holds one acceleration for each.
+            unsafe {
+                let p1: [$s; $d] = core::array::from_fn(|k| *affected.add(i * $d + k));
+                let a = acceleration::<$s, $d>(p1, massive, masses, n_massive, softening);
+                for (k, value) in a.iter().enumerate() {
+                    *out.add(i * $d + k) = *value;
+                }
+            }
+        }
+    };
+}
+
+nbody_kernel!(nbody_f32_3d, f32, 3);
+nbody_kernel!(nbody_f64_3d, f64, 3);
+nbody_kernel!(nbody_f32_2d, f32, 2);
+
+/// psdm 0.3.0's mark for ignored characters (`N` and `-` by default).
+const IGNORE: u8 = b'.';
+
+/// psdm's `hamming_distance` for every pair `i <= j` of `n` aligned sequences
+/// of `len` bytes, in its `combinations_with_replacement` order, with the
+/// diagonal 0 as psdm sets it. A `Grid::Plane` of `n × n`, `x` being `j`.
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn snp_distances(
+    out: *mut u64,
+    sequences: *const u8,
+    n: u32,
+    len: u32,
+) {
+    let (j, i) = plane_index();
+    if i >= n || j >= n || j < i {
+        return;
+    }
+    let (i, j, n, len) = (i as usize, j as usize, n as usize, len as usize);
+    let distance = if i == j {
+        0
+    } else {
+        let mut distance = 0u64;
+        for k in 0..len {
+            // SAFETY: both sequences hold `len` bytes.
+            let (a, b) = unsafe { (*sequences.add(i * len + k), *sequences.add(j * len + k)) };
+            distance += (a != b && a != IGNORE && b != IGNORE) as u64;
+        }
+        distance
+    };
+    // Row `i` of the upper triangle starts after the rows above it, which
+    // hold `n`, `n - 1`, ... pairs.
+    let row = i * n - i * i.saturating_sub(1) / 2;
+    // SAFETY: the output holds every pair `i <= j`.
+    unsafe { *out.add(row + (j - i)) = distance };
+}
+
+/// linfa-nn 0.8.1's `LinearSearchIndex::k_nearest` with `L2Dist`, for one
+/// query: the `k` points with the smallest squared distance, nearest first.
+/// Distances are ndarray-stats' `sq_l2_dist`, summed in order from zero.
+///
+/// linfa pushes every distance onto a `BinaryHeap` and pops `k`; a thread
+/// can't hold that heap, so this keeps a sorted list of the best `k`
+/// instead. The result is the same unless distances tie.
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn knn_f32(
+    out: *mut u32,
+    queries: *const f32,
+    n_queries: u32,
+    data: *const f32,
+    n_data: u32,
+    dims: u32,
+    k: u32,
+) {
+    const MAX_K: usize = 16;
+    let q = linear_index() as usize;
+    let (dims, k) = (dims as usize, (k as usize).min(MAX_K).min(n_data as usize));
+    if q >= n_queries as usize || k == 0 {
+        return;
+    }
+    let mut best = [(f32::INFINITY, u32::MAX); MAX_K];
+    for i in 0..n_data as usize {
+        let mut distance = 0.0f32;
+        for c in 0..dims {
+            // SAFETY: the host uploads `n_queries` and `n_data` rows of `dims`.
+            let diff = unsafe { *queries.add(q * dims + c) - *data.add(i * dims + c) };
+            distance += diff * diff;
+        }
+        if distance < best[k - 1].0 {
+            let mut at = k - 1;
+            while at > 0 && distance < best[at - 1].0 {
+                best[at] = best[at - 1];
+                at -= 1;
+            }
+            best[at] = (distance, i as u32);
+        }
+    }
+    for (slot, (_, index)) in best.iter().take(k).enumerate() {
+        // SAFETY: the output holds `k` indices for each query.
+        unsafe { *out.add(q * k + slot) = *index };
+    }
+}

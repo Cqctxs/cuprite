@@ -19,8 +19,11 @@ use cuprite_memory::{GpuMemory, Kernel, MemoryConfig};
 
 pub mod hashes;
 pub mod images;
+pub mod knn;
+pub mod nbody;
 pub mod noises;
 pub mod sdfs;
+pub mod snps;
 
 include!("../kernels/shared.rs");
 

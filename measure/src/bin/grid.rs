@@ -15,8 +15,11 @@ use std::{
 use cuprite_measure::{
     hashes::{Algorithm, HashCase},
     images::{test_image, HueCase, Transform, WarpCase},
+    knn::KnnCase,
+    nbody::{NbodyCase, Precision},
     noises::{Noise, NoiseCase},
     sdfs::{Scene, SdfCase},
+    snps::SnpCase,
     time, Case, Gpu,
 };
 use image::Rgba;
@@ -121,6 +124,38 @@ fn hash_cases() -> Vec<Box<dyn Case>> {
     cases
 }
 
+fn all_pairs_cases() -> Vec<Box<dyn Case>> {
+    let mut cases: Vec<Box<dyn Case>> = Vec::new();
+    for n in [1024, 4096, 16_384, 65_536] {
+        cases.push(Box::new(NbodyCase::new(Precision::F32, 3, n)));
+    }
+    for n in [1024, 4096, 16_384] {
+        cases.push(Box::new(NbodyCase::new(Precision::F64, 3, n)));
+    }
+    for n in [4096, 16_384] {
+        cases.push(Box::new(NbodyCase::new(Precision::F32, 2, n)));
+    }
+    // Test particles around a few stars, and a softened system.
+    let mut stars = NbodyCase::new(Precision::F32, 3, 65_536);
+    stars.massive = 655;
+    cases.push(Box::new(stars));
+    let mut softened = NbodyCase::new(Precision::F32, 3, 16_384);
+    softened.softening = 0.01;
+    cases.push(Box::new(softened));
+    for n in [256, 1024] {
+        cases.push(Box::new(SnpCase { n, len: 29_903 }));
+    }
+    for (points, dims) in [(16_384, 16), (65_536, 16), (65_536, 3)] {
+        cases.push(Box::new(KnnCase {
+            queries: 1024,
+            points,
+            dims,
+            k: 8,
+        }));
+    }
+    cases
+}
+
 fn main() {
     let filter = std::env::args().nth(1).unwrap_or_default();
     let mut gpu = Gpu::open();
@@ -140,7 +175,10 @@ fn main() {
         .into_iter()
         .chain(image_cases())
         .chain(sdf_cases())
-        .chain(hash_cases());
+        .chain(hash_cases())
+        .chain(all_pairs_cases());
+    let mut nbody_gpu = Vec::new();
+    let mut knn_gpu = Vec::new();
     for case in cases {
         let name = case.name();
         let kernel = case.kernel_name();
@@ -150,6 +188,10 @@ fn main() {
             "sdf"
         } else if kernel.starts_with("sha") {
             "hash"
+        } else if kernel.starts_with("nbody") {
+            "nbody"
+        } else if kernel.starts_with("snp") || kernel.starts_with("knn") {
+            "pairs"
         } else {
             "image"
         };
@@ -186,5 +228,61 @@ fn main() {
             ratio(cpu, on_gpu),
             ratio(parallel, on_gpu),
         );
+        if name == "n-body 3D f32" {
+            nbody_gpu.push((case.size().0, on_gpu));
+        }
+        if kind == "pairs" && name.starts_with("linfa") {
+            knn_gpu.push((case.shape(), case.size(), name.clone(), on_gpu));
+        }
+    }
+
+    // The GPU's top-k selection on the CPU, to separate the GPU's gain from
+    // the selection method's.
+    if !knn_gpu.is_empty() {
+        println!(
+            "
+| case | size | gpu | same selection, all cores | gpu vs it | identical to linfa |"
+        );
+        println!("|---|---|---|---|---|---|");
+        for (shape, (queries, points), name, on_gpu) in knn_gpu {
+            let dims = if name.contains("3 dims") { 3 } else { 16 };
+            let case = KnnCase {
+                queries,
+                points,
+                dims,
+                k: 8,
+            };
+            let identical = case
+                .cpu_parallel()
+                .compare(&case.insertion_parallel())
+                .exact();
+            let cpu = time(|| drop(case.insertion_parallel()));
+            println!(
+                "| {name} | {shape} | {} | {} | {} | {identical} |",
+                show(on_gpu),
+                show(cpu),
+                ratio(cpu, on_gpu)
+            );
+        }
+    }
+
+    // particular's faster CPU methods compute approximately the same
+    // accelerations: what a user chasing speed would run instead.
+    if !nbody_gpu.is_empty() {
+        println!(
+            "
+| bodies | gpu (exact) | crate method | its time | gpu vs it |"
+        );
+        println!("|---|---|---|---|---|");
+        for (n, on_gpu) in nbody_gpu {
+            for (method, duration) in NbodyCase::new(Precision::F32, 3, n).alternatives() {
+                println!(
+                    "| {n} | {} | {method} | {} | {} |",
+                    show(on_gpu),
+                    show(duration),
+                    ratio(duration, on_gpu)
+                );
+            }
+        }
     }
 }
