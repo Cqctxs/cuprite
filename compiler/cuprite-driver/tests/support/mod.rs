@@ -151,8 +151,10 @@ impl Probes {
         std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
     }
 
+    /// The dump writes a path's `::` as `..` in file names.
     pub fn mir(&self, function: &str, stage: &str) -> String {
-        let path = self.mir_dir().join(format!("{function}.{stage}.mir"));
+        let file = function.replace("::", "..");
+        let path = self.mir_dir().join(format!("{file}.{stage}.mir"));
         std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
     }
 

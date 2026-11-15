@@ -239,6 +239,43 @@ fn general_cases(state: &mut u64) -> usize {
             |x| x.wrapping_mul(-3).wrapping_shr(shift) ^ bias as i64,
         );
     }
+    // Calls: helpers of this crate, generics, and `glam`, whose references
+    // run `glam` itself on the CPU.
+    checked += general("with_helper", state, probes::with_helper, |x: u32| x.wrapping_mul(3));
+    checked += general("swap_halves", state, probes::swap_halves, |x: u32| x.rotate_left(16));
+    checked += general("bump_twice", state, probes::bump_twice, |x: f32| (x + 1.0) + 0.5);
+    checked += general("generic_twice", state, probes::generic_twice, |x: f32| (x + x) - 1.0);
+    checked += general("scaled", state, probes::scaled, |x: f64| x * 2.5 + -1.0);
+    checked += general("vector_lengths", state, probes::vector_lengths, |x: f32| {
+        glam::Vec3::new(x, 1.0, -2.0).length()
+    });
+    checked += general("normalized_y", state, probes::normalized_y, |x: f32| {
+        glam::Vec3::new(x, x * 0.5, 1.0).normalize().y
+    });
+    checked += general("cross_dot", state, probes::cross_dot, |x: f32| {
+        let a = glam::Vec3::new(x, 2.0, -1.0);
+        a.cross(glam::Vec3::Y).dot(a + glam::Vec3::Y)
+    });
+    // Held out: `ultraviolet`, validated after the translator was built.
+    checked += general("uv_lengths", state, probes::uv_lengths, |x: f32| {
+        ultraviolet::Vec3::new(x, 1.0, -2.0).mag()
+    });
+    checked += general("uv_normalized_y", state, probes::uv_normalized_y, |x: f32| {
+        ultraviolet::Vec3::new(x, x * 0.5, 1.0).normalized().y
+    });
+    checked += general("uv_cross_dot", state, probes::uv_cross_dot, |x: f32| {
+        let a = ultraviolet::Vec3::new(x, 2.0, -1.0);
+        let b = ultraviolet::Vec3::new(0.0, 1.0, 0.0);
+        a.cross(b).dot(a + b)
+    });
+    for passes in [0u32, 1, 13] {
+        checked += general(
+            "repeat_helper",
+            state,
+            |v: &mut [u32]| probes::repeat_helper(v, passes),
+            |x| (0..passes).fold(x, |x, _| x.wrapping_mul(3)),
+        );
+    }
     for passes in [0u32, 1, 13] {
         checked += general(
             "repeat_damp",

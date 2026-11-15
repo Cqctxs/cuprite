@@ -409,6 +409,131 @@ pub fn invert(values: &mut [bool]) {
     }
 }
 
+// Calls (code generation): helpers of this crate, generic functions, and
+// vector math from `glam`, all inlined into the kernel.
+
+/// Splits a word into its high and low halves: a helper returning a tuple.
+fn halves(x: u32) -> (u16, u16) {
+    ((x >> 16) as u16, x as u16)
+}
+
+/// Swaps the halves of each word, through a tuple-returning helper.
+pub fn swap_halves(values: &mut [u32]) {
+    for value in values {
+        let (high, low) = halves(*value);
+        *value = (u32::from(low) << 16) | u32::from(high);
+    }
+}
+
+/// Adds to a float through a mutable reference.
+fn bump(x: &mut f32, by: f32) {
+    *x += by;
+}
+
+/// Passes the element's reference on to a helper, twice.
+pub fn bump_twice(values: &mut [f32]) {
+    for value in values {
+        bump(value, 1.0);
+        bump(value, 0.5);
+    }
+}
+
+/// A generic helper, instantiated with `f32` and with `u64`.
+fn twice<T: std::ops::Add<Output = T> + Copy>(x: T) -> T {
+    x + x
+}
+
+pub fn generic_twice(values: &mut [f32]) {
+    for value in values {
+        *value = twice(*value) - 1.0;
+    }
+}
+
+/// A method with `&self` on a struct built inside the loop.
+struct Scale {
+    factor: f64,
+    offset: f64,
+}
+
+impl Scale {
+    fn apply(&self, x: f64) -> f64 {
+        x * self.factor + self.offset
+    }
+}
+
+pub fn scaled(values: &mut [f64]) {
+    for value in values {
+        *value = Scale { factor: 2.5, offset: -1.0 }.apply(*value);
+    }
+}
+
+/// Recursion can't be inlined.
+fn halvings(x: u32) -> u32 {
+    if x < 2 { 0 } else { halvings(x / 2).wrapping_add(1) }
+}
+
+pub fn count_halvings(values: &mut [u32]) {
+    for value in values {
+        *value = halvings(*value);
+    }
+}
+
+/// `glam`: building a vector and taking its length.
+pub fn vector_lengths(values: &mut [f32]) {
+    for value in values {
+        *value = glam::Vec3::new(*value, 1.0, -2.0).length();
+    }
+}
+
+/// `glam`: normalizing, through operator traits and a method chain.
+pub fn normalized_y(values: &mut [f32]) {
+    for value in values {
+        let v = glam::Vec3::new(*value, *value * 0.5, 1.0);
+        *value = v.normalize().y;
+    }
+}
+
+/// `glam`: a cross product, an associated constant, `+` and a dot product.
+pub fn cross_dot(values: &mut [f32]) {
+    for value in values {
+        let a = glam::Vec3::new(*value, 2.0, -1.0);
+        let b = glam::Vec3::Y;
+        *value = a.cross(b).dot(a + b);
+    }
+}
+
+/// `glam`'s `Vec3A` is SIMD on x86, which the kernel can't express.
+pub fn simd_lengths(values: &mut [f32]) {
+    for value in values {
+        *value = glam::Vec3A::new(*value, 1.0, -2.0).length();
+    }
+}
+
+// Held-out validation for calls: the same three computations with
+// `ultraviolet`, written after the translator was finished, with no changes
+// to it.
+
+pub fn uv_lengths(values: &mut [f32]) {
+    for value in values {
+        *value = ultraviolet::Vec3::new(*value, 1.0, -2.0).mag();
+    }
+}
+
+pub fn uv_normalized_y(values: &mut [f32]) {
+    for value in values {
+        let v = ultraviolet::Vec3::new(*value, *value * 0.5, 1.0);
+        *value = v.normalized().y;
+    }
+}
+
+pub fn uv_cross_dot(values: &mut [f32]) {
+    for value in values {
+        let a = ultraviolet::Vec3::new(*value, 2.0, -1.0);
+        let b = ultraviolet::Vec3::new(0.0, 1.0, 0.0);
+        *value = a.cross(b).dot(a + b);
+    }
+}
+
 /// Number of calls `counted` has made, for tests.
 pub fn counted_calls() -> u32 {
     CALLS.load(Ordering::Relaxed)

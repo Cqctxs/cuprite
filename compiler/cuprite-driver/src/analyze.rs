@@ -44,10 +44,7 @@ use rustc_middle::{
 };
 use rustc_span::def_id::{LocalDefId, LOCAL_CRATE};
 
-use crate::{
-    replace::Passes,
-    translate::{self, Method},
-};
+use crate::{replace::Passes, translate};
 
 /// The slice parameter.
 const SLICE: Local = Local::from_u32(1);
@@ -77,18 +74,42 @@ pub(crate) enum Verdict {
     Rejected(String),
 }
 
-/// What recognition found for one function.
+/// What is known about one function.
 enum Recorded {
+    /// Its built MIR, until it is recognized after analysis. Translation
+    /// inlines the functions a loop body calls, from their optimized MIR,
+    /// which is only safe to request once every body has been built: asking
+    /// for it while building could reach this function again, a cycle.
+    Saved(SavedBody),
+    /// Being recognized; a request now comes from recursion and finds none.
+    InProgress,
     Done(Verdict),
-    /// A counted loop around calls to functions of this crate. Callees may
-    /// be built after their callers, so it is resolved once every body has
-    /// been built: after analysis, when the report is written and optimized
-    /// MIR is requested.
-    Region {
-        element: KTy,
-        calls: Vec<LocalDefId>,
-        passes: Passes,
-    },
+}
+
+/// A function's built MIR, kept past the point where rustc frees it.
+///
+/// MIR refers to the compiler's arenas (`'tcx`). The copy is allocated in
+/// those arenas, and the driver compiles one crate per process and reads
+/// these only while compiling it, inside the same session, so the arenas
+/// outlive every use. The lifetime is erased only to store the copy here.
+struct SavedBody(&'static Body<'static>);
+
+// SAFETY: the driver compiles on one thread at a time; the mutex around
+// `RECORDED` only satisfies the static's bounds.
+unsafe impl Send for SavedBody {}
+
+impl SavedBody {
+    fn save<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Self {
+        let saved: &'tcx Body<'tcx> = tcx.arena.alloc(body.clone());
+        // SAFETY: see the type's documentation; `get` restores `'tcx`.
+        Self(unsafe { std::mem::transmute::<&'tcx Body<'tcx>, &'static Body<'static>>(saved) })
+    }
+
+    fn get<'tcx>(&self, _tcx: TyCtxt<'tcx>) -> &'tcx Body<'tcx> {
+        // SAFETY: the body was saved from this `tcx`'s session, which is
+        // the only one the process runs.
+        unsafe { std::mem::transmute::<&'static Body<'static>, &'tcx Body<'tcx>>(self.0) }
+    }
 }
 
 /// Results for the crate being compiled, recorded as each function's MIR is
@@ -99,9 +120,18 @@ pub(crate) fn record<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &Body<'t
     if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
         return;
     }
-    let recorded = Recognizer::new(tcx, def_id, body)
-        .recognize()
-        .unwrap_or_else(|reason| Recorded::Done(Verdict::Rejected(reason)));
+    // Only functions over a slice of numbers can be candidates; refuse the
+    // rest now, with the signature's reason.
+    let takes_slice = body.arg_count >= 1 && Recognizer::mut_slice_element(body.local_decls[SLICE].ty).is_some();
+    let recorded = if takes_slice {
+        Recorded::Saved(SavedBody::save(tcx, body))
+    } else {
+        let reason = Recognizer::new(tcx, def_id, body)
+            .check_signature(false)
+            .err()
+            .unwrap_or_else(|| "is not a candidate".into());
+        Recorded::Done(Verdict::Rejected(reason))
+    };
     RECORDED
         .lock()
         .unwrap()
@@ -111,36 +141,55 @@ pub(crate) fn record<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &Body<'t
 
 /// The verdict for `def_id`. Call only after analysis, when every body has
 /// been built.
+///
+/// Recognizes the function the first time it is asked, from its saved MIR.
+/// The lock is released meanwhile: translation requests other functions'
+/// optimized MIR, which asks for their verdicts.
 pub(crate) fn verdict(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<Verdict> {
-    let recorded = RECORDED.lock().unwrap();
-    let recorded = recorded.as_ref()?;
-    let (element, calls, passes) = match recorded.get(&def_id)? {
-        Recorded::Done(verdict) => return Some(verdict.clone()),
-        Recorded::Region { element, calls, passes } => (*element, calls, *passes),
-    };
-    let mut stages = Vec::new();
-    for callee in calls {
-        // Only single maps over the same slice, called with just the slice:
-        // a callee that is itself a region would need its own pass count.
-        let not_a_map = || {
-            Some(Verdict::Rejected(format!(
-                "calls `{}`, which is not a recognized map",
-                tcx.def_path_str(*callee)
-            )))
-        };
-        let Some(Recorded::Done(Verdict::Candidate(map))) = recorded.get(callee) else {
-            return not_a_map();
-        };
-        if map.element != element || !map.scalars.is_empty() {
-            return not_a_map();
+    let saved = {
+        let mut recorded = RECORDED.lock().unwrap();
+        let entry = recorded.as_mut()?.get_mut(&def_id)?;
+        match entry {
+            Recorded::Done(verdict) => return Some(verdict.clone()),
+            Recorded::InProgress => return None,
+            Recorded::Saved(_) => match std::mem::replace(entry, Recorded::InProgress) {
+                Recorded::Saved(saved) => saved,
+                _ => unreachable!("matched above"),
+            },
         }
-        stages.push(map.clone());
+    };
+    let verdict = Recognizer::new(tcx, def_id, saved.get(tcx))
+        .recognize()
+        .unwrap_or_else(Verdict::Rejected);
+    RECORDED
+        .lock()
+        .unwrap()
+        .get_or_insert_default()
+        .insert(def_id, Recorded::Done(verdict.clone()));
+    Some(verdict)
+}
+
+/// Composes a region's callees, each a map over the same slice called with
+/// just the slice: a callee that is itself a region would need its own
+/// pass count.
+fn compose(tcx: TyCtxt<'_>, element: KTy, calls: &[LocalDefId], passes: Passes) -> Verdict {
+    let mut stages = Vec::new();
+    for &callee in calls {
+        match verdict(tcx, callee) {
+            Some(Verdict::Candidate(map)) if map.element == element && map.scalars.is_empty() => stages.push(map),
+            _ => {
+                return Verdict::Rejected(format!(
+                    "calls `{}`, which is not a recognized map",
+                    tcx.def_path_str(callee)
+                ));
+            }
+        }
     }
-    Some(if stages.is_empty() || passes == Passes::Const(0) {
+    if stages.is_empty() || passes == Passes::Const(0) {
         Verdict::Rejected("does not change the slice".into())
     } else {
         Verdict::Repeated(stages, passes)
-    })
+    }
 }
 
 /// Describes a map for the report: "map over `[f32]` reading `scale`".
@@ -206,11 +255,12 @@ enum Known {
     SliceIterMut,
     /// `Iterator::next`.
     Next,
-    /// A numeric method with a kernel equivalent (`translate::method`).
-    Method(Method),
-    /// A non-generic, non-trait function of this crate, which only a
-    /// repeated map may call, and only if the callee is a map.
+    /// A non-generic, non-trait function of this crate, which a repeated
+    /// map may call, if the callee is a map.
     Local(LocalDefId),
+    /// Any other function, which a map's loop body may call if `translate`
+    /// can inline it.
+    Other,
 }
 
 struct Recognizer<'a, 'tcx> {
@@ -226,12 +276,11 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         Self { tcx, def_id, body }
     }
 
-    fn recognize(&self) -> Result<Recorded> {
+    fn recognize(&self) -> Result<Verdict> {
         if self.counts_passes() {
             self.recognize_region()
         } else {
-            let map = self.recognize_map()?;
-            Ok(Recorded::Done(Verdict::Candidate(map)))
+            Ok(Verdict::Candidate(self.recognize_map()?))
         }
     }
 
@@ -264,9 +313,8 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         })
     }
 
-    /// A counted loop whose body calls functions of this crate on the
-    /// slice. Whether those are maps is decided later (`verdict`).
-    fn recognize_region(&self) -> Result<Recorded> {
+    /// A counted loop whose body calls maps of this crate on the slice.
+    fn recognize_region(&self) -> Result<Verdict> {
         let (element, _) = self.check_signature(true)?;
         self.check_parameters_unchanged()?;
         let calls = self.check_effects(true)?;
@@ -276,11 +324,7 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         let mut walked = HashSet::new();
         let callees = self.region_calls(header.some, header.next_block, &mut walked)?;
         self.check_rest(&calls, &walked, &[range_setup], &header)?;
-        Ok(Recorded::Region {
-            element,
-            calls: callees,
-            passes,
-        })
+        Ok(compose(self.tcx, element, &callees, passes))
     }
 
     /// True if the function loops over an integer `Range`, which makes it a
@@ -352,7 +396,7 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
                     self.callee(block)
                 ));
             }
-            if walked.contains(&block) && !matches!(known, Known::Method(_) | Known::Local(_)) {
+            if walked.contains(&block) && matches!(known, Known::IntoIter | Known::SliceIterMut | Known::Next) {
                 return Err("iterates inside the loop body".into());
             }
         }
@@ -477,7 +521,9 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
             match &data.terminator().kind {
                 TerminatorKind::Call { func, .. } => {
                     let known = self.classify(func)?;
-                    if let (Known::Local(_), false) = (known, allow_local) {
+                    // A map's calls are inlined by `translate`; a region may
+                    // only call maps of this crate.
+                    if allow_local && known == Known::Other {
                         return Err(self.no_summary(func));
                     }
                     calls.push((block, known));
@@ -513,9 +559,6 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         if tcx.is_lang_item(def_id, LangItem::IteratorNext) {
             return Ok(Known::Next);
         }
-        if let Some(method) = translate::method(tcx, def_id) {
-            return Ok(Known::Method(method));
-        }
         if let Some(impl_id) = tcx.inherent_impl_of_assoc(def_id) {
             let self_ty = tcx.type_of(impl_id).instantiate_identity().skip_normalization();
             if tcx.crate_name(impl_id.krate).as_str() == "core"
@@ -535,7 +578,7 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
                 return Ok(Known::Local(local));
             }
         }
-        Err(self.no_summary(func))
+        Ok(Known::Other)
     }
 
     fn no_summary(&self, func: &Operand<'tcx>) -> String {
@@ -847,7 +890,7 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
             .into_iter()
             .filter(|(local, _)| !borrowed.contains(local))
             .filter_map(|(local, rvalues)| match rvalues.as_slice() {
-                [Rvalue::Use(Operand::Constant(constant), _)] => Some((local, translate::constant(constant)?)),
+                [Rvalue::Use(Operand::Constant(constant), _)] => Some((local, translate::constant(self.tcx, constant)?)),
                 _ => None,
             })
             .collect()

@@ -8,3 +8,8 @@ publish.workspace = true
 [dependencies]
 # Probe for library-provided parallel iteration.
 rayon = "=1.12.0"
+# Vector math from another author, for calls into generic library code.
+glam = "=0.34.3"
+# Held out: vector math by a third author, used to validate calls only after
+# they were built on `glam`.
+ultraviolet = "=0.9.2"

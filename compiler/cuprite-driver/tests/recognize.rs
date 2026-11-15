@@ -9,23 +9,32 @@ use support::{run, text, Probes, NO_PROFILE};
 
 /// Verdicts that do not depend on the build profile.
 const COMMON: &[(&str, &str)] = &[
+    ("Scale::apply", "rejected: takes `&Scale`, not a `&mut` slice of numbers"),
     ("add_into", "rejected: takes `&[u32]` as `a`, which a kernel can't take"),
     ("affine_chain", "candidate: map over `[u32]`"),
     ("apply", "rejected: takes `fn(u32) -> u32` as `f`, which a kernel can't take"),
+    ("bump", "rejected: takes `&mut f32`, not a `&mut` slice of numbers"),
+    ("bump_twice", "candidate: map over `[f32]`"),
     ("clamp", "candidate: map over `[u32]`"),
     ("collatz_steps", "candidate: map over `[u32]`"),
-    ("counted", "rejected: calls `std::sync::atomic::Atomic::<u32>::fetch_add`, which has no GPU summary"),
+    ("count_halvings", "rejected: calls `halvings`, which calls `halvings` recursively"),
+    ("counted", "rejected: uses a reference to constant data (`&std::sync::atomic::Atomic<u32>`)"),
     ("counted_calls", "rejected: takes no parameters; the first must be a `&mut` slice of numbers"),
+    ("cross_dot", "candidate: map over `[f32]`"),
     ("damp", "candidate: map over `[f32]`"),
     ("divide", "rejected: may panic: division by zero"),
     ("double", "candidate: map over `[u32]`"),
     ("fill", "candidate: map over `[u32]`"),
     ("float_rem", "rejected: uses `%` on floats, which has no exact GPU version yet"),
+    ("generic_twice", "candidate: map over `[f32]`"),
+    ("halves", "rejected: takes `u32`, not a `&mut` slice of numbers"),
+    ("halvings", "rejected: takes `u32`, not a `&mut` slice of numbers"),
     ("hash_bytes", "candidate: map over `[u8]` reading `seed`"),
     ("invert", "rejected: takes `&mut [bool]`, not a `&mut` slice of numbers"),
     ("levels", "candidate: map over `[u8]`"),
     ("minimum", "rejected: takes `&[u32]`, not a `&mut` slice of numbers"),
     ("mix_wide", "candidate: map over `[i64]` reading `shift`, `bias`"),
+    ("normalized_y", "candidate: map over `[f32]`"),
     ("numbered", "rejected: uses a value computed outside the loop body"),
     ("outside_factor", "candidate: map over `[u32]`"),
     ("prefix_sum", "rejected: calls `core::slice::<impl [u32]>::len`, which has no GPU summary"),
@@ -39,24 +48,32 @@ const COMMON: &[(&str, &str)] = &[
     ("repeat_damp", "candidate: `damp` then `relu` over `[f32]`, repeated `passes` times"),
     ("repeat_fixed", "candidate: `transform` over `[u32]`, repeated 4 times"),
     ("repeat_from_one", "rejected: counts passes from 1, not 0"),
-    ("repeat_helper", "rejected: calls `with_helper`, which is not a recognized map"),
+    ("repeat_helper", "candidate: `with_helper` over `[u32]`, repeated `passes` times"),
     ("repeat_named", "candidate: `affine_chain` over `[u32]`, repeated `passes` times"),
     ("repeat_nested", "rejected: calls `repeat`, which is not a recognized map"),
     ("repeat_reassigned", "rejected: reassigns its parameter `passes`"),
-    ("reversed", "rejected: calls `<std::slice::IterMut<'_, u32> as std::iter::Iterator>::rev`, which has no GPU summary"),
+    ("reversed", "rejected: iterates over something other than the slice parameter"),
     ("scale_offset", "candidate: map over `[f32]` reading `scale`, `offset`"),
+    ("scaled", "candidate: map over `[f64]`"),
+    ("simd_lengths", "rejected: calls `glam::Vec3A::new`, which builds an array"),
     ("smooth", "rejected: takes `&[u32]`, not a `&mut` slice of numbers"),
     ("soft_root", "candidate: map over `[f64]`"),
     ("square", "candidate: map over `[u32]`"),
+    ("swap_halves", "candidate: map over `[u32]`"),
     ("transform", "candidate: map over `[u32]`"),
     ("transform_indexed", "rejected: calls `core::slice::<impl [u32]>::len`, which has no GPU summary"),
     ("transform_iter_mut", "candidate: map over `[u32]`"),
-    ("transform_rayon", "rejected: calls `<[u32] as rayon::iter::IntoParallelRefMutIterator<'_>>::par_iter_mut`, which has no GPU summary"),
+    ("transform_rayon", "rejected: is not a single `for` loop over the slice"),
     ("triple", "rejected: takes `u32`, not a `&mut` slice of numbers"),
+    ("twice", "rejected: is generic"),
     ("two_loops", "rejected: contains more than one loop"),
     ("two_stores", "candidate: map over `[u32]`"),
     ("until_zero", "rejected: leaves the loop early"),
-    ("with_helper", "rejected: calls `triple`, which has no GPU summary"),
+    ("uv_cross_dot", "candidate: map over `[f32]`"),
+    ("uv_lengths", "candidate: map over `[f32]`"),
+    ("uv_normalized_y", "candidate: map over `[f32]`"),
+    ("vector_lengths", "candidate: map over `[f32]`"),
+    ("with_helper", "candidate: map over `[u32]`"),
     ("wrapping_sum", "rejected: takes `&[u32]`, not a `&mut` slice of numbers"),
 ];
 
@@ -134,10 +151,10 @@ fn differential(name: &'static str) -> std::path::PathBuf {
 }
 
 /// Runtime calls the differential program makes with `passes` passes, for
-/// each of its 10 lengths (`probes/src/bin/candidates.rs`): 4 repeated maps
-/// with 13 passes (3 over `u32`, `repeat_damp` over `f32`), and
-/// `repeat_fixed` with 4.
-const REGIONS: [(u32, usize); 2] = [(13, 4), (4, 1)];
+/// each of its 10 lengths (`probes/src/bin/candidates.rs`): 5 repeated maps
+/// with 13 passes (3 multiply-adds, `repeat_helper` and `repeat_damp`),
+/// and `repeat_fixed` with 4.
+const REGIONS: [(u32, usize); 2] = [(13, 5), (4, 1)];
 const LENGTHS: usize = 10;
 
 #[test]
@@ -170,8 +187,10 @@ fn rewritten_candidates_match_the_cpu_on_the_gpu() {
     let non_empty = LENGTHS - 1;
     // 9 `u32` multiply-add maps; 3 repeated maps with 1 and 13 passes;
     // `repeat_fixed`; 7 general maps, `mix_wide` with 5 parameter choices,
-    // and `repeat_damp` with 1 and 13 passes.
-    let gpu_calls = 9 * non_empty + 3 * 2 * non_empty + non_empty + (7 + 5) * non_empty + 2 * non_empty;
+    // 8 maps that call functions, 3 held-out `ultraviolet` maps, and
+    // `repeat_helper` and `repeat_damp` with 1 and 13 passes.
+    let gpu_calls =
+        9 * non_empty + 3 * 2 * non_empty + non_empty + (7 + 5 + 8 + 3) * non_empty + 2 * 2 * non_empty;
     assert_eq!(trace.matches("-> gpu").count(), gpu_calls, "{trace}");
     for (passes, functions) in REGIONS {
         let calls = trace.matches(&format!("passes={passes} -> gpu")).count();
