@@ -1,11 +1,13 @@
 //! Entry points that functions rewritten by the Cuprite driver call before
 //! their original body.
 //!
-//! [`map_u32`] returns [`DONE`] only when it has completed the work and
-//! committed the results. Otherwise the caller runs its original CPU body,
-//! which is always safe, because a failed GPU session never changes the
-//! caller's slice, and then reports to [`map_u32_finished`] with the value it
-//! got, so that the policy can learn what the CPU body takes.
+//! [`map_slice`] runs a kernel the compiler generated from the function and
+//! embedded as a description (`cuprite_kernel::description`). It returns
+//! [`DONE`] only when it has completed the work and committed the results.
+//! Otherwise the caller runs its original CPU body, which is always safe,
+//! because a failed GPU job never changes the caller's slice, and then
+//! reports to [`finished`] with the value it got, so that the policy can
+//! learn what the CPU body takes.
 //!
 //! Environment:
 //! - `CUPRITE_GPU` chooses the mode:
@@ -25,6 +27,7 @@ pub mod policy;
 use std::{
     cell::RefCell,
     env, fmt,
+    hash::{DefaultHasher, Hash, Hasher},
     path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -33,7 +36,8 @@ use std::{
     time::Instant,
 };
 
-use cuprite_memory::{GpuMemory, MapStep, MemoryConfig};
+use cuprite_kernel::{description::Description, Ty};
+use cuprite_memory::{Arg, Element, GpuMemory, Grid, MapStep, MemoryConfig};
 
 use policy::{Choice, HostKey, Policy, Profile};
 
@@ -104,6 +108,8 @@ enum Decline {
     /// `CUPRITE_GPU=0`, or an invalid value.
     Mode(&'static str),
     NoWork,
+    /// More elements than a launch numbers.
+    TooLong,
     /// No profile, or one that cannot be used.
     Profile(&'static str),
     Policy(Choice),
@@ -120,6 +126,7 @@ impl fmt::Display for Decline {
         match self {
             Self::Mode(reason) | Self::Profile(reason) => f.write_str(reason),
             Self::NoWork => f.write_str("no work"),
+            Self::TooLong => f.write_str("too many elements for one launch"),
             Self::Policy(choice) => write!(f, "{choice}"),
             Self::Busy => f.write_str("GPU busy"),
             Self::Poisoned => f.write_str("runtime poisoned"),
@@ -129,10 +136,10 @@ impl fmt::Display for Decline {
     }
 }
 
-/// Returned by [`map_u32`] when the GPU did the work.
+/// Returned by [`map_slice`] when the GPU did the work.
 pub const DONE: u64 = 0;
-/// Returned by [`map_u32`] when the caller must run its CPU body, and nobody
-/// times it.
+/// Returned by [`map_slice`] when the caller must run its CPU body, and
+/// nobody times it.
 pub const UNTIMED: u64 = 1;
 
 /// A CPU body being timed, for the policy's corrections.
@@ -141,7 +148,7 @@ struct Timing {
     start: Instant,
     len: usize,
     passes: u32,
-    step: MapStep,
+    kernel: u64,
 }
 
 thread_local! {
@@ -152,15 +159,57 @@ thread_local! {
 /// Tokens for timed bodies; 0 and 1 are `DONE` and `UNTIMED`.
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(2);
 
-/// `passes` repetitions of `x = x * mul + add` (wrapping) over `values`,
-/// kept resident on the GPU between passes.
+/// A kernel description embedded by the compiler, read once.
+struct Described {
+    description: Description,
+    /// Identifies the kernel to the policy.
+    key: u64,
+}
+
+type Read = Arc<Result<Described, String>>;
+
+/// Descriptions by address: each is a `&'static str` in the program.
+static DESCRIPTIONS: Mutex<Vec<(usize, Read)>> = Mutex::new(Vec::new());
+
+fn described(text: &'static str) -> Read {
+    let address = text.as_ptr() as usize;
+    let mut known = DESCRIPTIONS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((_, described)) = known.iter().find(|(a, _)| *a == address) {
+        return described.clone();
+    }
+    let described = Arc::new(Description::decode(text).map(|description| {
+        let mut hasher = DefaultHasher::new();
+        text.hash(&mut hasher);
+        Described {
+            description,
+            key: hasher.finish(),
+        }
+    }));
+    known.push((address, described.clone()));
+    described
+}
+
+/// Runs the kernel `description` describes over `values`, in place, with
+/// `args`: the bits of its scalar arguments, zero- or sign-extended, in the
+/// order of the description's `scalars`. A repeated kernel's first argument
+/// is its pass count.
 ///
 /// Returns [`DONE`] if the GPU did the work. Anything else means the caller
-/// must run its CPU body, then pass the value to [`map_u32_finished`].
-/// `values` is unchanged unless this returns `DONE`.
-pub fn map_u32(values: &mut [u32], mul: u32, add: u32, passes: u32) -> u64 {
-    let step = MapStep { mul, add };
-    let outcome = dispatch(values, step, passes);
+/// must run its CPU body, then pass the value to [`finished`]. `values` is
+/// unchanged unless this returns `DONE`.
+pub fn map_slice<T: Element>(values: &mut [T], description: &'static str, args: &[u64]) -> u64 {
+    let described = described(description);
+    let (function, passes) = match &*described {
+        Ok(d) if d.description.repeated => {
+            (d.description.function.as_str(), args.first().map_or(0, |&p| p as u32))
+        }
+        Ok(d) => (d.description.function.as_str(), 1),
+        Err(_) => ("(unreadable kernel)", 0),
+    };
+    let outcome = match &*described {
+        Ok(d) => dispatch(values, d, args, passes),
+        Err(reason) => Err(Decline::Failed(format!("kernel description: {reason}"))),
+    };
     let counter = if outcome.is_ok() {
         &GPU_CALLS
     } else {
@@ -170,20 +219,20 @@ pub fn map_u32(values: &mut [u32], mul: u32, add: u32, passes: u32) -> u64 {
     if tracing() {
         let len = values.len();
         match &outcome {
-            Ok(None) => eprintln!("cuprite: map_u32 len={len} passes={passes} -> gpu"),
+            Ok(None) => eprintln!("cuprite: {function} len={len} passes={passes} -> gpu"),
             Ok(Some(choice)) => {
-                eprintln!("cuprite: map_u32 len={len} passes={passes} -> gpu ({choice})");
+                eprintln!("cuprite: {function} len={len} passes={passes} -> gpu ({choice})");
             }
             Err(decline) => {
-                eprintln!("cuprite: map_u32 len={len} passes={passes} -> cpu ({decline})");
+                eprintln!("cuprite: {function} len={len} passes={passes} -> cpu ({decline})");
             }
         }
     }
-    match outcome {
-        Ok(_) => DONE,
+    match (outcome, &*described) {
+        (Ok(_), _) => DONE,
         // A close call: time the CPU body, so later decisions use what this
         // function's code actually takes.
-        Err(Decline::Policy(choice)) if Policy::worth_timing(choice.prediction()) => {
+        (Err(Decline::Policy(choice)), Ok(d)) if Policy::worth_timing(choice.prediction()) => {
             let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
             TIMINGS.with_borrow_mut(|timings| {
                 timings.push(Timing {
@@ -191,21 +240,21 @@ pub fn map_u32(values: &mut [u32], mul: u32, add: u32, passes: u32) -> u64 {
                     start: Instant::now(),
                     len: values.len(),
                     passes,
-                    step,
+                    kernel: d.key,
                 })
             });
             token
         }
-        Err(_) => UNTIMED,
+        _ => UNTIMED,
     }
 }
 
 /// Called by a rewritten function when the CPU body it ran after
-/// [`map_u32`] returned `token` has finished.
+/// [`map_slice`] returned `token` has finished.
 ///
 /// A body that unwinds never reports, so entries above `token`, from such
 /// bodies called inside this one, are discarded.
-pub fn map_u32_finished(token: u64) {
+pub fn finished(token: u64) {
     if token == DONE || token == UNTIMED {
         return;
     }
@@ -224,17 +273,21 @@ pub fn map_u32_finished(token: u64) {
     };
     if let Ok(mut state) = STATE.try_lock() {
         let micros = end.duration_since(timing.start).as_secs_f64() * 1e6;
-        let step = (timing.step.mul, timing.step.add);
         state
             .policy
-            .record(profile, timing.len, timing.passes, step, false, micros);
+            .record(profile, timing.len, timing.passes, timing.kernel, false, micros);
     }
 }
 
 /// Runs the call on the GPU if the mode and policy say so: `Ok` with the
 /// policy's choice (`None` when the GPU is forced), or `Err` with why the
 /// CPU must run it.
-fn dispatch(values: &mut [u32], step: MapStep, passes: u32) -> Result<Option<Choice>, Decline> {
+fn dispatch<T: Element>(
+    values: &mut [T],
+    described: &Described,
+    args: &[u64],
+    passes: u32,
+) -> Result<Option<Choice>, Decline> {
     let mode = match mode() {
         Ok(mode) => *mode,
         Err(reason) => return Err(Decline::Mode(reason)),
@@ -244,6 +297,14 @@ fn dispatch(values: &mut [u32], step: MapStep, passes: u32) -> Result<Option<Cho
     }
     if values.is_empty() || passes == 0 {
         return Err(Decline::NoWork);
+    }
+    let description = &described.description;
+    if description.element.bytes() as usize != size_of::<T>() || args.len() != description.scalars.len() {
+        return Err(Decline::Failed("the call doesn't match its kernel".into()));
+    }
+    // One thread per element, numbered in 32 bits.
+    if u32::try_from(values.len()).is_err() {
+        return Err(Decline::TooLong);
     }
     let profile = match (mode, profile()) {
         (Mode::Auto, Ok(profile)) => Some(profile),
@@ -259,11 +320,11 @@ fn dispatch(values: &mut [u32], step: MapStep, passes: u32) -> Result<Option<Cho
     if let Device::Unavailable(reason) = device {
         return Err(Decline::Unavailable(reason.clone()));
     }
+    let key = described.key;
     let choice = match profile {
         None => None,
         Some(profile) => {
             let open = matches!(device, Device::Ready(_));
-            let key = (step.mul, step.add);
             let choice = policy.choose(profile, values.len(), passes, key, open);
             if !choice.uses_gpu() {
                 return Err(Decline::Policy(choice));
@@ -281,15 +342,45 @@ fn dispatch(values: &mut [u32], step: MapStep, passes: u32) -> Result<Option<Cho
         Device::Untried => unreachable!("opened above"),
     };
     let start = Instant::now();
-    run_region(memory, values, step, passes).map_err(Decline::Failed)?;
+    run_kernel(memory, values, description, args).map_err(Decline::Failed)?;
     // The first region after opening also allocates for the first time,
     // which the profile already counts as startup.
     if let (Some(profile), false) = (profile, opening) {
         let micros = start.elapsed().as_secs_f64() * 1e6;
-        let key = (step.mul, step.add);
         policy.record(profile, values.len(), passes, key, true, micros);
     }
     Ok(choice)
+}
+
+/// One launch of a described in-place map, committed only if it all works.
+fn run_kernel<T: Element>(
+    memory: &mut GpuMemory,
+    values: &mut [T],
+    description: &Description,
+    args: &[u64],
+) -> Result<(), String> {
+    let kernel = memory
+        .kernel(&description.ptx, &description.entry)
+        .map_err(|e| e.to_string())?;
+    let len = values.len();
+    let mut launch_args = vec![Arg::U64(len as u64)];
+    for (&bits, ty) in args.iter().zip(&description.scalars) {
+        launch_args.push(match ty {
+            Ty::U32 => Arg::U32(bits as u32),
+            Ty::I32 => Arg::I32(bits as u32 as i32),
+            Ty::U64 => Arg::U64(bits),
+            Ty::I64 => Arg::I64(bits as i64),
+            Ty::F32 => Arg::F32(f32::from_bits(bits as u32)),
+            Ty::F64 => Arg::F64(f64::from_bits(bits)),
+            other => return Err(format!("a {other:?} argument can't be passed")),
+        });
+    }
+    let mut job = memory.job().map_err(|e| e.to_string())?;
+    let data = job.in_out(values).map_err(|e| e.to_string())?;
+    launch_args.insert(0, Arg::Buffer(data));
+    job.launch(kernel, Grid::Linear(len as u64), &launch_args)
+        .map_err(|e| e.to_string())?;
+    job.finish().map_err(|e| e.to_string())
 }
 
 /// Opens the GPU; under the policy, only if it is the one profiled.
@@ -342,13 +433,27 @@ mod tests {
     // The mode and profile are read once per process, and test binaries set
     // neither, so this exercises the policy without a profile. The driver's
     // integration tests cover the GPU paths in real rewritten programs.
+    const REPEATED: &str = "cuprite kernel 1\nfunction a::repeat\nentry a__repeat\nelement u32\n\
+                            repeated yes\nscalars u32\nptx\n(not reached)";
+
     #[test]
     fn without_a_profile_values_are_left_for_the_cpu() {
-        let mut values = vec![1, 2, 3];
-        assert_eq!(map_u32(&mut values, 3, 7, 2), UNTIMED);
+        let mut values = vec![1u32, 2, 3];
+        assert_eq!(map_slice(&mut values, REPEATED, &[2]), UNTIMED);
         assert_eq!(values, [1, 2, 3]);
         assert!(counts().1 >= 1);
-        map_u32_finished(UNTIMED);
+        finished(UNTIMED);
+    }
+
+    #[test]
+    fn unreadable_descriptions_leave_values_for_the_cpu() {
+        let mut values = vec![1u32, 2, 3];
+        assert_eq!(map_slice(&mut values, "cuprite kernel 99\n", &[]), UNTIMED);
+        assert_eq!(values, [1, 2, 3]);
+        let described = described(REPEATED);
+        assert_eq!(described.as_ref().as_ref().unwrap().description.function, "a::repeat");
+        // Read once, by address.
+        assert!(Arc::ptr_eq(&described, &super::described(REPEATED)));
     }
 
     fn timing(token: u64) -> Timing {
@@ -357,7 +462,7 @@ mod tests {
             start: Instant::now(),
             len: 1,
             passes: 1,
-            step: MapStep { mul: 3, add: 7 },
+            kernel: 37,
         }
     }
 
@@ -372,14 +477,14 @@ mod tests {
         TIMINGS.with_borrow_mut(|timings| {
             timings.extend([timing(5), timing(7), timing(9), timing(11)]);
         });
-        map_u32_finished(11);
+        finished(11);
         assert_eq!(pending(), [5, 7, 9]);
-        map_u32_finished(7); // 9 unwound.
+        finished(7); // 9 unwound.
         assert_eq!(pending(), [5]);
-        map_u32_finished(6); // Unknown: nothing to pop.
+        finished(6); // Unknown: nothing to pop.
         assert_eq!(pending(), [5]);
-        map_u32_finished(DONE);
-        map_u32_finished(5);
+        finished(DONE);
+        finished(5);
         assert_eq!(pending(), Vec::<u64>::new());
     }
 

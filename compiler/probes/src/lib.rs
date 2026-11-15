@@ -140,14 +140,14 @@ pub fn apply(values: &mut [u32], f: fn(u32) -> u32) {
     }
 }
 
-/// Not a multiply-add map: the element is multiplied by itself.
+/// The element times itself, which the first, multiply-add rule refused.
 pub fn square(values: &mut [u32]) {
     for value in values {
         *value = value.wrapping_mul(*value);
     }
 }
 
-/// A branch inside the loop.
+/// A branch inside the loop, which the first rule refused.
 pub fn clamp(values: &mut [u32]) {
     for value in values {
         if *value > 9 {
@@ -302,6 +302,110 @@ pub fn repeat_reassigned(values: &mut [u32], mut passes: u32) {
 pub fn repeat_nested(values: &mut [u32], passes: u32) {
     for _ in 0..passes {
         repeat(values, 2);
+    }
+}
+
+// General element code (code generation): other element types, scalar
+// parameters, floats, branches, inner loops and library methods.
+
+/// Floats and scalar parameters: a linear transform.
+pub fn scale_offset(values: &mut [f32], scale: f32, offset: f32) {
+    for value in values {
+        *value = *value * scale + offset;
+    }
+}
+
+/// A branch on a float comparison.
+pub fn relu(values: &mut [f32]) {
+    for value in values.iter_mut() {
+        if *value < 0.0 {
+            *value = 0.0;
+        }
+    }
+}
+
+/// `f64` library methods.
+pub fn soft_root(values: &mut [f64]) {
+    for value in values {
+        *value = (value.abs() + 1.0).sqrt().min(1e6).floor();
+    }
+}
+
+/// An inner `while` loop with a branch: steps to reach 1, capped.
+/// Dividing by the constant 2 can't panic.
+pub fn collatz_steps(values: &mut [u32]) {
+    for value in values {
+        let mut x = *value;
+        let mut steps = 0u32;
+        while x > 1 && steps < 500 {
+            x = if x % 2 == 0 { x / 2 } else { x.wrapping_mul(3).wrapping_add(1) };
+            steps = steps.wrapping_add(1);
+        }
+        *value = steps;
+    }
+}
+
+/// Narrow signed elements, a signed division by a constant (which can't
+/// overflow), and an `i32` parameter.
+pub fn quantize(values: &mut [i16], step: i32) {
+    for value in values {
+        *value = ((*value as i32) / 4).wrapping_mul(step) as i16;
+    }
+}
+
+/// Bytes, integer hashing and rotation.
+pub fn hash_bytes(values: &mut [u8], seed: u32) {
+    for value in values {
+        let h = (*value as u32 ^ seed).wrapping_mul(0x9E37_79B1).rotate_left(5);
+        *value = (h >> 24) as u8;
+    }
+}
+
+/// A `match` on ranges.
+pub fn levels(values: &mut [u8]) {
+    for value in values {
+        *value = match *value {
+            0..=63 => 0,
+            64..=127 => 85,
+            128..=191 => 170,
+            _ => 255,
+        };
+    }
+}
+
+/// 64-bit integers, a shift by a parameter, and a `usize` parameter.
+pub fn mix_wide(values: &mut [i64], shift: u32, bias: usize) {
+    for value in values {
+        *value = value.wrapping_mul(-3).wrapping_shr(shift) ^ bias as i64;
+    }
+}
+
+/// A map over floats that `repeat_damp` repeats.
+pub fn damp(values: &mut [f32]) {
+    for value in values {
+        *value = *value * 0.5 + 0.25;
+    }
+}
+
+/// A repeated map over floats.
+pub fn repeat_damp(values: &mut [f32], passes: u32) {
+    for _ in 0..passes {
+        damp(values);
+        relu(values);
+    }
+}
+
+/// Float remainder has no exact GPU version yet.
+pub fn float_rem(values: &mut [f32]) {
+    for value in values {
+        *value %= 2.5;
+    }
+}
+
+/// Booleans can't be elements.
+pub fn invert(values: &mut [bool]) {
+    for value in values {
+        *value = !*value;
     }
 }
 

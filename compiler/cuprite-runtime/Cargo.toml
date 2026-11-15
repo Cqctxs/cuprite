@@ -8,4 +8,5 @@ publish.workspace = true
 [dependencies]
 # Built here by the pinned nightly: everything linked into a rewritten crate
 # must come from the same compiler as that crate.
+cuprite-kernel = { path = "../cuprite-kernel" }
 cuprite-memory = { path = "../../crates/cuprite-memory", features = ["cuda"] }

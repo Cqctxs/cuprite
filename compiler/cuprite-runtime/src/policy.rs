@@ -439,25 +439,24 @@ impl fmt::Display for Choice {
 /// startup is paid only after as much has been lost waiting.
 ///
 /// The profile is corrected by what calls actually take ([`Policy::record`]).
-/// Calibration measures a general multiply-add, but the compiled CPU body
-/// of a function is specialized to its constants (`x * 3` becomes shifts and
-/// adds) and can be twice as fast; how much depends on the constants and on
-/// whether the slice fits in cache. So each correction applies to one map
-/// and one range of lengths.
+/// Calibration measures one multiply-add kernel and its CPU loop; a
+/// generated kernel and the function it came from can be several times
+/// faster or slower on either side, and specialized to their constants
+/// (`x * 3` becomes shifts and adds). So each correction applies to one
+/// kernel, one side and one range of lengths.
 #[derive(Debug, Default)]
 pub struct Policy {
     forgone_us: f64,
-    /// Measured over predicted time, by side, map and length range. Few
+    /// Measured over predicted time, by side, kernel and length range. Few
     /// entries, so a list.
     corrections: Vec<(Key, f64)>,
 }
 
-/// What a correction applies to. The GPU kernel's cost does not depend on
-/// the constants, the CPU's does.
+/// What a correction applies to: a kernel, by its description's hash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Key {
-    Gpu { range: u32 },
-    Cpu { step: (u32, u32), range: u32 },
+    Gpu { kernel: u64, range: u32 },
+    Cpu { kernel: u64, range: u32 },
 }
 
 /// Lengths within a factor of two share a correction.
@@ -494,12 +493,12 @@ impl Policy {
         profile: &Profile,
         len: usize,
         passes: u32,
-        step: (u32, u32),
+        kernel: u64,
     ) -> Prediction {
         let range = range(len);
         Prediction {
-            gpu: profile.gpu.predict(len, passes) * self.correction(Key::Gpu { range }),
-            cpu: profile.cpu.predict(len, passes) * self.correction(Key::Cpu { step, range }),
+            gpu: profile.gpu.predict(len, passes) * self.correction(Key::Gpu { kernel, range }),
+            cpu: profile.cpu.predict(len, passes) * self.correction(Key::Cpu { kernel, range }),
         }
     }
 
@@ -516,15 +515,15 @@ impl Policy {
         profile: &Profile,
         len: usize,
         passes: u32,
-        step: (u32, u32),
+        kernel: u64,
         gpu: bool,
         micros: f64,
     ) {
         let range = range(len);
         let (key, base) = if gpu {
-            (Key::Gpu { range }, profile.gpu.predict(len, passes))
+            (Key::Gpu { kernel, range }, profile.gpu.predict(len, passes))
         } else {
-            (Key::Cpu { step, range }, profile.cpu.predict(len, passes))
+            (Key::Cpu { kernel, range }, profile.cpu.predict(len, passes))
         };
         if !(base > 0.0 && micros > 0.0) {
             return;
@@ -549,10 +548,10 @@ impl Policy {
         profile: &Profile,
         len: usize,
         passes: u32,
-        step: (u32, u32),
+        kernel: u64,
         open: bool,
     ) -> Choice {
-        let predicted = self.predict(profile, len, passes, step);
+        let predicted = self.predict(profile, len, passes, kernel);
         if predicted.gpu >= predicted.cpu {
             return Choice::Cpu(predicted);
         }
@@ -576,7 +575,7 @@ impl Policy {
 mod tests {
     use super::*;
 
-    const STEP: (u32, u32) = (3, 7);
+    const STEP: u64 = 37;
 
     const LENGTHS: [usize; 6] = [1 << 10, 1 << 14, 1 << 17, 1 << 20, 1 << 22, 1 << 24];
 
@@ -855,8 +854,8 @@ mod tests {
             Choice::Cpu(_)
         ));
 
-        // Other constants, other lengths, and the GPU side keep the profile.
-        assert_eq!(policy.predict(&profile, len, passes, (5, 1)), before);
+        // Other kernels, other lengths, and the GPU side keep the profile.
+        assert_eq!(policy.predict(&profile, len, passes, 51), before);
         let far = policy.predict(&profile, len * 4, passes, STEP);
         assert_eq!(far.cpu, profile.cpu.predict(len * 4, passes));
         // Lengths within a factor of two share the correction.

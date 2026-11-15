@@ -9,43 +9,55 @@ use support::{run, text, Probes, NO_PROFILE};
 
 /// Verdicts that do not depend on the build profile.
 const COMMON: &[(&str, &str)] = &[
-    ("add_into", "rejected: takes 3 parameters; only `fn(&mut [u32])` is supported"),
-    ("affine_chain", "candidate: x * 15 + 33"),
-    ("apply", "rejected: takes 2 parameters; only `fn(&mut [u32])` is supported"),
-    ("clamp", "rejected: uses `Gt`, which is not supported"),
+    ("add_into", "rejected: takes `&[u32]` as `a`, which a kernel can't take"),
+    ("affine_chain", "candidate: map over `[u32]`"),
+    ("apply", "rejected: takes `fn(u32) -> u32` as `f`, which a kernel can't take"),
+    ("clamp", "candidate: map over `[u32]`"),
+    ("collatz_steps", "candidate: map over `[u32]`"),
     ("counted", "rejected: calls `std::sync::atomic::Atomic::<u32>::fetch_add`, which has no GPU summary"),
-    ("counted_calls", "rejected: takes 0 parameters; only `fn(&mut [u32])` is supported"),
-    ("divide", "rejected: takes 2 parameters; only `fn(&mut [u32])` is supported"),
-    ("double", "candidate: x * 2 + 0"),
-    ("fill", "candidate: x * 0 + 42"),
-    ("minimum", "rejected: takes `&[u32]`, not `&mut [u32]`"),
+    ("counted_calls", "rejected: takes no parameters; the first must be a `&mut` slice of numbers"),
+    ("damp", "candidate: map over `[f32]`"),
+    ("divide", "rejected: may panic: division by zero"),
+    ("double", "candidate: map over `[u32]`"),
+    ("fill", "candidate: map over `[u32]`"),
+    ("float_rem", "rejected: uses `%` on floats, which has no exact GPU version yet"),
+    ("hash_bytes", "candidate: map over `[u8]` reading `seed`"),
+    ("invert", "rejected: takes `&mut [bool]`, not a `&mut` slice of numbers"),
+    ("levels", "candidate: map over `[u8]`"),
+    ("minimum", "rejected: takes `&[u32]`, not a `&mut` slice of numbers"),
+    ("mix_wide", "candidate: map over `[i64]` reading `shift`, `bias`"),
     ("numbered", "rejected: uses a value computed outside the loop body"),
-    ("outside_factor", "candidate: x * 3 + 0"),
+    ("outside_factor", "candidate: map over `[u32]`"),
     ("prefix_sum", "rejected: calls `core::slice::<impl [u32]>::len`, which has no GPU summary"),
+    ("quantize", "candidate: map over `[i16]` reading `step`"),
     ("reassigned", "rejected: reassigns its parameter `values`"),
     ("reciprocal", "rejected: may panic: division by zero"),
-    ("repeat", "candidate: x * 3 + 7, repeated `passes` times"),
+    ("relu", "candidate: map over `[f32]`"),
+    ("repeat", "candidate: `transform` over `[u32]`, repeated `passes` times"),
     ("repeat_after_first", "rejected: computes values in the loop body"),
-    ("repeat_composed", "candidate: x * 6 + 14, repeated `passes` times"),
-    ("repeat_fixed", "candidate: x * 3 + 7, repeated 4 times"),
+    ("repeat_composed", "candidate: `transform` then `double` over `[u32]`, repeated `passes` times"),
+    ("repeat_damp", "candidate: `damp` then `relu` over `[f32]`, repeated `passes` times"),
+    ("repeat_fixed", "candidate: `transform` over `[u32]`, repeated 4 times"),
     ("repeat_from_one", "rejected: counts passes from 1, not 0"),
     ("repeat_helper", "rejected: calls `with_helper`, which is not a recognized map"),
-    ("repeat_named", "candidate: x * 15 + 33, repeated `passes` times"),
+    ("repeat_named", "candidate: `affine_chain` over `[u32]`, repeated `passes` times"),
     ("repeat_nested", "rejected: calls `repeat`, which is not a recognized map"),
     ("repeat_reassigned", "rejected: reassigns its parameter `passes`"),
     ("reversed", "rejected: calls `<std::slice::IterMut<'_, u32> as std::iter::Iterator>::rev`, which has no GPU summary"),
-    ("smooth", "rejected: takes 2 parameters; only `fn(&mut [u32])` is supported"),
-    ("square", "rejected: is not a multiply-add map (multiplies the element by itself)"),
-    ("transform", "candidate: x * 3 + 7"),
+    ("scale_offset", "candidate: map over `[f32]` reading `scale`, `offset`"),
+    ("smooth", "rejected: takes `&[u32]`, not a `&mut` slice of numbers"),
+    ("soft_root", "candidate: map over `[f64]`"),
+    ("square", "candidate: map over `[u32]`"),
+    ("transform", "candidate: map over `[u32]`"),
     ("transform_indexed", "rejected: calls `core::slice::<impl [u32]>::len`, which has no GPU summary"),
-    ("transform_iter_mut", "candidate: x * 3 + 7"),
+    ("transform_iter_mut", "candidate: map over `[u32]`"),
     ("transform_rayon", "rejected: calls `<[u32] as rayon::iter::IntoParallelRefMutIterator<'_>>::par_iter_mut`, which has no GPU summary"),
-    ("triple", "rejected: takes `u32`, not `&mut [u32]`"),
+    ("triple", "rejected: takes `u32`, not a `&mut` slice of numbers"),
     ("two_loops", "rejected: contains more than one loop"),
-    ("two_stores", "candidate: x * 2 + 2"),
-    ("until_zero", "rejected: uses `Eq`, which is not supported"),
+    ("two_stores", "candidate: map over `[u32]`"),
+    ("until_zero", "rejected: leaves the loop early"),
     ("with_helper", "rejected: calls `triple`, which has no GPU summary"),
-    ("wrapping_sum", "rejected: takes `&[u32]`, not `&mut [u32]`"),
+    ("wrapping_sum", "rejected: takes `&[u32]`, not a `&mut` slice of numbers"),
 ];
 
 /// Plain `+` and `*` panic on overflow in debug builds and wrap in release.
@@ -57,8 +69,8 @@ const DEBUG: &[(&str, &str)] = &[
     ("plain_ops", "rejected: may panic: `Mul` can overflow"),
 ];
 const RELEASE: &[(&str, &str)] = &[
-    ("checked_increment", "candidate: x * 1 + 1"),
-    ("plain_ops", "candidate: x * 3 + 7"),
+    ("checked_increment", "candidate: map over `[u32]`"),
+    ("plain_ops", "candidate: map over `[u32]`"),
 ];
 
 fn expected_report(profile: &[(&str, &str)]) -> String {
@@ -107,7 +119,7 @@ fn automatic_rewriting_touches_only_candidates() {
         for (function, _) in COMMON.iter().chain(profile) {
             let rewritten = probes
                 .mir(function, "optimized")
-                .contains("cuprite_runtime::map_u32");
+                .contains("cuprite_runtime::map_slice");
             assert_eq!(rewritten, accepted.contains(function), "{name}: {function}");
         }
     }
@@ -122,9 +134,10 @@ fn differential(name: &'static str) -> std::path::PathBuf {
 }
 
 /// Runtime calls the differential program makes with `passes` passes, for
-/// each of its 10 lengths (`probes/src/bin/candidates.rs`): 3 repeated maps
-/// with 13 passes, and `repeat_fixed` with 4.
-const REGIONS: [(u32, usize); 2] = [(13, 3), (4, 1)];
+/// each of its 10 lengths (`probes/src/bin/candidates.rs`): 4 repeated maps
+/// with 13 passes (3 over `u32`, `repeat_damp` over `f32`), and
+/// `repeat_fixed` with 4.
+const REGIONS: [(u32, usize); 2] = [(13, 4), (4, 1)];
 const LENGTHS: usize = 10;
 
 #[test]
@@ -155,8 +168,10 @@ fn rewritten_candidates_match_the_cpu_when_the_runtime_declines() {
 fn rewritten_candidates_match_the_cpu_on_the_gpu() {
     let trace = run(&differential("differential-gpu"), true, &[]);
     let non_empty = LENGTHS - 1;
-    // 9 maps; 3 repeated maps with 1 and 13 passes; `repeat_fixed`.
-    let gpu_calls = 9 * non_empty + 3 * 2 * non_empty + non_empty;
+    // 9 `u32` multiply-add maps; 3 repeated maps with 1 and 13 passes;
+    // `repeat_fixed`; 7 general maps, `mix_wide` with 5 parameter choices,
+    // and `repeat_damp` with 1 and 13 passes.
+    let gpu_calls = 9 * non_empty + 3 * 2 * non_empty + non_empty + (7 + 5) * non_empty + 2 * non_empty;
     assert_eq!(trace.matches("-> gpu").count(), gpu_calls, "{trace}");
     for (passes, functions) in REGIONS {
         let calls = trace.matches(&format!("passes={passes} -> gpu")).count();

@@ -1,5 +1,5 @@
 //! M1 questions 4 and 5: the driver rewrites a named function to call
-//! `cuprite_runtime::map_u32` before its original body, and links the
+//! `cuprite_runtime::map_slice` before its original body, and links the
 //! runtime into a crate that never declares it. When the runtime declines,
 //! the original CPU body still runs.
 
@@ -25,14 +25,15 @@ fn only_the_named_function_is_rewritten_and_the_cpu_body_still_runs() {
     assert_eq!(trace.matches(NO_PROFILE).count(), 3);
 
     let repeat = probes.mir("repeat", "optimized");
-    assert!(
-        repeat.contains("cuprite_runtime::map_u32(copy _1, const 3_u32, const 7_u32, copy _2)"),
-        "{repeat}"
-    );
+    // The kernel's description is embedded (MIR prints its newlines as
+    // `\n`), and the pass count passed.
+    let call = r#"cuprite_runtime::map_slice::<u32>(copy _1, const "cuprite kernel 1\nfunction cuprite_probes::repeat\n"#;
+    assert!(repeat.contains(call), "{repeat}");
+    assert!(repeat.contains("= copy _2 as u64 (IntToInt);"), "{repeat}");
     // The CPU body reports when it finishes, and nothing else returns
     // without going through either the GPU or that report.
     assert!(
-        repeat.contains("cuprite_runtime::map_u32_finished(copy "),
+        repeat.contains("cuprite_runtime::finished(copy "),
         "{repeat}"
     );
     assert_eq!(repeat.matches("return;").count(), 1, "{repeat}");
@@ -95,5 +96,5 @@ fn rewriting_without_the_runtime_is_refused() {
         .env("CUPRITE_REPLACE", REPEAT)
         .cargo(&["build", "--lib"]);
     assert!(!output.status.success());
-    assert!(text(&output.stderr).contains("`cuprite_runtime::map_u32` is not loaded"));
+    assert!(text(&output.stderr).contains("`cuprite_runtime::map_slice` is not loaded"));
 }

@@ -33,6 +33,7 @@ mod analyze;
 mod census;
 mod dump;
 mod replace;
+mod translate;
 
 use std::{
     env,
@@ -60,7 +61,7 @@ const TRACKED: [&str; 7] = [
 ];
 
 /// Cuprite's own crates, which are never analyzed or linked to the runtime.
-const CUPRITE_CRATES: [&str; 2] = [replace::RUNTIME_CRATE, "cuprite_memory"];
+const CUPRITE_CRATES: [&str; 3] = [replace::RUNTIME_CRATE, "cuprite_memory", "cuprite_kernel"];
 
 #[derive(Default)]
 pub(crate) struct Settings {

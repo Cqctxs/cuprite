@@ -1,0 +1,13 @@
+[package]
+name = "cuprite-kernel"
+description = "GPU kernels: a small typed representation with Rust's semantics, compiled to PTX directly or through LLVM"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+# Declares an NVIDIA GPU test host: the GPU tests run and must pass.
+gpu-tests = []
+
+[dev-dependencies]
+cuprite-memory = { path = "../../crates/cuprite-memory", features = ["cuda"] }

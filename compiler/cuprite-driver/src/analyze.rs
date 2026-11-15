@@ -1,47 +1,53 @@
-//! Recognizer: decides from built MIR whether a function is an in-place
-//! multiply-add map over a `u32` slice (M2), or a counted loop that repeats
-//! such maps (M3), and which map.
+//! Recognizer: decides from built MIR whether a function is an in-place map
+//! over a slice of numbers (M2), or a counted loop that repeats such maps
+//! (M3), and translates what the map does to each element into a kernel
+//! element function (`translate`).
 //!
-//! - **Maps.** A function `fn(&mut [u32])` whose body is a single `for` loop
-//!   over the slice (directly or through `iter_mut()`) in which each element
-//!   is replaced by a combination of wrapping `+`, `-` and `*` with
-//!   constants. The combination must reduce to `x * mul + add`. Plain
-//!   operators count only where they cannot panic, that is, without
-//!   overflow checks.
-//! - **Repeated maps.** A function `fn(&mut [u32])` or `fn(&mut [u32], u32)`
+//! - **Maps.** A function `fn(&mut [T], scalars...)`, with `T` a primitive
+//!   number and each scalar an `i32`, `u32`, `i64`, `u64`, `usize`,
+//!   `isize`, `f32` or `f64`, whose body is a single `for` loop over the
+//!   slice (directly or through `iter_mut()`). The loop body may compute
+//!   anything `translate` supports from the element, the scalars and
+//!   constants, and write the element. It may not leave the loop early.
+//! - **Repeated maps.** A function `fn(&mut [T])` or `fn(&mut [T], u32)`
 //!   whose body is a single `for _ in 0..n` loop, with `n` a constant or the
 //!   `u32` parameter, whose body only calls maps of this crate on the whole
-//!   slice. The calls compose into one map, applied `n` times.
+//!   slice. Maps change each element independently, so the calls compose
+//!   per element, and the kernel loops `n` times per element.
 //!
 //! Everything else is rejected with a reason. Neither rule allows a
 //! function to reassign its parameters, because the rewritten body reads
-//! them on entry.
+//! them on entry. Nothing may panic, unless the assertion provably passes.
 //!
 //! Library functions are recognized by their definitions (lang items, and
-//! inherent methods of `core`'s `u32` and `[T]`), never by printed names.
-//! Built MIR is read before inlining, so those calls are still visible; the
-//! borrow checker has accepted the function, so the loop's element
-//! reference is the only access to the slice while the loop runs.
+//! inherent methods of the primitive types and `[T]`), never by printed
+//! names. Built MIR is read before inlining, so those calls are still
+//! visible; the borrow checker has accepted the function, so the loop's
+//! element reference is the only access to the slice while the loop runs.
 
 use std::{
     collections::{HashMap, HashSet},
-    fmt, fs,
+    fs,
     path::Path,
     sync::Mutex,
 };
 
+use cuprite_kernel::{Const, Function, Ty as KTy};
 use rustc_attr_ir::lang_items::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::{
-        AggregateKind, AssertKind, BasicBlock, BinOp, Body, BorrowKind, Local, Operand, Place,
-        ProjectionElem, Rvalue, StatementKind, TerminatorKind, RETURN_PLACE,
+        AggregateKind, AssertKind, BasicBlock, Body, BorrowKind, Local, Operand, Place, ProjectionElem, Rvalue,
+        StatementKind, TerminatorKind, RETURN_PLACE,
     },
     ty::{self, Ty, TyCtxt},
 };
 use rustc_span::def_id::{LocalDefId, LOCAL_CRATE};
 
-use crate::replace::Passes;
+use crate::{
+    replace::Passes,
+    translate::{self, Method},
+};
 
 /// The slice parameter.
 const SLICE: Local = Local::from_u32(1);
@@ -51,69 +57,23 @@ const COUNT: Local = Local::from_u32(2);
 pub(crate) const REPORT_VAR: &str = "CUPRITE_REPORT";
 pub(crate) const AUTO_VAR: &str = "CUPRITE_AUTO";
 
-/// `x * mul + add`, wrapping.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Affine {
-    pub(crate) mul: u32,
-    pub(crate) add: u32,
+/// One map: what it does to each element of its slice.
+#[derive(Clone, Debug)]
+pub(crate) struct Map {
+    pub(crate) element: KTy,
+    /// Takes the element, then the values of `scalars`.
+    pub(crate) function: Function,
+    /// The function's parameters after the slice, in order.
+    pub(crate) scalars: Vec<Local>,
 }
 
-impl Affine {
-    const IDENTITY: Self = Self { mul: 1, add: 0 };
-
-    fn constant(value: u32) -> Self {
-        Self { mul: 0, add: value }
-    }
-
-    fn add(self, other: Self) -> Self {
-        Self {
-            mul: self.mul.wrapping_add(other.mul),
-            add: self.add.wrapping_add(other.add),
-        }
-    }
-
-    fn sub(self, other: Self) -> Self {
-        Self {
-            mul: self.mul.wrapping_sub(other.mul),
-            add: self.add.wrapping_sub(other.add),
-        }
-    }
-
-    /// Defined only when one side is a constant; otherwise the element
-    /// would be multiplied by itself.
-    fn mul(self, other: Self) -> Option<Self> {
-        let (scale, map) = match (self.mul, other.mul) {
-            (0, _) => (self.add, other),
-            (_, 0) => (other.add, self),
-            _ => return None,
-        };
-        Some(Self {
-            mul: map.mul.wrapping_mul(scale),
-            add: map.add.wrapping_mul(scale),
-        })
-    }
-
-    /// `self`, then `next`.
-    fn then(self, next: Self) -> Self {
-        Self {
-            mul: next.mul.wrapping_mul(self.mul),
-            add: next.mul.wrapping_mul(self.add).wrapping_add(next.add),
-        }
-    }
-}
-
-impl fmt::Display for Affine {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "x * {} + {}", self.mul, self.add)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) enum Verdict {
     /// One pass of a map.
-    Candidate(Affine),
-    /// A map applied `passes` times, which can stay on the GPU throughout.
-    Repeated(Affine, Passes),
+    Candidate(Map),
+    /// Maps applied in order, all of that `passes` times, which can stay on
+    /// the GPU throughout. None of them reads scalars.
+    Repeated(Vec<Map>, Passes),
     Rejected(String),
 }
 
@@ -125,6 +85,7 @@ enum Recorded {
     /// been built: after analysis, when the report is written and optimized
     /// MIR is requested.
     Region {
+        element: KTy,
         calls: Vec<LocalDefId>,
         passes: Passes,
     },
@@ -153,27 +114,43 @@ pub(crate) fn record<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &Body<'t
 pub(crate) fn verdict(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<Verdict> {
     let recorded = RECORDED.lock().unwrap();
     let recorded = recorded.as_ref()?;
-    let (calls, passes) = match recorded.get(&def_id)? {
+    let (element, calls, passes) = match recorded.get(&def_id)? {
         Recorded::Done(verdict) => return Some(verdict.clone()),
-        Recorded::Region { calls, passes } => (calls, *passes),
+        Recorded::Region { element, calls, passes } => (*element, calls, *passes),
     };
-    let mut map = Affine::IDENTITY;
+    let mut stages = Vec::new();
     for callee in calls {
-        // Only single maps: a callee that is itself a region would need its
-        // own pass count.
-        let Some(Recorded::Done(Verdict::Candidate(step))) = recorded.get(callee) else {
-            return Some(Verdict::Rejected(format!(
+        // Only single maps over the same slice, called with just the slice:
+        // a callee that is itself a region would need its own pass count.
+        let not_a_map = || {
+            Some(Verdict::Rejected(format!(
                 "calls `{}`, which is not a recognized map",
                 tcx.def_path_str(*callee)
-            )));
+            )))
         };
-        map = map.then(*step);
+        let Some(Recorded::Done(Verdict::Candidate(map))) = recorded.get(callee) else {
+            return not_a_map();
+        };
+        if map.element != element || !map.scalars.is_empty() {
+            return not_a_map();
+        }
+        stages.push(map.clone());
     }
-    Some(if map == Affine::IDENTITY || passes == Passes::Const(0) {
+    Some(if stages.is_empty() || passes == Passes::Const(0) {
         Verdict::Rejected("does not change the slice".into())
     } else {
-        Verdict::Repeated(map, passes)
+        Verdict::Repeated(stages, passes)
     })
+}
+
+/// Describes a map for the report: "map over `[f32]` reading `scale`".
+fn describe_map(tcx: TyCtxt<'_>, def_id: LocalDefId, map: &Map) -> String {
+    let mut text = format!("map over `[{}]`", map.element.name());
+    if !map.scalars.is_empty() {
+        let names: Vec<String> = map.scalars.iter().map(|&local| parameter(tcx, def_id, local)).collect();
+        text += &format!(" reading {}", names.join(", "));
+    }
+    text
 }
 
 /// A parameter's name for messages, such as "`passes`".
@@ -191,14 +168,23 @@ pub(crate) fn write_report(tcx: TyCtxt<'_>, dir: &Path) {
         .hir_body_owners()
         .filter_map(|def_id| {
             let line = match verdict(tcx, def_id)? {
-                Verdict::Candidate(map) => format!("candidate: {map}"),
-                Verdict::Repeated(map, Passes::Const(passes)) => {
-                    format!("candidate: {map}, repeated {passes} times")
+                Verdict::Candidate(map) => format!("candidate: {}", describe_map(tcx, def_id, &map)),
+                Verdict::Repeated(stages, passes) => {
+                    let passes = match passes {
+                        Passes::Const(passes) => passes.to_string(),
+                        Passes::Arg(index) => parameter(tcx, def_id, Local::from_usize(index)),
+                    };
+                    let krate = format!("{}::", tcx.crate_name(LOCAL_CRATE));
+                    let names: Vec<String> = stages
+                        .iter()
+                        .map(|map| format!("`{}`", map.function.kernel.name.trim_start_matches(&krate)))
+                        .collect();
+                    format!(
+                        "candidate: {} over `[{}]`, repeated {passes} times",
+                        names.join(" then "),
+                        stages[0].element.name()
+                    )
                 }
-                Verdict::Repeated(map, Passes::Arg(index)) => format!(
-                    "candidate: {map}, repeated {} times",
-                    parameter(tcx, def_id, Local::from_usize(index))
-                ),
                 Verdict::Rejected(reason) => format!("rejected: {reason}"),
             };
             Some(format!("{krate}::{}: {line}", tcx.def_path_str(def_id)))
@@ -216,26 +202,15 @@ enum Known {
     /// `IntoIterator::into_iter`; which receivers are allowed is checked
     /// where the iterator is traced.
     IntoIter,
-    /// `<[u32]>::iter_mut`.
+    /// `<[T]>::iter_mut`.
     SliceIterMut,
     /// `Iterator::next`.
     Next,
-    /// `u32::wrapping_add`, `wrapping_sub` or `wrapping_mul`.
-    Wrapping(BinOp),
+    /// A numeric method with a kernel equivalent (`translate::method`).
+    Method(Method),
     /// A non-generic, non-trait function of this crate, which only a
     /// repeated map may call, and only if the callee is a map.
     Local(LocalDefId),
-}
-
-/// What a local holds while the loop body is evaluated.
-#[derive(Clone, Copy, Debug)]
-enum Value {
-    /// The `&mut u32` to the current element.
-    Element,
-    /// A `u32` as a function of the element's original value.
-    Map(Affine),
-    /// `()`, which the body may assign but never compute with.
-    Unit,
 }
 
 struct Recognizer<'a, 'tcx> {
@@ -260,27 +235,39 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         }
     }
 
-    fn recognize_map(&self) -> Result<Affine> {
-        self.check_signature(false)?;
+    fn recognize_map(&self) -> Result<Map> {
+        let (element, scalars) = self.check_signature(false)?;
         self.check_parameters_unchanged()?;
         let calls = self.check_effects(false)?;
         let header = self.single_loop(&calls, "is not a single `for` loop over the slice")?;
         let iterator_chain = self.iterator_chain(header.receiver)?;
 
-        let mut walked = HashSet::new();
-        let map = self.evaluate_body(header.some, header.next_block, header.option, &mut walked)?;
-        self.check_rest(&calls, &walked, &iterator_chain, &header)?;
-
-        if map == Affine::IDENTITY {
+        let constants = self.constants_before_loop();
+        let is_header = |block| self.is_header(block, header.next_block);
+        let shape = translate::Loop {
+            option: header.option,
+            start: header.some,
+            is_header: &is_header,
+            constants: &constants,
+            scalars: &scalars,
+        };
+        let name = format!("{}::{}", self.tcx.crate_name(LOCAL_CRATE), self.tcx.def_path_str(self.def_id));
+        let translated = translate::translate(self.tcx, self.body, &name, element, &shape)?;
+        self.check_rest(&calls, &translated.blocks, &iterator_chain, &header)?;
+        if !translated.stores {
             return Err("does not change the slice".into());
         }
-        Ok(map)
+        Ok(Map {
+            element,
+            function: translated.function,
+            scalars,
+        })
     }
 
     /// A counted loop whose body calls functions of this crate on the
     /// slice. Whether those are maps is decided later (`verdict`).
     fn recognize_region(&self) -> Result<Recorded> {
-        self.check_signature(true)?;
+        let (element, _) = self.check_signature(true)?;
         self.check_parameters_unchanged()?;
         let calls = self.check_effects(true)?;
         let header = self.single_loop(&calls, "is not a single counted loop")?;
@@ -290,6 +277,7 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         let callees = self.region_calls(header.some, header.next_block, &mut walked)?;
         self.check_rest(&calls, &walked, &[range_setup], &header)?;
         Ok(Recorded::Region {
+            element,
             calls: callees,
             passes,
         })
@@ -319,9 +307,12 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         calls: &[(BasicBlock, Known)],
         not_a_loop: &str,
     ) -> Result<LoopHeader<'a, 'tcx>> {
-        let mut nexts = calls.iter().filter(|(_, known)| *known == Known::Next);
-        let (Some(&(next_block, _)), None) = (nexts.next(), nexts.next()) else {
-            return Err(not_a_loop.into());
+        let nexts: Vec<BasicBlock> =
+            calls.iter().filter(|(_, known)| *known == Known::Next).map(|&(block, _)| block).collect();
+        let next_block = match nexts[..] {
+            [block] => block,
+            [] => return Err(not_a_loop.into()),
+            _ => return Err("contains more than one loop".into()),
         };
         let TerminatorKind::Call {
             args,
@@ -361,48 +352,64 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
                     self.callee(block)
                 ));
             }
-            if walked.contains(&block) && !matches!(known, Known::Wrapping(_) | Known::Local(_)) {
+            if walked.contains(&block) && !matches!(known, Known::Method(_) | Known::Local(_)) {
                 return Err("iterates inside the loop body".into());
             }
         }
         self.check_outside_loop(walked, header.after_next, header.next_block, header.none)
     }
 
-    /// `fn(&mut [u32]) -> ()`, or with `counted`, optionally a second `u32`
-    /// parameter for the pass count.
-    fn check_signature(&self, counted: bool) -> Result<()> {
+    /// `fn(&mut [T], scalars...) -> ()` with `T` a primitive number, or with
+    /// `counted`, `fn(&mut [T])` or `fn(&mut [T], u32)`, the second being the
+    /// pass count. Returns `T` and the scalar parameters.
+    fn check_signature(&self, counted: bool) -> Result<(KTy, Vec<Local>)> {
         if self.tcx.generics_of(self.def_id).count() != 0 {
             return Err("is generic".into());
         }
         let params = self.body.arg_count;
-        let supported = if counted {
-            "only `fn(&mut [u32])` and `fn(&mut [u32], u32)` are supported"
-        } else {
-            "only `fn(&mut [u32])` is supported"
-        };
-        if !(params == 1 || counted && params == 2) {
-            return Err(format!("takes {params} parameters; {supported}"));
+        if params == 0 {
+            return Err("takes no parameters; the first must be a `&mut` slice of numbers".into());
+        }
+        if counted && params > 2 {
+            return Err(format!(
+                "takes {params} parameters; a repeated map takes the slice and at most a `u32` pass count"
+            ));
         }
         let param = self.body.local_decls[SLICE].ty;
-        if !self.is_mut_u32_slice(param) {
-            return Err(format!("takes `{param}`, not `&mut [u32]`"));
-        }
-        if params == 2 {
+        let element = Self::mut_slice_element(param)
+            .ok_or_else(|| format!("takes `{param}`, not a `&mut` slice of numbers"))?;
+        if counted && params == 2 {
             let count = self.body.local_decls[COUNT].ty;
             if count != self.tcx.types.u32 {
                 return Err(format!("takes `{count}` as its pass count, not `u32`"));
+            }
+        }
+        let scalars: Vec<Local> = if counted { Vec::new() } else { (2..=params).map(Local::from_usize).collect() };
+        for &local in &scalars {
+            let ty = self.body.local_decls[local].ty;
+            if !translate::kernel_ty(ty).is_some_and(|ty| ty.is_passable()) {
+                return Err(format!(
+                    "takes `{ty}` as {}, which a kernel can't take",
+                    parameter(self.tcx, self.def_id, local)
+                ));
             }
         }
         let output = self.body.local_decls[RETURN_PLACE].ty;
         if !output.is_unit() {
             return Err(format!("returns `{output}`"));
         }
-        Ok(())
+        Ok((element, scalars))
     }
 
-    fn is_mut_u32_slice(&self, ty: Ty<'tcx>) -> bool {
-        matches!(ty.kind(), ty::Ref(_, inner, ty::Mutability::Mut)
-            if matches!(inner.kind(), ty::Slice(element) if *element == self.tcx.types.u32))
+    /// `T` for `&mut [T]` with `T` a number.
+    fn mut_slice_element(ty: Ty<'tcx>) -> Option<KTy> {
+        match ty.kind() {
+            ty::Ref(_, inner, ty::Mutability::Mut) => match inner.kind() {
+                ty::Slice(element) => translate::kernel_ty(*element).filter(|ty| *ty != KTy::Bool),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn is_parameter(&self, local: Local) -> bool {
@@ -445,12 +452,12 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         Ok(())
     }
 
-    /// Rejects anything that may panic, run a destructor, call unknown code,
-    /// or loop other than the one loop; returns the known calls. Calls to
-    /// functions of this crate are allowed only with `allow_local`.
+    /// Rejects anything that may panic, run a destructor or call unknown
+    /// code; returns the known calls. An assertion is allowed only if it
+    /// provably passes. Calls to functions of this crate are allowed only
+    /// with `allow_local`.
     fn check_effects(&self, allow_local: bool) -> Result<Vec<(BasicBlock, Known)>> {
         let mut calls = Vec::new();
-        let mut loops = 0;
         for (block, data) in self.body.basic_blocks.iter_enumerated() {
             for statement in &data.statements {
                 match &statement.kind {
@@ -476,20 +483,18 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
                     calls.push((block, known));
                 }
                 TerminatorKind::Assert { msg, .. } => {
-                    return Err(format!("may panic: {}", describe_assert(msg)));
-                }
-                TerminatorKind::Drop { .. } => return Err("runs a destructor".into()),
-                TerminatorKind::FalseUnwind { .. } => {
-                    loops += 1;
-                    if loops > 1 {
-                        return Err("contains more than one loop".into());
+                    if !translate::assert_holds(self.body, block) {
+                        return Err(format!("may panic: {}", describe_assert(msg)));
                     }
                 }
+                TerminatorKind::Drop { .. } => return Err("runs a destructor".into()),
                 TerminatorKind::Goto { .. }
                 | TerminatorKind::SwitchInt { .. }
                 | TerminatorKind::Return
                 | TerminatorKind::UnwindResume
                 | TerminatorKind::Unreachable
+                // Loops: the `for` loop, and `while` loops inside its body.
+                | TerminatorKind::FalseUnwind { .. }
                 | TerminatorKind::FalseEdge { .. } => {}
                 other => return Err(format!("contains unsupported control flow `{other:?}`")),
             }
@@ -508,27 +513,16 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         if tcx.is_lang_item(def_id, LangItem::IteratorNext) {
             return Ok(Known::Next);
         }
+        if let Some(method) = translate::method(tcx, def_id) {
+            return Ok(Known::Method(method));
+        }
         if let Some(impl_id) = tcx.inherent_impl_of_assoc(def_id) {
-            if tcx.crate_name(impl_id.krate).as_str() == "core" {
-                let self_ty = tcx
-                    .type_of(impl_id)
-                    .instantiate_identity()
-                    .skip_normalization();
-                let name = tcx.item_name(def_id);
-                if self_ty == tcx.types.u32 {
-                    match name.as_str() {
-                        "wrapping_add" => return Ok(Known::Wrapping(BinOp::Add)),
-                        "wrapping_sub" => return Ok(Known::Wrapping(BinOp::Sub)),
-                        "wrapping_mul" => return Ok(Known::Wrapping(BinOp::Mul)),
-                        _ => {}
-                    }
-                }
-                if matches!(self_ty.kind(), ty::Slice(_))
-                    && name.as_str() == "iter_mut"
-                    && args.type_at(0) == tcx.types.u32
-                {
-                    return Ok(Known::SliceIterMut);
-                }
+            let self_ty = tcx.type_of(impl_id).instantiate_identity().skip_normalization();
+            if tcx.crate_name(impl_id.krate).as_str() == "core"
+                && matches!(self_ty.kind(), ty::Slice(_))
+                && tcx.item_name(def_id).as_str() == "iter_mut"
+            {
+                return Ok(Known::SliceIterMut);
             }
         }
         // Trait methods are excluded: the call names the trait's item, and
@@ -699,79 +693,6 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
             }
     }
 
-    /// Evaluates the loop body symbolically, from the `Some` branch back to
-    /// the header, and returns the map applied to the element.
-    fn evaluate_body(
-        &self,
-        start: BasicBlock,
-        next_block: BasicBlock,
-        option: Place<'tcx>,
-        walked: &mut HashSet<BasicBlock>,
-    ) -> Result<Affine> {
-        let constants = self.constants_before_loop();
-        let mut values: HashMap<Local, Value> = HashMap::new();
-        let mut element = Affine::IDENTITY;
-        let mut block = start;
-        loop {
-            if !walked.insert(block) {
-                return Err("has an unsupported loop shape".into());
-            }
-            let data = &self.body.basic_blocks[block];
-            let env = Env {
-                option,
-                constants: &constants,
-                u32_ty: self.tcx.types.u32,
-            };
-            for statement in &data.statements {
-                let StatementKind::Assign(assign) = &statement.kind else {
-                    continue; // Storage markers and other no-ops.
-                };
-                let (place, rvalue) = &**assign;
-                let value = env.rvalue(rvalue, &values, element)?;
-                if let Some(local) = place.as_local() {
-                    values.insert(local, value);
-                } else if let ([ProjectionElem::Deref], Some(Value::Element)) =
-                    (place.projection.as_slice(), values.get(&place.local))
-                {
-                    let Value::Map(map) = value else {
-                        return Err("stores something other than a `u32`".into());
-                    };
-                    element = map;
-                } else {
-                    return Err("writes memory other than the current element".into());
-                }
-            }
-            block = match &data.terminator().kind {
-                TerminatorKind::Call {
-                    func,
-                    args,
-                    destination,
-                    target: Some(target),
-                    ..
-                } => {
-                    let Known::Wrapping(op) = self.classify(func)? else {
-                        return Err("iterates inside the loop body".into());
-                    };
-                    let lhs = env.operand(&args[0].node, &values, element)?;
-                    let rhs = env.operand(&args[1].node, &values, element)?;
-                    let local = destination
-                        .as_local()
-                        .ok_or("writes memory other than the current element")?;
-                    values.insert(local, Value::Map(binary(op, lhs, rhs)?));
-                    *target
-                }
-                TerminatorKind::Goto { target, .. } if self.is_header(*target, next_block) => {
-                    return Ok(element);
-                }
-                TerminatorKind::Goto { target, .. } => *target,
-                TerminatorKind::SwitchInt { .. } => {
-                    return Err("branches inside the loop body".into())
-                }
-                _ => return Err("has an unsupported loop shape".into()),
-            };
-        }
-    }
-
     /// `next`'s receiver must be `(a..b).into_iter()` with integer constants
     /// `a` and `b`, or `(0..n).into_iter()` with `n` the pass-count
     /// parameter. Returns the `into_iter` block and the number of passes.
@@ -900,8 +821,8 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         }
     }
 
-    /// Locals assigned once, from a `u32` constant, and never borrowed.
-    fn constants_before_loop(&self) -> HashMap<Local, u32> {
+    /// Locals assigned once, from a scalar constant, and never borrowed.
+    fn constants_before_loop(&self) -> HashMap<Local, Const> {
         let mut assigned: HashMap<Local, Vec<&Rvalue<'tcx>>> = HashMap::new();
         let mut borrowed = HashSet::new();
         for data in self.body.basic_blocks.iter() {
@@ -926,19 +847,10 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
             .into_iter()
             .filter(|(local, _)| !borrowed.contains(local))
             .filter_map(|(local, rvalues)| match rvalues.as_slice() {
-                [Rvalue::Use(Operand::Constant(constant), _)] => {
-                    Some((local, self.u32_constant(constant)?))
-                }
+                [Rvalue::Use(Operand::Constant(constant), _)] => Some((local, translate::constant(constant)?)),
                 _ => None,
             })
             .collect()
-    }
-
-    fn u32_constant(&self, constant: &rustc_middle::mir::ConstOperand<'tcx>) -> Option<u32> {
-        if constant.ty() != self.tcx.types.u32 {
-            return None;
-        }
-        Some(constant.const_.try_to_scalar_int()?.to_u32())
     }
 
     /// The setup before the loop and the exit after it may only move
@@ -1012,102 +924,6 @@ struct LoopHeader<'a, 'tcx> {
     none: BasicBlock,
 }
 
-/// Evaluation context for the loop body.
-struct Env<'c, 'tcx> {
-    /// `next`'s result: `(option as Some).0` is the element reference.
-    option: Place<'tcx>,
-    constants: &'c HashMap<Local, u32>,
-    u32_ty: Ty<'tcx>,
-}
-
-impl<'tcx> Env<'_, 'tcx> {
-    fn operand(
-        &self,
-        operand: &Operand<'tcx>,
-        values: &HashMap<Local, Value>,
-        element: Affine,
-    ) -> Result<Value> {
-        let place = match operand {
-            Operand::Move(place) | Operand::Copy(place) => place,
-            Operand::Constant(constant) => {
-                if constant.ty().is_unit() {
-                    return Ok(Value::Unit);
-                }
-                let scalar = constant
-                    .const_
-                    .try_to_scalar_int()
-                    .filter(|_| constant.ty() == self.u32_ty);
-                return match scalar.map(|scalar| scalar.to_u32()) {
-                    Some(value) => Ok(Value::Map(Affine::constant(value))),
-                    None => Err(format!(
-                        "uses an unsupported constant of type `{}`",
-                        constant.ty()
-                    )),
-                };
-            }
-            Operand::RuntimeChecks(_) => return Err("reads a runtime-check flag".into()),
-        };
-        if place.local == self.option.local {
-            return match place.projection.as_slice() {
-                [ProjectionElem::Downcast(_, variant), ProjectionElem::Field(field, _)]
-                    if variant.as_u32() == 1 && field.as_u32() == 0 =>
-                {
-                    Ok(Value::Element)
-                }
-                _ => Err("has an unsupported loop shape".into()),
-            };
-        }
-        match (place.projection.as_slice(), values.get(&place.local)) {
-            ([], Some(value)) => Ok(*value),
-            ([ProjectionElem::Deref], Some(Value::Element)) => Ok(Value::Map(element)),
-            ([], None) => match self.constants.get(&place.local) {
-                Some(&value) => Ok(Value::Map(Affine::constant(value))),
-                None => Err("uses a value computed outside the loop body".into()),
-            },
-            _ => Err("reads memory other than the current element".into()),
-        }
-    }
-
-    fn rvalue(
-        &self,
-        rvalue: &Rvalue<'tcx>,
-        values: &HashMap<Local, Value>,
-        element: Affine,
-    ) -> Result<Value> {
-        match rvalue {
-            Rvalue::Use(operand, _) => self.operand(operand, values, element),
-            Rvalue::BinaryOp(op, operands) => {
-                let lhs = self.operand(&operands.0, values, element)?;
-                let rhs = self.operand(&operands.1, values, element)?;
-                Ok(Value::Map(binary(*op, lhs, rhs)?))
-            }
-            Rvalue::Ref(_, _, place) => {
-                match (place.projection.as_slice(), values.get(&place.local)) {
-                    ([ProjectionElem::Deref], Some(Value::Element)) => Ok(Value::Element),
-                    _ => Err("borrows something other than the current element".into()),
-                }
-            }
-            _ => Err("uses an unsupported operation".into()),
-        }
-    }
-}
-
-/// Wrapping `+`, `-` or `*` of two maps. Plain operators only reach here
-/// without overflow checks, where they wrap.
-fn binary(op: BinOp, lhs: Value, rhs: Value) -> Result<Affine> {
-    let (Value::Map(lhs), Value::Map(rhs)) = (lhs, rhs) else {
-        return Err("computes with something other than a `u32`".into());
-    };
-    match op {
-        BinOp::Add => Ok(lhs.add(rhs)),
-        BinOp::Sub => Ok(lhs.sub(rhs)),
-        BinOp::Mul => lhs
-            .mul(rhs)
-            .ok_or_else(|| "is not a multiply-add map (multiplies the element by itself)".into()),
-        other => Err(format!("uses `{other:?}`, which is not supported")),
-    }
-}
-
 /// The value of an integer constant of any width and sign, if it fits in
 /// `i128`.
 fn integer_constant(constant: &rustc_middle::mir::ConstOperand<'_>) -> Option<i128> {
@@ -1130,78 +946,3 @@ fn describe_assert<O>(msg: &AssertKind<O>) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const X: Affine = Affine::IDENTITY;
-
-    #[test]
-    fn maps_compose_with_wrapping_arithmetic() {
-        let three = Affine::constant(3);
-        let seven = Affine::constant(7);
-        assert_eq!(X.mul(three).unwrap().add(seven), Affine { mul: 3, add: 7 });
-        assert_eq!(X.add(X), Affine { mul: 2, add: 0 });
-        assert_eq!(
-            seven.sub(X),
-            Affine {
-                mul: u32::MAX,
-                add: 7
-            }
-        );
-        let big = Affine::constant(u32::MAX);
-        assert_eq!(
-            X.add(seven).mul(big).unwrap(),
-            Affine {
-                mul: u32::MAX,
-                add: 7u32.wrapping_mul(u32::MAX)
-            }
-        );
-    }
-
-    #[test]
-    fn the_element_times_itself_is_not_a_map() {
-        assert_eq!(X.mul(X), None);
-        assert_eq!(X.add(Affine::constant(1)).mul(X), None);
-    }
-
-    /// Every composition must agree with evaluating the operations
-    /// directly, including where they wrap.
-    #[test]
-    fn composition_matches_direct_evaluation() {
-        let values = [0, 1, 2, 12345, u32::MAX - 1, u32::MAX];
-        for &a in &values {
-            for &b in &values {
-                let map = X
-                    .mul(Affine::constant(a))
-                    .unwrap()
-                    .sub(Affine::constant(b))
-                    .add(X);
-                for &x in &values {
-                    let direct = x.wrapping_mul(a).wrapping_sub(b).wrapping_add(x);
-                    assert_eq!(x.wrapping_mul(map.mul).wrapping_add(map.add), direct);
-                }
-            }
-        }
-    }
-
-    /// Sequencing two maps agrees with applying them one after the other.
-    #[test]
-    fn sequencing_matches_applying_in_order() {
-        let apply = |map: Affine, x: u32| x.wrapping_mul(map.mul).wrapping_add(map.add);
-        let values = [0, 1, 7, 12345, u32::MAX - 1, u32::MAX];
-        for &(m1, a1, m2, a2) in &[
-            (3, 7, 2, 0),
-            (u32::MAX, 5, 3, u32::MAX),
-            (0, 42, 9, 1),
-            (1, 0, 1, 0),
-        ] {
-            let first = Affine { mul: m1, add: a1 };
-            let second = Affine { mul: m2, add: a2 };
-            for &x in &values {
-                assert_eq!(apply(first.then(second), x), apply(second, apply(first, x)));
-            }
-        }
-        assert_eq!(X.then(X), X);
-    }
-}

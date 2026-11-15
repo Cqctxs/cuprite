@@ -3,6 +3,9 @@
 //! operations one by one, pass by pass. Built through the driver with
 //! `CUPRITE_AUTO=1`, the calls can run on the GPU.
 //!
+//! Floats are compared by their bits, so signed zeros must match too; only
+//! NaN payloads, which Rust leaves unspecified, may differ.
+//!
 //! Release builds only: `plain_ops` and `checked_increment` overflow (and
 //! so panic) in debug builds, which is why they are rejected there.
 
@@ -110,6 +113,151 @@ fn check(case: &str, values: &[u32], expected: &[u32]) {
     }
 }
 
+
+/// Element types the general maps use, compared bit for bit, so signed
+/// zeros count. Rust leaves the payload of a NaN from arithmetic
+/// unspecified (x86 and NVIDIA GPUs differ), so any NaN matches any NaN.
+trait Element: Copy + std::fmt::Debug {
+    fn random(state: &mut u64) -> Self;
+    fn same(self, other: Self) -> bool;
+}
+
+macro_rules! integer_elements {
+    ($($t:ty),*) => {
+        $(impl Element for $t {
+            fn random(state: &mut u64) -> Self {
+                // Edge values a quarter of the time.
+                let bits = u64::from(next(state)) << 32 | u64::from(next(state));
+                match bits % 8 {
+                    0 => 0,
+                    1 => <$t>::MAX,
+                    2 => <$t>::MIN,
+                    _ => bits as $t,
+                }
+            }
+            fn same(self, other: Self) -> bool {
+                self == other
+            }
+        })*
+    };
+}
+integer_elements!(u8, i16, u32, i64);
+
+impl Element for f32 {
+    fn random(state: &mut u64) -> Self {
+        // Every kind of float: ordinary values, and from raw bits, NaNs,
+        // infinities, subnormals and signed zeros.
+        let bits = next(state);
+        match bits % 4 {
+            0 => f32::from_bits(bits),
+            1 => [0.0, -0.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN][(bits / 4 % 5) as usize],
+            _ => (bits as i32) as f32 / 65_536.0,
+        }
+    }
+    fn same(self, other: Self) -> bool {
+        self.to_bits() == other.to_bits() || self.is_nan() && other.is_nan()
+    }
+}
+
+impl Element for f64 {
+    fn random(state: &mut u64) -> Self {
+        let bits = u64::from(next(state)) << 32 | u64::from(next(state));
+        match bits % 4 {
+            0 => f64::from_bits(bits),
+            1 => [0.0, -0.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN][(bits / 4 % 5) as usize],
+            _ => (bits as i64) as f64 / 4_294_967_296.0,
+        }
+    }
+    fn same(self, other: Self) -> bool {
+        self.to_bits() == other.to_bits() || self.is_nan() && other.is_nan()
+    }
+}
+
+/// Runs `function` on every length and compares with `reference` applied
+/// to each element. Returns the number of cases.
+fn general<T: Element>(
+    name: &str,
+    state: &mut u64,
+    function: impl Fn(&mut [T]),
+    reference: impl Fn(T) -> T,
+) -> usize {
+    for len in LENGTHS {
+        let input: Vec<T> = (0..len).map(|_| T::random(state)).collect();
+        let expected: Vec<T> = input.iter().map(|&x| reference(x)).collect();
+        let mut values = input.clone();
+        function(&mut values);
+        if let Some(index) = values.iter().zip(&expected).position(|(a, b)| !a.same(*b)) {
+            panic!(
+                "{name}, {len} elements: index {index} is {:?} but should be {:?} (input {:?})",
+                values[index], expected[index], input[index]
+            );
+        }
+    }
+    LENGTHS.len()
+}
+
+/// The general maps, each against an independent reference written with
+/// the same operations in the same order.
+fn general_cases(state: &mut u64) -> usize {
+    let mut checked = 0;
+    checked += general(
+        "scale_offset",
+        state,
+        |v: &mut [f32]| probes::scale_offset(v, 1.5, -0.25),
+        |x| x * 1.5 + -0.25,
+    );
+    checked += general("relu", state, probes::relu, |x: f32| if x < 0.0 { 0.0 } else { x });
+    checked += general("soft_root", state, probes::soft_root, |x: f64| {
+        (x.abs() + 1.0).sqrt().min(1e6).floor()
+    });
+    checked += general("collatz_steps", state, probes::collatz_steps, |start: u32| {
+        let (mut x, mut steps) = (start, 0u32);
+        while x > 1 && steps < 500 {
+            x = if x.is_multiple_of(2) { x >> 1 } else { x.wrapping_mul(3).wrapping_add(1) };
+            steps += 1;
+        }
+        steps
+    });
+    checked += general(
+        "quantize",
+        state,
+        |v: &mut [i16]| probes::quantize(v, -7),
+        |x| (i32::from(x) / 4).wrapping_mul(-7) as i16,
+    );
+    checked += general(
+        "hash_bytes",
+        state,
+        |v: &mut [u8]| probes::hash_bytes(v, 0xDEAD_BEEF),
+        |x| ((u32::from(x) ^ 0xDEAD_BEEF).wrapping_mul(0x9E37_79B1).rotate_left(5) >> 24) as u8,
+    );
+    checked += general("levels", state, probes::levels, |x: u8| (x / 64) * 85);
+    for (shift, bias) in [(0u32, 0usize), (5, 12_345), (63, usize::MAX), (64, 1), (200, 7)] {
+        checked += general(
+            "mix_wide",
+            state,
+            |v: &mut [i64]| probes::mix_wide(v, shift, bias),
+            |x| x.wrapping_mul(-3).wrapping_shr(shift) ^ bias as i64,
+        );
+    }
+    for passes in [0u32, 1, 13] {
+        checked += general(
+            "repeat_damp",
+            state,
+            |v: &mut [f32]| probes::repeat_damp(v, passes),
+            |mut x| {
+                for _ in 0..passes {
+                    x = x * 0.5 + 0.25;
+                    if x < 0.0 {
+                        x = 0.0;
+                    }
+                }
+                x
+            },
+        );
+    }
+    checked
+}
+
 fn main() {
     let mut state = 0x9E37_79B9_7F4A_7C15;
     let mut checked = 0;
@@ -141,5 +289,6 @@ fn main() {
             }
         }
     }
+    checked += general_cases(&mut state);
     println!("{checked} cases match");
 }

@@ -145,8 +145,8 @@ fn expected() -> String {
 /// The calls the application makes: the library's region, then its own map.
 fn calls(side: &str) -> [String; 2] {
     [
-        format!("cuprite: map_u32 len={LEN} passes={PASSES} -> {side}"),
-        format!("cuprite: map_u32 len={LEN} passes=1 -> {side}"),
+        format!("cuprite: fixture_lib::simulate len={LEN} passes={PASSES} -> {side}"),
+        format!("cuprite: cuprite_fixture_app::mix len={LEN} passes=1 -> {side}"),
     ]
 }
 
@@ -158,15 +158,12 @@ fn a_package_and_its_libraries_are_rewritten() {
         let report = report(name).unwrap();
         assert!(report.lines().any(|l| l == line), "{name}:\n{report}");
     };
-    has("fixture_lib", "fixture_lib::step: candidate: x * 5 + 1");
+    has("fixture_lib", "fixture_lib::step: candidate: map over `[u32]`");
     has(
         "fixture_lib",
-        "fixture_lib::simulate: candidate: x * 5 + 1, repeated `passes` times",
+        "fixture_lib::simulate: candidate: `step` over `[u32]`, repeated `passes` times",
     );
-    has(
-        "cuprite_fixture_app",
-        "cuprite_fixture_app::mix: candidate: x * 7 + 42",
-    );
+    has("cuprite_fixture_app", "cuprite_fixture_app::mix: candidate: map over `[u32]`");
     // crates.io dependencies pass through the driver too.
     for name in ["rayon", "rayon_core", "either", "crossbeam_utils"] {
         report(name).unwrap_or_else(|error| panic!("{name}: {error}"));
@@ -180,12 +177,14 @@ fn a_package_and_its_libraries_are_rewritten() {
 
     let (stdout, stderr) = run_app(&[]);
     assert_eq!(stdout.trim(), expected());
-    let region = format!("cuprite: map_u32 len={LEN} passes={PASSES} {NO_PROFILE}");
+    let region = format!("cuprite: fixture_lib::simulate len={LEN} passes={PASSES} {NO_PROFILE}");
     assert_eq!(stderr.lines().next(), Some(region.as_str()));
     // The region's CPU body calls the rewritten `step` once per pass.
-    let [_, map] = calls("cpu");
-    let maps = stderr.lines().filter(|line| line.starts_with(&map)).count();
-    assert_eq!(maps, PASSES as usize + 1, "{stderr}");
+    let step = format!("cuprite: fixture_lib::step len={LEN} passes=1 -> cpu");
+    let steps = stderr.lines().filter(|line| line.starts_with(&step)).count();
+    assert_eq!(steps, PASSES as usize, "{stderr}");
+    let [_, mix] = calls("cpu");
+    assert_eq!(stderr.lines().filter(|line| line.starts_with(&mix)).count(), 1, "{stderr}");
 }
 
 #[cfg(feature = "gpu-tests")]

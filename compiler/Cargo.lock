@@ -46,7 +46,15 @@ dependencies = [
 name = "cuprite-driver"
 version = "0.1.0"
 dependencies = [
+ "cuprite-kernel",
  "serde_json",
+]
+
+[[package]]
+name = "cuprite-kernel"
+version = "0.1.0"
+dependencies = [
+ "cuprite-memory",
 ]
 
 [[package]]
@@ -67,6 +75,7 @@ dependencies = [
 name = "cuprite-runtime"
 version = "0.1.0"
 dependencies = [
+ "cuprite-kernel",
  "cuprite-memory",
 ]
 
