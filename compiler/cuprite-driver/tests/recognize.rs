@@ -9,6 +9,26 @@ use support::{run, text, Probes, NO_PROFILE};
 
 /// Verdicts that do not depend on the build profile.
 const COMMON: &[(&str, &str)] = &[
+    ("clamp_unit", "rejected: takes `&mut f32`, not a `&mut` slice of numbers"),
+    ("each_affine", "candidate: map over `[u32]`"),
+    ("each_counter", "rejected: passes `for_each` a closure that changes what it captures, which carries a value from one element to the next"),
+    ("each_function", "candidate: map over `[f32]`"),
+    ("each_saxpy", "candidate: map over `[f32]` zipped with `x` reading `a`"),
+    ("each_setup", "candidate: map over `[f64]` reading `scale`"),
+    ("each_then_more", "rejected: uses `core::slice::<impl [u32]>::first_mut` after the loop"),
+    ("par_saxpy", "candidate: map over `[f32]` zipped with `x` reading `a`"),
+    ("apply_once", "rejected: is generic"),
+    ("apply_twice", "rejected: is generic"),
+    ("halve", "rejected: takes `f32`, not a `&mut` slice of numbers"),
+    ("closure_affine", "candidate: map over `[f32]` reading `scale`, `offset`"),
+    ("closure_counter", "candidate: map over `[u32]`"),
+    ("closure_generic", "candidate: map over `[f32]` reading `add`"),
+    ("closure_in_body", "candidate: map over `[u32]` reading `step`"),
+    ("closure_move", "candidate: map over `[i32]` reading `bias`"),
+    ("closure_once", "candidate: map over `[u32]` reading `mask`"),
+    ("closure_pair", "candidate: map over `[u32]` reading `other`"),
+    ("closure_table", "candidate: map over `[u32]` indexing `table`"),
+    ("function_item", "candidate: map over `[f32]`"),
     ("<Adjust as std::clone::Clone>::clone", "rejected: takes `&Adjust`, not a `&mut` slice of numbers"),
     ("Scale::apply", "rejected: takes `&Scale`, not a `&mut` slice of numbers"),
     ("add_bytes", "candidate: map over `[u8]` reading `amount`"),
@@ -48,13 +68,11 @@ const COMMON: &[(&str, &str)] = &[
     ("mix_wide", "candidate: map over `[i64]` reading `shift`, `bias`"),
     ("ni_div_floor", "candidate: map over `[i32]` reading `divisor`"),
     ("ni_gcd", "candidate: map over `[u32]` reading `other`"),
-    ("ni_sqrt", "rejected: calls `<u64 as num_integer::Roots>::sqrt`, which calls `<u64 as num_integer::Roots>::sqrt::go`, which builds a closure or coroutine"),
     ("normalize_range", "candidate: map over `[f32]` reading `low`, `high`"),
     ("normalized_y", "candidate: map over `[f32]`"),
     ("numbered", "rejected: carries a value from one element to the next"),
     ("outside_factor", "candidate: map over `[u32]`"),
     ("palette_blend", "candidate: map over `[f32]` zipped with `others`"),
-    ("palette_linear", "rejected: calls `palette::rgb::Rgb::into_linear::<f32>`, which calls `<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear`, which builds a closure or coroutine"),
     ("palette_mix", "candidate: map over `[f32]` reading `red`, `green`, `blue`"),
     ("plain_ops", "candidate: map over `[u32]`"),
     ("prefix_sum", "rejected: calls `core::slice::<impl [u32]>::len`, which has no GPU summary"),
@@ -89,7 +107,7 @@ const COMMON: &[(&str, &str)] = &[
     ("transform", "candidate: map over `[u32]`"),
     ("transform_indexed", "rejected: calls `core::slice::<impl [u32]>::len`, which has no GPU summary"),
     ("transform_iter_mut", "candidate: map over `[u32]`"),
-    ("transform_rayon", "rejected: is not a single `for` loop over the slice"),
+    ("transform_rayon", "candidate: map over `[u32]`"),
     ("triple", "rejected: takes `u32`, not a `&mut` slice of numbers"),
     ("twice", "rejected: is generic"),
     ("two_loops", "rejected: contains more than one loop"),
@@ -107,9 +125,13 @@ const COMMON: &[(&str, &str)] = &[
 /// rustc inlines differently in debug and release builds, which changes
 /// where some refusals are found.
 const DEBUG: &[(&str, &str)] = &[
+    ("ni_sqrt", "rejected: calls `<u64 as num_integer::Roots>::sqrt`, which calls `<u64 as num_integer::Roots>::sqrt::go`, which uses an unsupported operation"),
+    ("palette_linear", "rejected: calls `palette::rgb::Rgb::into_linear::<f32>`, which calls `<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear`, which calls `<bool as palette::bool_mask::LazySelect<f32>>::lazy_select::<{closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#0}}, {closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#1}}>`, which calls `<{closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#1}} as std::ops::FnOnce<()>>::call_once`, which calls `<f32 as palette::num::Powf>::powf`, which calls `std::f32::<impl f32>::powf`, which uses the intrinsic `powf32`"),
     ("palette_saturation", "rejected: calls `<palette::Hsv as palette::FromColor<palette::rgb::Rgb>>::from_color`, which calls `<palette::Hsv as palette::convert::FromColorUnclamped<palette::rgb::Rgb>>::from_color_unclamped`, which calls `std::any::TypeId::of::<bool>`, which uses a value of type `[*const (); 2]`"),
 ];
 const RELEASE: &[(&str, &str)] = &[
+    ("ni_sqrt", "candidate: map over `[u64]`"),
+    ("palette_linear", "rejected: calls `palette::rgb::Rgb::into_linear::<f32>`, which calls `<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear`, which calls `<bool as palette::bool_mask::LazySelect<f32>>::lazy_select::<{closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#0}}, {closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#1}}>`, which calls `<{closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#1}} as std::ops::FnOnce<()>>::call_once`, which calls `<f32 as palette::num::Powf>::powf`, which uses the intrinsic `powf32`"),
     ("palette_saturation", "rejected: calls `<palette::Hsv as palette::FromColor<palette::rgb::Rgb>>::from_color`, which calls `<palette::Hsv as palette::convert::FromColorUnclamped<palette::rgb::Rgb>>::from_color_unclamped`, which uses an unsupported operation"),
 ];
 
@@ -177,21 +199,22 @@ fn checks(name: &'static str, release: bool) -> std::path::PathBuf {
 const FAILED_CHECK: &str = "-> cpu (a check failed on the GPU)";
 
 /// Runtime calls the checks program makes.
-const CHECK_CALLS: usize = 26;
+const CHECK_CALLS: usize = 28;
 
 /// Calls whose checks pass keep the GPU's results; calls where one fails
 /// fall back to the CPU, which panics with the same message and leaves the
 /// same values as plain Rust. Debug builds also check overflow, so 3 more
 /// calls fail there. Includes held-out `num-integer` (floored division,
 /// by a divisor and by zero, and GCDs) and `strength_reduce` (by a
-/// divisor, a power of two and zero).
+/// divisor, a power of two and zero), and a closure indexing a captured
+/// table, which may be empty.
 #[test]
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "needs an NVIDIA GPU; enable the gpu-tests feature"
 )]
 fn failed_checks_on_the_gpu_behave_like_the_cpu() {
-    for (name, release, failed) in [("checks-debug", false, 12), ("checks-release", true, 9)] {
+    for (name, release, failed) in [("checks-debug", false, 13), ("checks-release", true, 10)] {
         let trace = run(&checks(name, release), true, &[]);
         let calls = trace.lines().filter(|line| line.starts_with("cuprite: ")).count();
         assert_eq!(calls, CHECK_CALLS, "{name}:\n{trace}");
@@ -256,12 +279,17 @@ fn rewritten_candidates_match_the_cpu_on_the_gpu() {
     // 8 maps that call functions, 3 held-out `ultraviolet` maps, and
     // `repeat_helper` and `repeat_damp` with 1 and 13 passes. Then 10 maps
     // reading data, 2 of them twice; and 2 zipped with an input 3 shorter,
-    // which have no work below 4 elements.
+    // which have no work below 4 elements. Then 9 maps with closures, and
+    // `ni_sqrt` (accepted in release builds). Then 5 maps with `for_each`,
+    // and `par_saxpy`, zipped with an input 3 shorter.
     let with_work = LENGTHS - 3;
     let gpu_calls = 9 * non_empty + 3 * 2 * non_empty + non_empty + (7 + 5 + 8 + 3) * non_empty
         + 2 * 2 * non_empty
         + 10 * non_empty
-        + 2 * with_work;
+        + 2 * with_work
+        + (9 + 1) * non_empty
+        + 5 * non_empty
+        + with_work;
     assert_eq!(trace.matches("-> gpu").count(), gpu_calls, "{trace}");
     for (passes, functions) in REGIONS {
         let calls = trace.matches(&format!("passes={passes} -> gpu")).count();

@@ -6,9 +6,12 @@
 //! - **Maps.** A function `fn(&mut [T], scalars...)`, with `T` a primitive
 //!   number and each scalar an `i32`, `u32`, `i64`, `u64`, `usize`,
 //!   `isize`, `f32` or `f64`, whose body is a single `for` loop over the
-//!   slice (directly or through `iter_mut()`). The loop body may compute
-//!   anything `translate` supports from the element, the scalars and
-//!   constants, and write the element. It may not leave the loop early.
+//!   slice (directly or through `iter_mut()`), or a single `for_each` call
+//!   on such an iterator, sequential or Rayon's (`par_iter_mut()`), whose
+//!   closure is the loop body. The loop body may compute anything
+//!   `translate` supports from the element, the scalars and constants, and
+//!   write the element. It may not leave the loop early, and a `for_each`
+//!   closure may not change what it captures.
 //! - **Repeated maps.** A function `fn(&mut [T])` or `fn(&mut [T], u32)`
 //!   whose body is a single `for _ in 0..n` loop, with `n` a constant or the
 //!   `u32` parameter, whose body only calls maps of this crate on the whole
@@ -297,6 +300,8 @@ enum Known {
     Zip,
     /// `Iterator::next`.
     Next,
+    /// `Iterator::for_each`.
+    ForEach,
     /// A non-generic, non-trait function of this crate, which a repeated
     /// map may call, if the callee is a map.
     Local(LocalDefId),
@@ -304,6 +309,26 @@ enum Known {
     /// can inline it.
     Other,
 }
+
+impl Known {
+    /// Builds or runs an iterator.
+    fn iterates(self) -> bool {
+        matches!(
+            self,
+            Known::IntoIter | Known::SliceIterMut | Known::SliceIter | Known::Zip | Known::Next | Known::ForEach
+        )
+    }
+}
+
+/// Rayon's methods that mean the same as the sequential ones, by trait and
+/// method name: a parallel iterator over a slice, `zip` (which also stops
+/// at the shorter side) and `for_each` (whose function must be `Fn`).
+const RAYON: [(&str, &str, Known); 4] = [
+    ("IntoParallelRefMutIterator", "par_iter_mut", Known::SliceIterMut),
+    ("IntoParallelRefIterator", "par_iter", Known::SliceIter),
+    ("IndexedParallelIterator", "zip", Known::Zip),
+    ("ParallelIterator", "for_each", Known::ForEach),
+];
 
 struct Recognizer<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
@@ -326,53 +351,120 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         }
     }
 
+    /// A map: a `for` loop over the slice, or a `for_each` call on it.
     fn recognize_map(&self) -> Result<Map> {
         let (element, params) = self.check_signature(false)?;
         self.check_parameters_unchanged()?;
         let calls = self.check_effects(false)?;
+        let has_next = calls.iter().any(|(_, known)| *known == Known::Next);
+        let eaches: Vec<BasicBlock> =
+            calls.iter().filter(|(_, known)| *known == Known::ForEach).map(|&(block, _)| block).collect();
+        if !has_next && !eaches.is_empty() {
+            return self.recognize_each(element, params, &calls, &eaches);
+        }
         let header = self.single_loop(&calls, "is not a single `for` loop over the slice")?;
-        let not_slice = || "iterates over something other than the slice parameter".to_string();
-        let receiver = Self::operand_local(header.receiver).ok_or_else(not_slice)?;
+        let receiver = Self::operand_local(header.receiver).ok_or_else(Self::not_slice)?;
+        let traced = self.trace(receiver, &params)?;
+        let is_header = |block| self.is_header(block, header.next_block);
+        let iteration = translate::Iteration::For { option: header.option, start: header.some, is_header: &is_header };
+        let translated = self.translate_map(element, &params, &traced, iteration)?;
+        self.check_rest(&calls, &translated.blocks, &traced.chain, &header)?;
+        self.finish_map(element, params, traced, translated)
+    }
+
+    /// `iterator.for_each(function)`: the iteration calls `function` with
+    /// what the iterator yields, as `Iterator::for_each` or Rayon's
+    /// `ParallelIterator::for_each` does. Nothing may follow it.
+    fn recognize_each(
+        &self,
+        element: KTy,
+        params: Params,
+        calls: &[(BasicBlock, Known)],
+        eaches: &[BasicBlock],
+    ) -> Result<Map> {
+        let block = match eaches {
+            [block] => *block,
+            _ => return Err("contains more than one loop".into()),
+        };
+        let TerminatorKind::Call { args, target: Some(after), .. } = &self.body.basic_blocks[block].terminator().kind else {
+            return Err("has an unsupported loop shape".into());
+        };
+        let [iterator, function] = &args[..] else {
+            return Err("has an unsupported loop shape".into());
+        };
+        let receiver = Self::operand_local(&iterator.node).ok_or_else(Self::not_slice)?;
+        let traced = self.trace(receiver, &params)?;
+        let iteration = translate::Iteration::ForEach { block, function: &function.node };
+        let translated = self.translate_map(element, &params, &traced, iteration)?;
+        // Every other call builds the iterator, or is in the setup.
+        for &(call, known) in calls {
+            if call == block || traced.chain.contains(&call) {
+                continue;
+            }
+            if known.iterates() {
+                return Err("iterates outside the loop".into());
+            }
+            if !translated.blocks.contains(&call) {
+                return Err(format!("uses `{}` after the loop", self.callee(call)));
+            }
+        }
+        self.check_exit(*after)?;
+        self.finish_map(element, params, traced, translated)
+    }
+
+    fn not_slice() -> String {
+        "iterates over something other than the slice parameter".to_string()
+    }
+
+    /// What the loop's iterator yields, and the slices it and the code read.
+    fn trace(&self, receiver: Local, params: &Params) -> Result<Traced> {
         let mut chain = HashSet::new();
         let mut plumbing = HashSet::from([receiver]);
         let lane = self.lanes(receiver, &params.slices, &mut chain, &mut plumbing)?;
         if lane.elements() != 1 {
-            return Err(not_slice());
+            return Err(Self::not_slice());
         }
         let mut input_locals = Vec::new();
         lane.inputs(&mut input_locals);
-        let inputs: Vec<(Local, KTy)> =
-            input_locals.iter().map(|local| (*local, params.slices[local])).collect();
+        let inputs: Vec<(Local, KTy)> = input_locals.iter().map(|local| (*local, params.slices[local])).collect();
         // The other slices can be indexed, with bounds checks.
         let mut tables: Vec<(Local, KTy)> =
             params.slices.iter().filter(|(local, _)| !input_locals.contains(local)).map(|(&l, &t)| (l, t)).collect();
         tables.sort_by_key(|&(local, _)| local);
-
-        let is_header = |block| self.is_header(block, header.next_block);
         let opaque: Vec<Local> = std::iter::once(SLICE).chain(input_locals.iter().copied()).collect();
+        Ok(Traced { lane, chain, plumbing, inputs, tables, opaque })
+    }
+
+    fn translate_map(
+        &self,
+        element: KTy,
+        params: &Params,
+        traced: &Traced,
+        iteration: translate::Iteration<'_, 'tcx>,
+    ) -> Result<translate::Translated> {
         let shape = translate::Loop {
-            option: header.option,
-            start: header.some,
-            is_header: &is_header,
-            lane: &lane,
-            inputs: &inputs,
-            tables: &tables,
+            iteration,
+            lane: &traced.lane,
+            inputs: &traced.inputs,
+            tables: &traced.tables,
             leaves: &params.leaves,
-            opaque: &opaque,
-            chain: &chain,
-            plumbing: &plumbing,
+            opaque: &traced.opaque,
+            chain: &traced.chain,
+            plumbing: &traced.plumbing,
         };
         let name = format!("{}::{}", self.tcx.crate_name(LOCAL_CRATE), self.tcx.def_path_str(self.def_id));
-        let translated = translate::translate(self.tcx, self.body, &name, element, &shape)?;
-        self.check_rest(&calls, &translated.blocks, &chain, &header)?;
+        translate::translate(self.tcx, self.body, &name, element, &shape)
+    }
+
+    fn finish_map(&self, element: KTy, params: Params, traced: Traced, translated: translate::Translated) -> Result<Map> {
         if !translated.stores {
             return Err("does not change the slice".into());
         }
         Ok(Map {
             element,
             function: translated.function,
-            inputs,
-            tables,
+            inputs: traced.inputs,
+            tables: traced.tables,
             scalars: params.leaves,
         })
     }
@@ -454,11 +546,7 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         header: &LoopHeader<'_, 'tcx>,
     ) -> Result<()> {
         for &(block, known) in calls {
-            let iterates = matches!(
-                known,
-                Known::IntoIter | Known::SliceIterMut | Known::SliceIter | Known::Zip | Known::Next
-            );
-            if iterates && !chain.contains(&block) && block != header.next_block {
+            if known.iterates() && !chain.contains(&block) && block != header.next_block {
                 return Err("iterates inside the loop body".into());
             }
             if !translated.contains(&block) && !chain.contains(&block) && block != header.next_block {
@@ -674,8 +762,21 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
             }
         }
         if let Some(trait_id) = tcx.trait_of_assoc(def_id) {
-            if tcx.is_lang_item(trait_id, LangItem::Iterator) && tcx.item_name(def_id).as_str() == "zip" {
-                return Ok(Known::Zip);
+            let method = tcx.item_name(def_id);
+            if tcx.is_lang_item(trait_id, LangItem::Iterator) {
+                match method.as_str() {
+                    "zip" => return Ok(Known::Zip),
+                    "for_each" => return Ok(Known::ForEach),
+                    _ => {}
+                }
+            }
+            if tcx.crate_name(trait_id.krate).as_str() == "rayon" {
+                let trait_name = tcx.item_name(trait_id);
+                if let Some(&(_, _, known)) =
+                    RAYON.iter().find(|(t, m, _)| *t == trait_name.as_str() && *m == method.as_str())
+                {
+                    return Ok(known);
+                }
             }
         }
         // Trait methods are excluded: the call names the trait's item, and
@@ -1092,6 +1193,21 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
 enum Origin {
     Param(Local),
     Call(BasicBlock),
+}
+
+/// A map's iterator, traced back to the slices.
+struct Traced {
+    lane: Lane,
+    /// The calls that build the iterator.
+    chain: HashSet<BasicBlock>,
+    /// The locals the iterator passes through.
+    plumbing: HashSet<Local>,
+    /// The input slices the iterator zips with, in order.
+    inputs: Vec<(Local, KTy)>,
+    /// The other slices, which the code may index.
+    tables: Vec<(Local, KTy)>,
+    /// The slices only the iterator may use.
+    opaque: Vec<Local>,
 }
 
 /// A `for` loop's `next` call and where it leads.

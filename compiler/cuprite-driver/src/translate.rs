@@ -24,9 +24,18 @@
 //! it is called with. Library methods in [`method`] and intrinsics in
 //! [`intrinsic`] become kernel operations directly.
 //!
-//! Supported values: integers, floats and `bool`, and structs and tuples of
-//! them, with references to any of those. Enums, arrays, slices, raw
-//! pointer arithmetic, closures and statics are refused with a reason.
+//! Closures are values too: a closure is its captures, a struct whose
+//! by-reference captures are references, so they alias what they captured.
+//! A reference inside a value is bound like a reference local. Calls
+//! through the `Fn` traits use the "rust-call" convention, which passes the
+//! arguments as one tuple; it is spread into the closure body's parameters.
+//! The bodies rustc builds for calling an `Fn` closure through `FnOnce`, or
+//! a function item through the `Fn` traits, are inlined the same way.
+//!
+//! Supported values: integers, floats and `bool`, structs and tuples of
+//! them, closures, with references to any of those. Enums, arrays, slices,
+//! raw pointer arithmetic, coroutines and statics are refused with a
+//! reason.
 //!
 //! Panics must be provable away: [`assert_holds`] accepts an assertion only
 //! when its condition folds to a constant that passes, as for a division by
@@ -44,8 +53,9 @@ use rustc_middle::{
         AggregateKind, BasicBlock, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, Operand, Place,
         ProjectionElem, Rvalue, StatementKind, TerminatorKind, UnOp, RETURN_PLACE, START_BLOCK,
     },
-    ty::{self, FloatTy, Instance, InstanceKind, IntTy, Ty, TyCtxt, TypingEnv, UintTy},
+    ty::{self, FloatTy, Instance, InstanceKind, IntTy, ShimKind, Ty, TyCtxt, TypingEnv, UintTy},
 };
+use rustc_abi::ExternAbi;
 use rustc_span::def_id::DefId;
 
 type Result<T> = std::result::Result<T, String>;
@@ -83,11 +93,15 @@ pub(crate) fn constant<'tcx>(tcx: TyCtxt<'tcx>, constant: &ConstOperand<'tcx>) -
     Some(Const { ty, bits })
 }
 
-/// The field types of a struct or tuple, with the generic arguments
-/// filled in. Errors for anything else that isn't a number.
+/// The field types of a struct, tuple or closure (its captures), with the
+/// generic arguments filled in. A function item has none. Errors for
+/// anything else that isn't a number.
 pub(crate) fn fields_of<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<Vec<Ty<'tcx>>> {
     match ty.kind() {
         ty::Tuple(fields) => Ok(fields.to_vec()),
+        // Captured by reference, a capture's type is the reference.
+        ty::Closure(_, args) => Ok(args.as_closure().upvar_tys().to_vec()),
+        ty::FnDef(..) => Ok(Vec::new()),
         ty::Adt(adt, args) if adt.is_struct() && !adt.repr().simd() => Ok(adt
             .non_enum_variant()
             .fields
@@ -414,12 +428,7 @@ impl<'tcx> Folder<'_, 'tcx> {
 /// What the function around a loop reads and writes, around the
 /// translation.
 pub(crate) struct Loop<'a, 'tcx> {
-    /// `next`'s result: `(option as Some).0` is what the iterator yields.
-    pub(crate) option: Place<'tcx>,
-    /// The first block of the body.
-    pub(crate) start: BasicBlock,
-    /// True for the loop header's blocks, where an iteration ends.
-    pub(crate) is_header: &'a dyn Fn(BasicBlock) -> bool,
+    pub(crate) iteration: Iteration<'a, 'tcx>,
     /// What the iterator yields.
     pub(crate) lane: &'a Lane,
     /// The input slices `lane` reads, in order, and their element types.
@@ -434,6 +443,39 @@ pub(crate) struct Loop<'a, 'tcx> {
     pub(crate) chain: &'a HashSet<BasicBlock>,
     /// The locals the iterator passes through, which the kernel skips.
     pub(crate) plumbing: &'a HashSet<Local>,
+}
+
+/// How the function runs one iteration.
+pub(crate) enum Iteration<'a, 'tcx> {
+    /// A `for` loop.
+    For {
+        /// `next`'s result: `(option as Some).0` is what the iterator yields.
+        option: Place<'tcx>,
+        /// The first block of the body.
+        start: BasicBlock,
+        /// True for the loop header's blocks, where an iteration ends.
+        is_header: &'a dyn Fn(BasicBlock) -> bool,
+    },
+    /// `for_each(iterator, function)`, ending `block`: an iteration calls
+    /// `function` with what the iterator yields.
+    ForEach { block: BasicBlock, function: &'a Operand<'tcx> },
+}
+
+impl<'tcx> Loop<'_, 'tcx> {
+    fn is_header(&self, block: BasicBlock) -> bool {
+        match &self.iteration {
+            Iteration::For { is_header, .. } => is_header(block),
+            Iteration::ForEach { .. } => false,
+        }
+    }
+
+    /// The block whose call is the iteration, for `for_each`.
+    fn each_block(&self) -> Option<BasicBlock> {
+        match &self.iteration {
+            Iteration::For { .. } => None,
+            Iteration::ForEach { block, .. } => Some(*block),
+        }
+    }
 }
 
 /// A translated function around its loop.
@@ -455,9 +497,22 @@ pub(crate) fn translate<'tcx>(
     element: KTy,
     shape: &Loop<'_, 'tcx>,
 ) -> Result<Translated> {
-    let loop_blocks = loop_region(body, shape)?;
-    let setup = setup_region(body, shape, &loop_blocks)?;
-    check_carried(body, &setup, &loop_blocks, shape)?;
+    let (loop_blocks, setup) = match &shape.iteration {
+        Iteration::For { start, .. } => {
+            let loop_blocks = loop_region(body, shape, *start)?;
+            let setup = setup_region(body, shape, &loop_blocks)?;
+            check_carried(body, &setup, &loop_blocks, shape)?;
+            (loop_blocks, setup)
+        }
+        // The setup ends with the `for_each` call, which is the iteration.
+        // The closure can't carry values between elements: `each` accepts
+        // only `Fn` closures, which can't change what they capture.
+        Iteration::ForEach { block, .. } => {
+            let mut setup = setup_region(body, shape, &HashSet::new())?;
+            setup.insert(*block);
+            (HashSet::new(), setup)
+        }
+    };
 
     let mut params = vec![element];
     params.extend(shape.inputs.iter().map(|&(_, ty)| ty));
@@ -473,6 +528,7 @@ pub(crate) fn translate<'tcx>(
         element: value,
         stores: false,
         stack: Vec::new(),
+        written: HashSet::new(),
     };
 
     let mut slots = HashMap::new();
@@ -526,7 +582,10 @@ pub(crate) fn translate<'tcx>(
         let slot = if is_ref(ty) { Slot::Ref(Box::new(tree)) } else { tree };
         slots.insert(param, slot);
     }
-    slots.insert(shape.option.local, Slot::Some(Box::new(lane_slot(shape.lane, value, &inputs))));
+    let item = lane_slot(shape.lane, value, &inputs);
+    if let Iteration::For { option, .. } = &shape.iteration {
+        slots.insert(option.local, Slot::Some(Box::new(item.clone())));
+    }
 
     let mut blocks: HashSet<BasicBlock> = setup.union(&loop_blocks).copied().collect();
     let mut frame = Frame {
@@ -538,6 +597,7 @@ pub(crate) fn translate<'tcx>(
             shape,
             body: loop_blocks.clone(),
             assigned_outside: assigned_outside(body, &blocks),
+            item,
         }),
     };
     frame.exit = translator.b.block();
@@ -568,11 +628,11 @@ fn lane_slot(lane: &Lane, element: KLocal, inputs: &HashMap<Local, KLocal>) -> S
 /// The loop body's blocks: everything reachable from its start without
 /// passing the header. Leaving the loop any other way (`break`, `return`)
 /// makes later elements depend on earlier ones, so it is refused.
-fn loop_region(body: &Body<'_>, shape: &Loop<'_, '_>) -> Result<HashSet<BasicBlock>> {
+fn loop_region(body: &Body<'_>, shape: &Loop<'_, '_>, start: BasicBlock) -> Result<HashSet<BasicBlock>> {
     let mut region = HashSet::new();
-    let mut pending = vec![shape.start];
+    let mut pending = vec![start];
     while let Some(block) = pending.pop() {
-        if (shape.is_header)(block) || !region.insert(block) {
+        if shape.is_header(block) || !region.insert(block) {
             continue;
         }
         let data = &body.basic_blocks[block];
@@ -588,12 +648,12 @@ fn loop_region(body: &Body<'_>, shape: &Loop<'_, '_>) -> Result<HashSet<BasicBlo
 }
 
 /// The blocks before the loop: everything reachable from the start without
-/// passing the header.
+/// passing the header, or reaching the `for_each` call.
 fn setup_region(body: &Body<'_>, shape: &Loop<'_, '_>, loop_blocks: &HashSet<BasicBlock>) -> Result<HashSet<BasicBlock>> {
     let mut region = HashSet::new();
     let mut pending = vec![START_BLOCK];
     while let Some(block) = pending.pop() {
-        if (shape.is_header)(block) || !region.insert(block) {
+        if shape.is_header(block) || shape.each_block() == Some(block) || !region.insert(block) {
             continue;
         }
         if loop_blocks.contains(&block) {
@@ -632,7 +692,7 @@ fn check_carried(
         assigned
     };
     let inside = assigned_in(&|block| loop_blocks.contains(&block));
-    let outside = assigned_in(&|block| !loop_blocks.contains(&block) && (setup.contains(&block) || (shape.is_header)(block)));
+    let outside = assigned_in(&|block| !loop_blocks.contains(&block) && (setup.contains(&block) || shape.is_header(block)));
     let carried = inside.intersection(&outside).any(|&local| {
         let ty = body.local_decls[local].ty;
         local != RETURN_PLACE && !ty.is_unit() && !shape.plumbing.contains(&local)
@@ -736,6 +796,8 @@ struct LoopRules<'a, 'tcx> {
     body: HashSet<BasicBlock>,
     /// Locals assigned in blocks the kernel doesn't run.
     assigned_outside: HashSet<Local>,
+    /// What the iterator yields this iteration.
+    item: Slot,
 }
 
 /// One body being translated: the loop body, or a function it calls.
@@ -756,6 +818,8 @@ struct Translator<'tcx> {
     stores: bool,
     /// The functions being inlined, innermost last.
     stack: Vec<DefId>,
+    /// Every local written, for `each`.
+    written: HashSet<KLocal>,
 }
 
 /// How deep inlining may go.
@@ -798,11 +862,13 @@ impl<'tcx> Translator<'tcx> {
     /// iteration when reached from the body.
     fn target(&self, frame: &Frame<'_, 'tcx>, from: BasicBlock, block: BasicBlock) -> Result<BlockId> {
         if let Some(rules) = &frame.loop_rules {
-            if (rules.shape.is_header)(block) {
-                if rules.body.contains(&from) {
-                    return Ok(frame.exit);
+            if let Iteration::For { start, is_header, .. } = &rules.shape.iteration {
+                if is_header(block) {
+                    if rules.body.contains(&from) {
+                        return Ok(frame.exit);
+                    }
+                    return frame.blocks.get(start).copied().ok_or_else(|| "has an unsupported loop shape".into());
                 }
-                return frame.blocks.get(&rules.shape.start).copied().ok_or_else(|| "has an unsupported loop shape".into());
             }
         }
         frame.blocks.get(&block).copied().ok_or_else(|| "has an unsupported loop shape".into())
@@ -812,6 +878,7 @@ impl<'tcx> Translator<'tcx> {
         if local == self.element {
             self.stores = true;
         }
+        self.written.insert(local);
         self.b.set(local, rvalue);
     }
 
@@ -833,6 +900,13 @@ impl<'tcx> Translator<'tcx> {
                 _ => {}
             }
         }
+        // In `for_each`'s block: its function, and what the iterator yields.
+        let each = frame.loop_rules.as_ref().and_then(|rules| match &rules.shape.iteration {
+            Iteration::ForEach { block: each_block, function } if *each_block == block => {
+                Some((*function, rules.item.clone()))
+            }
+            _ => None,
+        });
         match &data.terminator().kind {
             TerminatorKind::Goto { target, .. }
             | TerminatorKind::FalseEdge { real_target: target, .. }
@@ -882,6 +956,13 @@ impl<'tcx> Translator<'tcx> {
             TerminatorKind::Return => self.b.goto(frame.exit),
             // Never reached in a correct program; if it were, the CPU decides.
             TerminatorKind::Unreachable => self.b.fail(),
+            // `for_each`'s call is the iteration: call its function with
+            // what the iterator yields, and end.
+            TerminatorKind::Call { .. } if each.is_some() => {
+                let (function, item) = each.expect("checked by the guard");
+                self.each(frame, function, item)?;
+                self.b.goto(frame.exit);
+            }
             TerminatorKind::Call { func, args, destination, target: Some(target), .. } => {
                 // Calls that build the loop's iterator are skipped.
                 if !frame.loop_rules.as_ref().is_some_and(|rules| rules.shape.chain.contains(&block)) {
@@ -914,7 +995,16 @@ impl<'tcx> Translator<'tcx> {
         destination: &Place<'tcx>,
     ) -> Result<()> {
         let tcx = self.tcx;
-        let (def_id, generic_args) = func.const_fn_def().ok_or("calls a function pointer or closure value")?;
+        // The callee is in the operand's type: a constant, or a function
+        // item held in a local.
+        let func_ty = func.ty(frame.body, tcx);
+        let ty::FnDef(def_id, generic_args) = *func_ty.kind() else {
+            return Err("calls a function pointer".into());
+        };
+        let generic_args = generic_args.no_bound_vars().ok_or("calls a function with bound generic arguments")?;
+        // A "rust-call" call passes its arguments as one tuple, as calls to
+        // closures through the `Fn` traits do.
+        let rust_call = func_ty.fn_sig(tcx).abi() == ExternAbi::RustCall;
         let path = || tcx.def_path_str_with_args(def_id, generic_args);
         if let Some(method) = method(tcx, def_id) {
             return self.operation(frame, IntrinsicOp::Method(method), args, destination);
@@ -930,9 +1020,14 @@ impl<'tcx> Translator<'tcx> {
                 self.operation(frame, op, args, destination)
             }
             InstanceKind::Item(item) if tcx.is_mir_available(item) => {
-                self.inline(frame, instance, args, destination, &path())
+                self.inline(frame, instance, args, rust_call, destination, &path())
             }
             InstanceKind::Item(_) => Err(format!("calls `{}`, whose MIR isn't available", path())),
+            // Calling an `Fn` closure through `FnOnce`, or a function item
+            // through the `Fn` traits: rustc builds these bodies itself.
+            InstanceKind::Shim(ShimKind::ClosureOnce { .. } | ShimKind::FnPtr(..)) => {
+                self.inline(frame, instance, args, rust_call, destination, &path())
+            }
             _ => Err(format!("calls `{}`, which has no GPU summary", path())),
         }
     }
@@ -963,15 +1058,80 @@ impl<'tcx> Translator<'tcx> {
         Ok(())
     }
 
-    /// Translates a call to `instance` in place.
+    /// One iteration of `for_each`: calls `function` with `item` through
+    /// `FnMut::call_mut`, as `for_each` does. Each thread has its own copy
+    /// of the closure, so one that changes what it captured (a counter, a
+    /// running total) would carry a value from one element to the next: it
+    /// is refused when the call writes any local the captures reach. The
+    /// closure's kind can't decide this: passed to `for_each`, a closure
+    /// takes the kind of its `FnMut` bound, whatever its body does.
+    fn each(&mut self, frame: &mut Frame<'_, 'tcx>, function: &Operand<'tcx>, item: Slot) -> Result<()> {
+        let tcx = self.tcx;
+        let function_ty = function.ty(frame.body, tcx);
+        // The arguments, as the tuple `FnMut::call_mut` takes.
+        let arguments = match function_ty.kind() {
+            // A closure's signature takes its arguments as one tuple.
+            ty::Closure(_, args) => tcx.instantiate_bound_regions_with_erased(args.as_closure().sig()).inputs()[0],
+            ty::FnDef(..) => Ty::new_tup(tcx, tcx.instantiate_bound_regions_with_erased(function_ty.fn_sig(tcx)).inputs()),
+            _ => return Err("passes `for_each` something other than a closure or function".into()),
+        };
+        let fn_mut_trait = tcx.lang_items().fn_mut_trait().ok_or("has no `FnMut` trait")?;
+        let call = tcx
+            .associated_item_def_ids(fn_mut_trait)
+            .iter()
+            .copied()
+            .find(|&item| tcx.item_name(item).as_str() == "call_mut")
+            .ok_or("has no `FnMut::call_mut`")?;
+        let generic_args = tcx.mk_args(&[function_ty.into(), arguments.into()]);
+        let path = tcx.def_path_str_with_args(call, generic_args);
+        let instance = Instance::try_resolve(tcx, self.typing_env(), call, generic_args)
+            .ok()
+            .flatten()
+            .ok_or_else(|| format!("calls `{path}`, which can't be resolved to one function"))?;
+        if !matches!(
+            instance.def,
+            InstanceKind::Item(_) | InstanceKind::Shim(ShimKind::ClosureOnce { .. } | ShimKind::FnPtr(..))
+        ) || matches!(instance.def, InstanceKind::Item(item) if !tcx.is_mir_available(item))
+        {
+            return Err(format!("calls `{path}`, whose MIR isn't available"));
+        }
+        let receiver = self.operand_slot(frame, function)?;
+        let mut captured = Vec::new();
+        receiver.scalars(&mut captured);
+        let outer = std::mem::take(&mut self.written);
+        let values = vec![Slot::Ref(Box::new(receiver)), Slot::Fields(vec![item])];
+        let called = self.inline_values(instance, values, true, &path);
+        let written = std::mem::replace(&mut self.written, outer);
+        self.written.extend(&written);
+        called?;
+        if captured.iter().any(|local| written.contains(local)) {
+            return Err(
+                "passes `for_each` a closure that changes what it captures, which carries a value from one element to the next"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Translates a call to `instance` in place. With `rust_call`, the last
+    /// argument is a tuple of the callee's remaining arguments.
     fn inline(
         &mut self,
         frame: &mut Frame<'_, 'tcx>,
         instance: Instance<'tcx>,
         args: &[rustc_span::Spanned<Operand<'tcx>>],
+        rust_call: bool,
         destination: &Place<'tcx>,
         path: &str,
     ) -> Result<()> {
+        // Arguments are read in the caller's frame, before the call.
+        let values = args.iter().map(|arg| self.operand_slot(frame, &arg.node)).collect::<Result<Vec<_>>>()?;
+        let result = self.inline_values(instance, values, rust_call, path)?;
+        self.store(frame, destination, result)
+    }
+
+    /// `inline`, with the arguments' slots; returns the result's slot.
+    fn inline_values(&mut self, instance: Instance<'tcx>, mut values: Vec<Slot>, rust_call: bool, path: &str) -> Result<Slot> {
         let tcx = self.tcx;
         let def_id = instance.def_id();
         if self.stack.contains(&def_id) {
@@ -986,21 +1146,28 @@ impl<'tcx> Translator<'tcx> {
             ty::EarlyBinder::bind(tcx, tcx.instance_mir(instance.def).clone()),
         );
         let within = |reason: String| format!("calls `{path}`, which {reason}");
-        if body.spread_arg.is_some() {
-            return Err(within("takes its arguments as a tuple".into()));
-        }
         let region = function_region(&body);
-        // Arguments are read in the caller's frame, before the call.
+        // A closure's body takes the tuple's fields as separate parameters;
+        // a body with `spread_arg` (a shim) takes the tuple itself, as MIR
+        // passes it. rustc's inliner does the same.
+        if rust_call && body.spread_arg.is_none() {
+            match values.pop() {
+                Some(Slot::Fields(fields)) => values.extend(fields),
+                Some(Slot::Unit) => {}
+                _ => return Err(within("takes arguments the kernel can't spread".into())),
+            }
+        }
+        if values.len() != body.arg_count {
+            return Err(within("is called with a different number of arguments".into()));
+        }
         let mut slots = HashMap::new();
-        for (index, arg) in args.iter().enumerate() {
+        for (index, value) in values.into_iter().enumerate() {
             let param = Local::from_usize(index + 1);
-            let value = self.operand_slot(frame, &arg.node)?;
             let slot = if is_ref(body.local_decls[param].ty) {
                 value
             } else {
-                let slot = self.fresh(body.local_decls[param].ty).map_err(within)?;
-                self.copy(&slot, &value)?;
-                slot
+                let fresh = self.fresh(body.local_decls[param].ty).map_err(within)?;
+                self.copy(&fresh, &value)?
             };
             slots.insert(param, slot);
         }
@@ -1015,8 +1182,7 @@ impl<'tcx> Translator<'tcx> {
         self.run_frame(&mut callee, &ordered(&body, &region), START_BLOCK).map_err(within)?;
         self.stack.pop();
         self.b.switch_to(callee.exit);
-        let result = self.local_slot(&mut callee, RETURN_PLACE).map_err(within)?;
-        self.store(frame, destination, result)
+        self.local_slot(&mut callee, RETURN_PLACE).map_err(within)
     }
 
     /// The slot for a fresh value of type `ty`.
@@ -1122,12 +1288,29 @@ impl<'tcx> Translator<'tcx> {
             return self.bind(frame, place.local, value);
         }
         let dest = self.place(frame, place)?;
-        self.copy(&dest, &value)
+        let written = self.copy(&dest, &value)?;
+        if written == dest {
+            return Ok(());
+        }
+        // The value binds references inside the local, such as a closure's
+        // captures. The local's slot records them; a field can't be updated
+        // inside a larger slot.
+        if !place.projection.is_empty() {
+            return Err("stores a reference inside part of a value".into());
+        }
+        if let Some(rules) = &frame.loop_rules {
+            if rules.assigned_outside.contains(&place.local) {
+                return Err("uses a value computed outside the loop body".into());
+            }
+        }
+        frame.slots.insert(place.local, written);
+        Ok(())
     }
 
     /// Copies `src` into `dest`, field by field. If they share kernel
-    /// locals (`a = (a.1, a.0)`), through temporaries.
-    fn copy(&mut self, dest: &Slot, src: &Slot) -> Result<()> {
+    /// locals (`a = (a.1, a.0)`), through temporaries. Returns the slot
+    /// `dest` names afterwards, with the references inside it bound.
+    fn copy(&mut self, dest: &Slot, src: &Slot) -> Result<Slot> {
         let (mut written, mut read) = (Vec::new(), Vec::new());
         dest.scalars(&mut written);
         src.scalars(&mut read);
@@ -1138,22 +1321,27 @@ impl<'tcx> Translator<'tcx> {
         self.copy_fields(dest, src)
     }
 
-    fn copy_fields(&mut self, dest: &Slot, src: &Slot) -> Result<()> {
+    /// Numbers are copied. A reference inside the value is bound, as
+    /// reference locals are (`bind`): one not bound yet takes the source's
+    /// target, and one already bound must have the same target.
+    fn copy_fields(&mut self, dest: &Slot, src: &Slot) -> Result<Slot> {
         match (dest, src) {
             (Slot::Scalar(d), Slot::Scalar(s)) => {
                 if d != s {
                     self.set(*d, KRvalue::Use((*s).into()));
                 }
-                Ok(())
             }
             (Slot::Fields(d), Slot::Fields(s)) if d.len() == s.len() => {
-                d.iter().zip(s).try_for_each(|(d, s)| self.copy_fields(d, s))
+                let fields = d.iter().zip(s).map(|(d, s)| self.copy_fields(d, s)).collect::<Result<_>>()?;
+                return Ok(Slot::Fields(fields));
             }
-            (Slot::Unit, Slot::Unit) => Ok(()),
-            (Slot::Ref(d), Slot::Ref(s)) if d == s => Ok(()),
-            (Slot::Ref(_) | Slot::Unbound, Slot::Ref(_)) => Err("stores a reference inside a value".into()),
-            _ => Err("copies between values of different shapes".into()),
+            (Slot::Unit, Slot::Unit) | (Slot::Unbound, Slot::Unbound) => {}
+            (Slot::Unbound, Slot::Ref(_)) => return Ok(src.clone()),
+            (Slot::Ref(d), Slot::Ref(s)) if d == s => {}
+            (Slot::Ref(_), Slot::Ref(_)) => return Err("chooses between references at run time".into()),
+            _ => return Err("copies between values of different shapes".into()),
         }
+        Ok(dest.clone())
     }
 
     /// A copy of `src`'s numbers in new locals.
@@ -1204,7 +1392,10 @@ impl<'tcx> Translator<'tcx> {
                     AggregateKind::Adt(adt, _, _, _, None) if self.tcx.adt_def(adt).is_struct() => {}
                     AggregateKind::Adt(..) => return Err("builds an enum or union".into()),
                     AggregateKind::Array(_) => return Err("builds an array".into()),
-                    _ => return Err("builds a closure or coroutine".into()),
+                    // A closure is its captures: values, or references to
+                    // what it captured by reference.
+                    AggregateKind::Closure(..) => {}
+                    _ => return Err("builds a coroutine".into()),
                 }
                 let values: Vec<Slot> =
                     operands.iter().map(|operand| self.operand_slot(frame, operand)).collect::<Result<_>>()?;
@@ -1472,12 +1663,15 @@ fn doomed(frame: &Frame<'_, '_>, region: &[BasicBlock]) -> HashSet<BasicBlock> {
                 continue;
             }
             let kind = &body.basic_blocks[block].terminator().kind;
+            // The `for_each` call is an iteration, which ends there.
+            let each = frame.loop_rules.as_ref().is_some_and(|rules| rules.shape.each_block() == Some(block));
             let finishes = matches!(kind, TerminatorKind::Return)
-                || successors(kind).into_iter().any(|next| match &frame.loop_rules {
-                    Some(rules) if (rules.shape.is_header)(next) => {
+                || each
+                || successors(kind).into_iter().any(|next| match frame.loop_rules.as_ref().map(|r| (r, &r.shape.iteration)) {
+                    Some((rules, Iteration::For { start, is_header, .. })) if is_header(next) => {
                         // From the body the iteration ends; from the setup
                         // the body starts.
-                        rules.body.contains(&block) || finishing.contains(&rules.shape.start)
+                        rules.body.contains(&block) || finishing.contains(start)
                     }
                     _ => finishing.contains(&next),
                 });

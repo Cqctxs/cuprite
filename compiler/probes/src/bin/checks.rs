@@ -226,6 +226,18 @@ fn main() {
         }));
     }
 
+    // A closure's checks: a remainder by the captured table's length, which
+    // is zero for an empty table, then a bounds check.
+    let entries: Vec<u32> = (0..37u32).map(|i| i.wrapping_mul(2_654_435_761)).collect();
+    for (name, table) in [("closure_table", &entries[..]), ("closure_table, empty table", &[][..])] {
+        count(check(name, &spread, |v| probes::closure_table(v, table), |v| {
+            let wrap = |i: u32| table[i as usize % table.len()];
+            for value in v {
+                *value = wrap(*value).wrapping_add(wrap(*value >> 8));
+            }
+        }));
+    }
+
     // `palette`'s `mix`, which clamps its factor.
     count(check("palette_mix", &floats, |v| probes::palette_mix(v, 0.9, 0.1, 0.5), |v| {
         use palette::Mix;

@@ -754,6 +754,146 @@ pub fn ni_sqrt(values: &mut [u64]) {
     }
 }
 
+// Closures (code generation): closure values built before the loop or in
+// its body, capturing by reference, by value and mutably, called directly
+// or passed to generic functions, through `Fn`, `FnMut` and `FnOnce`.
+
+/// A closure built before the loop, capturing two parameters by reference.
+pub fn closure_affine(values: &mut [f32], scale: f32, offset: f32) {
+    let affine = |x: f32| x * scale + offset;
+    for value in values {
+        *value = affine(*value);
+    }
+}
+
+/// A closure built in the loop body, capturing the element's reference.
+pub fn closure_in_body(values: &mut [u32], step: u32) {
+    for value in values {
+        let plus_value = |x: u32| x.wrapping_add(*value);
+        *value = plus_value(step) ^ plus_value(1);
+    }
+}
+
+/// A closure of two arguments, whose order matters.
+pub fn closure_pair(values: &mut [u32], other: u32) {
+    let mix = |a: u32, b: u32| a.wrapping_mul(3) ^ b.rotate_left(5);
+    for value in values {
+        *value = mix(*value, other);
+    }
+}
+
+/// An `FnMut` closure that changes a value it captured.
+pub fn closure_counter(values: &mut [u32]) {
+    for value in values {
+        let mut total = 0u32;
+        let mut add = |by: u32| total = total.wrapping_add(by).rotate_left(3);
+        add(*value);
+        add(7);
+        *value = total;
+    }
+}
+
+/// A closure that moves its captures in (`move`), a copy of the parameter.
+pub fn closure_move(values: &mut [i32], bias: i32) {
+    let shifted = move |x: i32| x.wrapping_sub(bias) >> 1;
+    for value in values {
+        *value = shifted(*value);
+    }
+}
+
+fn apply_twice<F: Fn(f32) -> f32>(f: F, x: f32) -> f32 {
+    f(f(x))
+}
+
+fn apply_once<F: FnOnce(u32) -> u32>(f: F, x: u32) -> u32 {
+    f(x)
+}
+
+fn halve(x: f32) -> f32 {
+    x * 0.5
+}
+
+/// Closures passed to generic functions: one through `Fn`, called twice,
+/// and one through `FnOnce`, which rustc calls through a shim.
+pub fn closure_generic(values: &mut [f32], add: f32) {
+    for value in values {
+        *value = apply_twice(|x| x + add, *value);
+    }
+}
+
+pub fn closure_once(values: &mut [u32], mask: u32) {
+    for value in values {
+        *value = apply_once(|x| x & mask, *value).wrapping_mul(3);
+    }
+}
+
+/// A function item passed where a closure is expected, called through
+/// `Fn`: another rustc shim.
+pub fn function_item(values: &mut [f32]) {
+    for value in values {
+        *value = apply_twice(halve, *value);
+    }
+}
+
+/// A closure capturing a table, indexing it with a bounds check.
+pub fn closure_table(values: &mut [u32], table: &[u32]) {
+    let wrap = |i: u32| table[i as usize % table.len()];
+    for value in values {
+        *value = wrap(*value).wrapping_add(wrap(*value >> 8));
+    }
+}
+
+// Iterator chains (code generation): `for_each`, where the loop is inside
+// the library and the closure is the body, sequential and Rayon's.
+
+/// `for_each` on the slice's `iter_mut()`.
+pub fn each_affine(values: &mut [u32]) {
+    values.iter_mut().for_each(|value| *value = value.wrapping_mul(5).wrapping_add(3));
+}
+
+/// `for_each` on a zip, the closure destructuring the pair.
+pub fn each_saxpy(values: &mut [f32], x: &[f32], a: f32) {
+    values.iter_mut().zip(x).for_each(|(y, x)| *y += a * x);
+}
+
+fn clamp_unit(value: &mut f32) {
+    *value = value.clamp(0.0, 1.0);
+}
+
+/// `for_each` with a function instead of a closure.
+pub fn each_function(values: &mut [f32]) {
+    values.iter_mut().for_each(clamp_unit);
+}
+
+/// A value computed before `for_each`, moved into the closure.
+pub fn each_setup(values: &mut [f64], scale: f64) {
+    let factor = scale * 2.0 - 1.0;
+    values.iter_mut().for_each(move |value| *value = *value * factor + 0.5);
+}
+
+/// Rayon's `zip` of two parallel slices.
+pub fn par_saxpy(values: &mut [f32], x: &[f32], a: f32) {
+    values.par_iter_mut().zip(x.par_iter()).for_each(|(y, x)| *y += a * x);
+}
+
+/// Refused: the closure counts across elements, so each element depends on
+/// the ones before it.
+pub fn each_counter(values: &mut [u32]) {
+    let mut index = 0u32;
+    values.iter_mut().for_each(|value| {
+        *value = value.wrapping_add(index);
+        index += 1;
+    });
+}
+
+/// Refused: work after the `for_each`, which the GPU path would skip.
+pub fn each_then_more(values: &mut [u32]) {
+    values.iter_mut().for_each(|value| *value = value.wrapping_add(1));
+    if let Some(first) = values.first_mut() {
+        *first = 0;
+    }
+}
+
 /// Number of calls `counted` has made, for tests.
 pub fn counted_calls() -> u32 {
     CALLS.load(Ordering::Relaxed)

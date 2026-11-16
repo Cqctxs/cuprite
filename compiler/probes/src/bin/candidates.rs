@@ -141,7 +141,7 @@ macro_rules! integer_elements {
         })*
     };
 }
-integer_elements!(u8, i16, u32, i64);
+integer_elements!(u8, i16, i32, u32, i64, u64);
 
 impl Element for f32 {
     fn random(state: &mut u64) -> Self {
@@ -378,6 +378,66 @@ fn general_cases(state: &mut u64) -> usize {
             },
         );
     }
+    // Closures.
+    checked += general("closure_affine", state, |v: &mut [f32]| probes::closure_affine(v, 1.5, -0.25), |x| {
+        x * 1.5 + -0.25
+    });
+    checked += general("closure_in_body", state, |v: &mut [u32]| probes::closure_in_body(v, 5), |x| {
+        5u32.wrapping_add(x) ^ 1u32.wrapping_add(x)
+    });
+    checked += general("closure_pair", state, |v: &mut [u32]| probes::closure_pair(v, 0x1234_5678), |x| {
+        x.wrapping_mul(3) ^ 0x1234_5678u32.rotate_left(5)
+    });
+    checked += general("closure_counter", state, probes::closure_counter, |x: u32| {
+        let total = x.rotate_left(3);
+        total.wrapping_add(7).rotate_left(3)
+    });
+    checked += general("closure_move", state, |v: &mut [i32]| probes::closure_move(v, 9), |x| x.wrapping_sub(9) >> 1);
+    checked += general("closure_generic", state, |v: &mut [f32]| probes::closure_generic(v, 0.75), |x| {
+        (x + 0.75) + 0.75
+    });
+    checked += general("closure_once", state, |v: &mut [u32]| probes::closure_once(v, 0xF0F0_1234), |x| {
+        (x & 0xF0F0_1234).wrapping_mul(3)
+    });
+    checked += general("function_item", state, probes::function_item, |x: f32| (x * 0.5) * 0.5);
+    let table: Vec<u32> = (0..37).map(|_| next(state)).collect();
+    checked += general("closure_table", state, |v: &mut [u32]| probes::closure_table(v, &table), |x| {
+        table[x as usize % 37].wrapping_add(table[(x >> 8) as usize % 37])
+    });
+    // Iterator chains: `for_each`, sequential and Rayon's.
+    checked += general("each_affine", state, probes::each_affine, |x: u32| x.wrapping_mul(5).wrapping_add(3));
+    checked += general_indexed(
+        "each_saxpy",
+        state,
+        |v: &mut [f32]| probes::each_saxpy(v, &xs[..v.len()], 0.75),
+        |i, _, y| y + 0.75 * xs[i],
+    );
+    checked += general("each_function", state, probes::each_function, |x: f32| x.clamp(0.0, 1.0));
+    checked += general("each_setup", state, |v: &mut [f64]| probes::each_setup(v, 0.3), |x| {
+        x * (0.3 * 2.0 - 1.0) + 0.5
+    });
+    checked += general("transform_rayon", state, probes::transform_rayon, |x: u32| {
+        x.wrapping_mul(3).wrapping_add(7)
+    });
+    // Rayon's `zip` also stops at the shorter side.
+    checked += general_indexed(
+        "par_saxpy",
+        state,
+        |v: &mut [f32]| {
+            let len = v.len();
+            probes::par_saxpy(v, &xs[..short(len)], -1.5)
+        },
+        |i, len, y| if i < short(len) { y + -1.5 * xs[i] } else { y },
+    );
+    // Refused, so they run on the CPU; here so that accepting one by
+    // mistake shows up as a wrong result.
+    checked += general_indexed("each_counter", state, probes::each_counter, |i, _, x: u32| x.wrapping_add(i as u32));
+    checked += general_indexed("each_then_more", state, probes::each_then_more, |i, _, x: u32| {
+        if i == 0 { 0 } else { x.wrapping_add(1) }
+    });
+    // Held out before, now development code: `num-integer`'s square root,
+    // a closure passed to a generic fixed-point loop.
+    checked += general("ni_sqrt", state, probes::ni_sqrt, |x: u64| x.isqrt());
     checked
 }
 
