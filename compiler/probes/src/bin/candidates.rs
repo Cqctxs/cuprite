@@ -181,9 +181,20 @@ fn general<T: Element>(
     function: impl Fn(&mut [T]),
     reference: impl Fn(T) -> T,
 ) -> usize {
+    general_indexed(name, state, function, |_, _, x| reference(x))
+}
+
+/// `general`, with a reference that also sees each element's index and the
+/// slice's length.
+fn general_indexed<T: Element>(
+    name: &str,
+    state: &mut u64,
+    function: impl Fn(&mut [T]),
+    reference: impl Fn(usize, usize, T) -> T,
+) -> usize {
     for len in LENGTHS {
         let input: Vec<T> = (0..len).map(|_| T::random(state)).collect();
-        let expected: Vec<T> = input.iter().map(|&x| reference(x)).collect();
+        let expected: Vec<T> = input.iter().enumerate().map(|(i, &x)| reference(i, len, x)).collect();
         let mut values = input.clone();
         function(&mut values);
         if let Some(index) = values.iter().zip(&expected).position(|(a, b)| !a.same(*b)) {
@@ -255,6 +266,81 @@ fn general_cases(state: &mut u64) -> usize {
     checked += general("cross_dot", state, probes::cross_dot, |x: f32| {
         let a = glam::Vec3::new(x, 2.0, -1.0);
         a.cross(glam::Vec3::Y).dot(a + glam::Vec3::Y)
+    });
+    // Reading data: values computed before the loop, plain-data parameters
+    // and zipped input slices. `b` is 3 shorter than the output, so the
+    // last elements stay as they are, as `zip` leaves them.
+    let largest = LENGTHS[LENGTHS.len() - 1];
+    let a: Vec<u32> = (0..largest).map(|_| u32::random(state)).collect();
+    let b: Vec<u32> = (0..largest).map(|_| u32::random(state)).collect();
+    let xs: Vec<f32> = (0..largest).map(|_| f32::random(state)).collect();
+    let weights: Vec<u8> = (0..largest).map(|_| u8::random(state)).collect();
+    let short = |len: usize| len.saturating_sub(3);
+    checked += general("normalize_range", state, |v: &mut [f32]| probes::normalize_range(v, -2.5, 7.0), |x| {
+        (x - (-2.5f32 + 7.0) * 0.5) / (7.0 - -2.5)
+    });
+    for double in [false, true] {
+        checked += general(
+            "conditional_scale",
+            state,
+            |v: &mut [f32]| probes::conditional_scale(v, double),
+            |x| x * if double { 2.0 } else { 3.0 },
+        );
+    }
+    for clamp in [false, true] {
+        let settings = probes::Adjust { gain: 1.75, bias: -0.5, clamp, limit: 200 };
+        checked += general("adjust", state, |v: &mut [f32]| probes::adjust(v, &settings), |x| {
+            let y = x * settings.gain + settings.bias;
+            if settings.clamp && y > f32::from(settings.limit) { f32::from(settings.limit) } else { y }
+        });
+    }
+    let settings = probes::Adjust { gain: -3.0, bias: 0.0, clamp: false, limit: 0 };
+    checked += general(
+        "adjust_by_value",
+        state,
+        |v: &mut [f32]| probes::adjust_by_value(v, settings, (0.125, -300)),
+        |x| (f64::from(x * -3.0) * 0.125) as f32 + -300.0,
+    );
+    checked += general_indexed(
+        "add_into",
+        state,
+        |v: &mut [u32]| {
+            let len = v.len();
+            probes::add_into(v, &a[..len], &b[..short(len)])
+        },
+        |i, len, x| if i < short(len) { a[i].wrapping_add(b[i]) } else { x },
+    );
+    checked += general_indexed(
+        "add_pairs",
+        state,
+        |v: &mut [u32]| {
+            let len = v.len();
+            probes::add_pairs(v, &a[..len], &b[..short(len)])
+        },
+        |i, len, x| if i < short(len) { x.wrapping_add(a[i].wrapping_mul(b[i])) } else { x },
+    );
+    checked += general_indexed(
+        "saxpy",
+        state,
+        |v: &mut [f32]| probes::saxpy(v, &xs[..v.len()], 0.75),
+        |i, _, y| 0.75 * xs[i] + y,
+    );
+    checked += general_indexed(
+        "weighted",
+        state,
+        |v: &mut [f64]| probes::weighted(v, &weights[..v.len()]),
+        |i, _, x| x * (f64::from(weights[i]) / 255.0),
+    );
+    checked += general("scene_distances", state, probes::scene_distances, |x: f32| {
+        use sdfu::SDF;
+        let scene = sdfu::Sphere::new(1.0)
+            .union_smooth(sdfu::Sphere::new(0.5).translate(glam::Vec3A::new(1.0, 0.0, 0.0)), 0.3)
+            .subtract(sdfu::Box::new(glam::Vec3A::new(0.25, 2.0, 0.25)));
+        scene.dist(glam::Vec3A::new(x, 0.25, -0.5))
+    });
+    checked += general("rounded_box", state, |v: &mut [f32]| probes::rounded_box(v, 0.8, 0.1), |x: f32| {
+        use sdfu::SDF;
+        sdfu::Box::new(glam::Vec3A::splat(0.8)).round(0.1).dist(glam::Vec3A::new(x, x * 0.5, 0.1))
     });
     // Held out: `ultraviolet`, validated after the translator was built.
     checked += general("uv_lengths", state, probes::uv_lengths, |x: f32| {

@@ -470,6 +470,40 @@ impl<'k> Emitter<'k> {
                     }
                 }
             }
+            Intrinsic::CountOnes => {
+                let operand_ty = self.ty(args[0]);
+                match operand_ty.bits() {
+                    32 => self.line(format!("popc.b32 {d}, {x}")),
+                    64 => self.line(format!("popc.b64 {d}, {x}")),
+                    _ => {
+                        let wide = self.widen_unsigned(operand_ty, x);
+                        self.line(format!("popc.b32 {d}, {wide}"));
+                    }
+                }
+            }
+            // No `ctz` instruction: reverse the bits and count leading zeros.
+            Intrinsic::TrailingZeros => {
+                let operand_ty = self.ty(args[0]);
+                match operand_ty.bits() {
+                    32 => {
+                        let reversed = self.temp(Class::B32);
+                        self.line(format!("brev.b32 {reversed}, {x}"));
+                        self.line(format!("clz.b32 {d}, {reversed}"));
+                    }
+                    64 => {
+                        let reversed = self.temp(Class::B64);
+                        self.line(format!("brev.b64 {reversed}, {x}"));
+                        self.line(format!("clz.b64 {d}, {reversed}"));
+                    }
+                    bits => {
+                        // A bit just above the operand stops zero at its width.
+                        let wide = self.widen_unsigned(operand_ty, x);
+                        self.line(format!("or.b32 {wide}, {wide}, {}", 1u32 << bits));
+                        self.line(format!("brev.b32 {wide}, {wide}"));
+                        self.line(format!("clz.b32 {d}, {wide}"));
+                    }
+                }
+            }
         }
     }
 }
@@ -514,6 +548,7 @@ pub fn emit(kernel: &Kernel) -> String {
                 emitter.line(format!("bra.uni {}", label(otherwise.0)));
             }
             Terminator::Return => emitter.line("ret"),
+            Terminator::Fail => emitter.line("trap"),
         }
     }
 

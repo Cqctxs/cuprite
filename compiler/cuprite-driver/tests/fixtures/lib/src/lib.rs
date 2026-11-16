@@ -13,6 +13,20 @@ pub fn step(values: &mut [u32]) {
     }
 }
 
+/// Mixes a value's high bits into its low ones. Neither it nor its helper
+/// is generic or inline, so rustc keeps their MIR in this crate's metadata
+/// only when told to (`-Zalways-encode-mir`), and callers in other crates
+/// can inline them into kernels only then.
+#[inline(never)]
+pub fn fold(value: u32) -> u32 {
+    value ^ shifted(value)
+}
+
+#[inline(never)]
+fn shifted(value: u32) -> u32 {
+    value >> 13
+}
+
 /// Runs `passes` steps.
 pub fn simulate(values: &mut [u32], passes: u32) {
     for _ in 0..passes {

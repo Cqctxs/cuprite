@@ -3,24 +3,31 @@
 //! entry point and signature, and holds its PTX.
 //!
 //! ```text
-//! cuprite kernel 1
+//! cuprite kernel 3
 //! function cuprite_probes::scale
 //! entry cuprite_probes__scale
 //! element f32
+//! inputs u8
+//! tables u32
 //! repeated no
 //! scalars f32
 //! ptx
 //! <PTX until the end>
 //! ```
 //!
-//! The kernel is [`crate::shapes::in_place_map`]: the runtime passes the
-//! data and its length, then the call's scalar arguments, which follow
-//! `scalars`. With `repeated yes`, the first scalar is the pass count, a
-//! `u32`.
+//! The kernel is [`crate::shapes::in_place_map`]. The call passes the
+//! bits of each scalar in `scalars`, then the address and length of each
+//! input slice, whose element types `inputs` lists. The runtime passes the
+//! data, the shortest length, a zeroed `u32` failure flag, the input
+//! pointers, then the stages' scalars: a pointer and length for each
+//! table (a read-only slice the code indexes, whose element types `tables`
+//! lists, passed like an input after them), then `scalars`. It discards the
+//! results if the flag is set. With
+//! `repeated yes`, the first scalar is the pass count, a `u32`.
 
 use crate::Ty;
 
-const HEADER: &str = "cuprite kernel 1";
+const HEADER: &str = "cuprite kernel 3";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Description {
@@ -28,6 +35,10 @@ pub struct Description {
     pub function: String,
     pub entry: String,
     pub element: Ty,
+    /// The element types of the read-only slices zipped with the data.
+    pub inputs: Vec<Ty>,
+    /// The element types of the read-only slices the code indexes.
+    pub tables: Vec<Ty>,
     pub repeated: bool,
     /// The kernel's parameters after the data and its length.
     pub scalars: Vec<Ty>,
@@ -36,20 +47,21 @@ pub struct Description {
 
 impl Description {
     pub fn encode(&self) -> String {
-        let scalars: Vec<&str> = self.scalars.iter().map(|ty| ty.name()).collect();
         format!(
-            "{HEADER}\nfunction {}\nentry {}\nelement {}\nrepeated {}\nscalars {}\nptx\n{}",
+            "{HEADER}\nfunction {}\nentry {}\nelement {}\ninputs {}\ntables {}\nrepeated {}\nscalars {}\nptx\n{}",
             self.function,
             self.entry,
             self.element.name(),
+            names(&self.inputs),
+            names(&self.tables),
             if self.repeated { "yes" } else { "no" },
-            scalars.join(" "),
+            names(&self.scalars),
             self.ptx
         )
     }
 
     pub fn decode(text: &str) -> Result<Description, String> {
-        let mut lines = text.splitn(8, '\n');
+        let mut lines = text.splitn(10, '\n');
         let mut field = |name: &str| -> Result<&str, String> {
             let line = lines.next().ok_or_else(|| format!("no `{name}` line"))?;
             if name == HEADER || name == "ptx" {
@@ -64,6 +76,20 @@ impl Description {
         let entry = field("entry")?.to_owned();
         let element = field("element")?;
         let element = Ty::from_name(element).ok_or_else(|| format!("unknown element type `{element}`"))?;
+        let inputs = field("inputs")?
+            .split_whitespace()
+            .map(|name| match Ty::from_name(name) {
+                Some(ty) if ty.is_int() || ty.is_float() => Ok(ty),
+                _ => Err(format!("`{name}` is not an input element type")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let tables = field("tables")?
+            .split_whitespace()
+            .map(|name| match Ty::from_name(name) {
+                Some(ty) if ty.is_int() || ty.is_float() => Ok(ty),
+                _ => Err(format!("`{name}` is not a table element type")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let repeated = match field("repeated")? {
             "yes" => true,
             "no" => false,
@@ -81,8 +107,12 @@ impl Description {
         }
         field("ptx")?;
         let ptx = lines.next().unwrap_or_default().to_owned();
-        Ok(Description { function, entry, element, repeated, scalars, ptx })
+        Ok(Description { function, entry, element, inputs, tables, repeated, scalars, ptx })
     }
+}
+
+fn names(types: &[Ty]) -> String {
+    types.iter().map(|ty| ty.name()).collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -94,6 +124,8 @@ mod tests {
             function: "a::scale".into(),
             entry: "a__scale".into(),
             element: Ty::F32,
+            inputs: vec![Ty::U8, Ty::F64],
+            tables: vec![Ty::U32],
             repeated: true,
             scalars: vec![Ty::U32, Ty::F32, Ty::I64],
             ptx: ".version 7.0\n.target sm_70\n".into(),
@@ -104,7 +136,7 @@ mod tests {
     fn descriptions_survive_encoding() {
         let description = sample();
         assert_eq!(Description::decode(&description.encode()).unwrap(), description);
-        let plain = Description { repeated: false, scalars: Vec::new(), ..sample() };
+        let plain = Description { repeated: false, inputs: Vec::new(), tables: Vec::new(), scalars: Vec::new(), ..sample() };
         assert_eq!(Description::decode(&plain.encode()).unwrap(), plain);
     }
 
@@ -112,8 +144,11 @@ mod tests {
     fn malformed_descriptions_are_refused() {
         let text = sample().encode();
         for (from, to) in [
-            ("cuprite kernel 1", "cuprite kernel 2"),
+            ("cuprite kernel 3", "cuprite kernel 2"),
             ("element f32", "element f16"),
+            ("inputs u8", "inputs bool"),
+            ("tables u32", "tables ptr"),
+            ("inputs u8 f64\n", "\n"),
             ("repeated yes", "repeated maybe"),
             ("scalars u32", "scalars ptr"),
             ("scalars u32 f32", "scalars f32 f32"),

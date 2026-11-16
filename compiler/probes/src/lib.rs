@@ -502,13 +502,6 @@ pub fn cross_dot(values: &mut [f32]) {
     }
 }
 
-/// `glam`'s `Vec3A` is SIMD on x86, which the kernel can't express.
-pub fn simd_lengths(values: &mut [f32]) {
-    for value in values {
-        *value = glam::Vec3A::new(*value, 1.0, -2.0).length();
-    }
-}
-
 // Held-out validation for calls: the same three computations with
 // `ultraviolet`, written after the translator was finished, with no changes
 // to it.
@@ -531,6 +524,233 @@ pub fn uv_cross_dot(values: &mut [f32]) {
         let a = ultraviolet::Vec3::new(*value, 2.0, -1.0);
         let b = ultraviolet::Vec3::new(0.0, 1.0, 0.0);
         *value = a.cross(b).dot(a + b);
+    }
+}
+
+// Reading data (code generation): values computed before the loop,
+// parameters of plain data, and read-only slices zipped with the slice.
+
+/// Values computed before the loop from parameters.
+pub fn normalize_range(values: &mut [f32], low: f32, high: f32) {
+    let middle = (low + high) * 0.5;
+    let span = high - low;
+    for value in values {
+        *value = (*value - middle) / span;
+    }
+}
+
+/// A branch before the loop, on a `bool` parameter.
+pub fn conditional_scale(values: &mut [f32], double: bool) {
+    let factor = if double { 2.0 } else { 3.0 };
+    for value in values {
+        *value *= factor;
+    }
+}
+
+/// Plain data, passed by reference and by value.
+#[derive(Clone, Copy)]
+pub struct Adjust {
+    pub gain: f32,
+    pub bias: f32,
+    pub clamp: bool,
+    pub limit: u8,
+}
+
+pub fn adjust(values: &mut [f32], settings: &Adjust) {
+    for value in values {
+        let x = *value * settings.gain + settings.bias;
+        *value = if settings.clamp && x > f32::from(settings.limit) { f32::from(settings.limit) } else { x };
+    }
+}
+
+pub fn adjust_by_value(values: &mut [f32], settings: Adjust, extra: (f64, i16)) {
+    for value in values {
+        *value = (f64::from(*value * settings.gain) * extra.0) as f32 + f32::from(extra.1);
+    }
+}
+
+/// Two input slices zipped with the output.
+pub fn add_pairs(output: &mut [u32], a: &[u32], b: &[u32]) {
+    for ((out, x), y) in output.iter_mut().zip(a).zip(b) {
+        *out = out.wrapping_add(x.wrapping_mul(*y));
+    }
+}
+
+/// `y = a * x + y`, with `.iter()` on the input.
+pub fn saxpy(y: &mut [f32], x: &[f32], a: f32) {
+    for (yi, xi) in y.iter_mut().zip(x.iter()) {
+        *yi += a * xi;
+    }
+}
+
+/// The input first, and of another type than the output.
+pub fn weighted(values: &mut [f64], weights: &[u8]) {
+    for (weight, value) in weights.iter().zip(values.iter_mut()) {
+        *value *= f64::from(*weight) / 255.0;
+    }
+}
+
+/// An `sdfu` scene built before the loop, sampled along a line.
+pub fn scene_distances(values: &mut [f32]) {
+    use sdfu::SDF;
+    let scene = sdfu::Sphere::new(1.0)
+        .union_smooth(sdfu::Sphere::new(0.5).translate(glam::Vec3A::new(1.0, 0.0, 0.0)), 0.3)
+        .subtract(sdfu::Box::new(glam::Vec3A::new(0.25, 2.0, 0.25)));
+    for value in values {
+        *value = scene.dist(glam::Vec3A::new(*value, 0.25, -0.5));
+    }
+}
+
+/// A rounded box from parameters, through `sdfu`'s modifiers.
+pub fn rounded_box(values: &mut [f32], size: f32, rounding: f32) {
+    use sdfu::SDF;
+    let scene = sdfu::Box::new(glam::Vec3A::splat(size)).round(rounding);
+    for value in values {
+        *value = scene.dist(glam::Vec3A::new(*value, *value * 0.5, 0.1));
+    }
+}
+
+/// Indexing a slice needs a bounds check whose result depends on lengths
+/// known only at run time.
+pub fn lookup(values: &mut [u8], table: &[u8]) {
+    for value in values {
+        *value = table[*value as usize];
+    }
+}
+
+/// Explicit SIMD can't be expressed in the kernel.
+#[cfg(target_arch = "x86_64")]
+pub fn simd_roots(values: &mut [f32]) {
+    use std::arch::x86_64::{_mm_cvtss_f32, _mm_set_ss, _mm_sqrt_ss};
+    for value in values {
+        // SAFETY: SSE is part of the x86_64 baseline.
+        *value = unsafe { _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(*value))) };
+    }
+}
+
+// Held-out validation for reading data: `palette`, written after the
+// translator was finished, with no changes to it.
+
+/// Mixes towards a colour built before the loop from parameters.
+pub fn palette_mix(values: &mut [f32], red: f32, green: f32, blue: f32) {
+    use palette::Mix;
+    let base = palette::LinSrgb::new(0.2f32, 0.4, 0.6);
+    let target = palette::LinSrgb::new(red, green, blue);
+    for value in values {
+        *value = base.mix(target, *value).green;
+    }
+}
+
+/// Decodes sRGB to linear light.
+pub fn palette_linear(values: &mut [f32]) {
+    for value in values {
+        *value = palette::Srgb::new(*value, 0.5, 0.25).into_linear().red;
+    }
+}
+
+/// Converts to HSV and takes the saturation.
+pub fn palette_saturation(values: &mut [f32]) {
+    use palette::FromColor;
+    for value in values {
+        *value = palette::Hsv::from_color(palette::Srgb::new(*value, 0.3, 0.7)).saturation;
+    }
+}
+
+/// Blends each element with a second slice's colours.
+pub fn palette_blend(values: &mut [f32], others: &[f32]) {
+    use palette::Mix;
+    let tint = palette::LinSrgb::new(1.0f32, 0.5, 0.0);
+    for (value, other) in values.iter_mut().zip(others) {
+        *value = palette::LinSrgb::new(*value, *other, 0.5).mix(tint, 0.25).red;
+    }
+}
+
+// Checks (error flag): code whose checks can fail at run time. The GPU
+// makes the same checks; when one fails, the CPU runs the code and panics
+// where it always would.
+
+/// An index into a table that wraps around its length: a remainder by a
+/// length that may be zero, then a bounds check.
+pub fn lookup_wrapped(values: &mut [f32], table: &[f32]) {
+    for value in values {
+        let index = (value.abs() * 16.0) as usize % table.len();
+        *value *= table[index];
+    }
+}
+
+/// Division and remainder by a parameter: zero and `MIN / -1` panic.
+pub fn div_mod(values: &mut [i32], divisor: i32) {
+    for value in values {
+        *value = *value / divisor + *value % divisor;
+    }
+}
+
+/// `f32::clamp` asserts its bounds are in order.
+pub fn clamp_range(values: &mut [f32], low: f32, high: f32) {
+    for value in values {
+        *value = value.clamp(low, high);
+    }
+}
+
+/// `+=` on bytes overflows, and so panics, in debug builds.
+pub fn add_bytes(values: &mut [u8], amount: u8) {
+    for value in values {
+        *value += amount;
+    }
+}
+
+/// `*` on 64-bit integers: the widest overflow check.
+pub fn square_wide(values: &mut [i64]) {
+    for value in values {
+        *value *= *value;
+    }
+}
+
+/// An explicit assertion.
+pub fn asserted_halves(values: &mut [u32]) {
+    for value in values {
+        assert!(*value % 2 == 0, "odd value {value}");
+        *value /= 2;
+    }
+}
+
+// Held-out validation for checks: `strength_reduce` and `num-integer`,
+// written after the error flag was finished, with no changes to it.
+
+/// A divisor reduced before the loop (which panics for zero), then used.
+pub fn sr_divide(values: &mut [u32], divisor: u32) {
+    let reduced = strength_reduce::StrengthReducedU32::new(divisor);
+    for value in values {
+        *value = *value / reduced;
+    }
+}
+
+/// The same with 64-bit division and remainder.
+pub fn sr_div_rem(values: &mut [u64], divisor: u64) {
+    let reduced = strength_reduce::StrengthReducedU64::new(divisor);
+    for value in values {
+        *value = *value / reduced + *value % reduced;
+    }
+}
+
+/// Floored division, which panics for a zero divisor.
+pub fn ni_div_floor(values: &mut [i32], divisor: i32) {
+    for value in values {
+        *value = num_integer::div_floor(*value, divisor);
+    }
+}
+
+/// Greatest common divisors, with a loop inside.
+pub fn ni_gcd(values: &mut [u32], other: u32) {
+    for value in values {
+        *value = num_integer::gcd(*value, other);
+    }
+}
+
+/// Integer square roots.
+pub fn ni_sqrt(values: &mut [u64]) {
+    for value in values {
+        *value = num_integer::Roots::sqrt(value);
     }
 }
 

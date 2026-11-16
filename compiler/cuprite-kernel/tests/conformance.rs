@@ -165,6 +165,8 @@ macro_rules! integer_suite {
             let values: Vec<$t> = vec![
                 0, 1, 2, 3, 7, 0x5A, <$t>::MAX, <$t>::MIN, <$t>::MAX - 1, <$t>::MIN.wrapping_add(1),
                 <$t>::MAX / 3, zero.wrapping_sub(1), zero.wrapping_sub(7), 100u8 as $t,
+                // Only a high bit: the top of the trailing-zero counts.
+                <$t>::MAX ^ (<$t>::MAX >> 1), (<$t>::MAX ^ (<$t>::MAX >> 1)) >> 1,
             ];
             let all = pairs(&values, &values);
             let wrapping: [(BinOp, fn($t, $t) -> $t); 6] = [
@@ -221,6 +223,20 @@ macro_rules! integer_suite {
                 &values,
                 |b, x| b.call(Intrinsic::LeadingZeros, &[x.into()]),
                 |x: $t| x.leading_zeros(),
+                Freedom::None,
+            );
+            unary(
+                &format!("{n}_ctz"),
+                &values,
+                |b, x| b.call(Intrinsic::TrailingZeros, &[x.into()]),
+                |x: $t| x.trailing_zeros(),
+                Freedom::None,
+            );
+            unary(
+                &format!("{n}_popcount"),
+                &values,
+                |b, x| b.call(Intrinsic::CountOnes, &[x.into()]),
+                |x: $t| x.count_ones(),
                 Freedom::None,
             );
         }

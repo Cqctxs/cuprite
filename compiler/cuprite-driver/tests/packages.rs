@@ -128,7 +128,8 @@ fn run_app(env: &[(&str, &OsStr)]) -> (String, String) {
 }
 
 /// What the application prints, computed independently: the library's
-/// `x * 5 + 1` for `PASSES` passes, then the application's `x * 7 + 42`,
+/// `x * 5 + 1` for `PASSES` passes, then the application's
+/// `fold(x * 7) + 42`,
 /// summed; then 36 from the build script (`7 * 5 + 1`, through the library).
 fn expected() -> String {
     let checksum: u64 = (0..LEN)
@@ -136,7 +137,8 @@ fn expected() -> String {
             for _ in 0..PASSES {
                 x = x.wrapping_mul(5).wrapping_add(1);
             }
-            u64::from(x.wrapping_mul(7).wrapping_add(42))
+            let y = x.wrapping_mul(7);
+            u64::from((y ^ (y >> 13)).wrapping_add(42))
         })
         .sum();
     format!("{checksum} 36")

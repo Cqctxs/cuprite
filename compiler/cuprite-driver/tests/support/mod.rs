@@ -151,9 +151,13 @@ impl Probes {
         std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
     }
 
-    /// The dump writes a path's `::` as `..` in file names.
+    /// The dump names files as `dump::write` does: every character other
+    /// than letters, digits, `_` and `#` becomes `.`.
     pub fn mir(&self, function: &str, stage: &str) -> String {
-        let file = function.replace("::", "..");
+        let file: String = function
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '#' { c } else { '.' })
+            .collect();
         let path = self.mir_dir().join(format!("{file}.{stage}.mir"));
         std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
     }
@@ -194,6 +198,10 @@ impl Probes {
                 "RUSTC_WORKSPACE_WRAPPER",
                 env!("CARGO_BIN_EXE_cuprite-driver"),
             )
+            // The driver keeps all MIR in the crates it compiles; as a
+            // workspace wrapper it doesn't compile the dependencies, so they
+            // are told directly, as `cargo cuprite` tells every crate.
+            .env("RUSTFLAGS", "-Zalways-encode-mir")
             .env("CUPRITE_DUMP_MIR", output_dir.join("mir"))
             .env("CUPRITE_REPORT", output_dir.join("report"));
         if self.link_runtime {

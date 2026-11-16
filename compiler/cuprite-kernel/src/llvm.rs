@@ -319,10 +319,19 @@ impl Emitter<'_> {
                 self.declare(format!("declare {t} @{full}({t}, {t}, {t})"));
                 self.value(format!("call {t} @{full}({t} {x}, {t} {x}, {t} {amount})"))
             }
-            Intrinsic::LeadingZeros => {
-                let full = format!("llvm.ctlz.{}", suffix(operand_ty));
-                self.declare(format!("declare {t} @{full}({t}, i1)"));
-                let count = self.value(format!("call {t} @{full}({t} {}, i1 false)", values[0]));
+            Intrinsic::LeadingZeros | Intrinsic::TrailingZeros | Intrinsic::CountOnes => {
+                let x = &values[0];
+                let count = if intrinsic == Intrinsic::CountOnes {
+                    let full = format!("llvm.ctpop.{}", suffix(operand_ty));
+                    self.declare(format!("declare {t} @{full}({t})"));
+                    self.value(format!("call {t} @{full}({t} {x})"))
+                } else {
+                    // `false`: zero is defined, giving the width.
+                    let name = if intrinsic == Intrinsic::LeadingZeros { "ctlz" } else { "cttz" };
+                    let full = format!("llvm.{name}.{}", suffix(operand_ty));
+                    self.declare(format!("declare {t} @{full}({t}, i1)"));
+                    self.value(format!("call {t} @{full}({t} {x}, i1 false)"))
+                };
                 let unsigned = match operand_ty.bits() {
                     8 => Ty::U8,
                     16 => Ty::U16,
@@ -359,6 +368,11 @@ pub fn emit(kernel: &Kernel) -> String {
                 emitter.line(format!("br i1 {condition}, label %b{}, label %b{}", then.0, otherwise.0));
             }
             Terminator::Return => emitter.line("ret void"),
+            Terminator::Fail => {
+                emitter.declare("declare void @llvm.trap()".into());
+                emitter.line("call void @llvm.trap()");
+                emitter.line("unreachable");
+            }
         }
     }
 

@@ -6,9 +6,7 @@ use rayon::prelude::*;
 
 fn mix(values: &mut [u32]) {
     for value in values.iter_mut() {
-        *value = value
-            .wrapping_mul(7)
-            .wrapping_add(fixture_macros::answer!());
+        *value = fixture_lib::fold(value.wrapping_mul(7)).wrapping_add(fixture_macros::answer!());
     }
 }
 

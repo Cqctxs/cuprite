@@ -16,10 +16,14 @@
 //! ```
 //!
 //! Build scripts, procedural macros and Cuprite's own crates always compile
-//! as with plain rustc.
+//! as with plain rustc. Crates it analyzes keep every function's MIR
+//! (`-Zalways-encode-mir`), so their callers can inline any of their calls;
+//! as a workspace wrapper, set that flag in `RUSTFLAGS` for the
+//! dependencies too.
 
 #![feature(rustc_private)]
 
+extern crate rustc_abi;
 extern crate rustc_attr_ir;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
@@ -230,6 +234,18 @@ fn add_runtime_args(early_dcx: &EarlyDiagCtxt, args: &mut Vec<String>) -> Vec<St
     files
 }
 
+/// The flag that keeps every function's MIR in the crate's metadata.
+const ENCODE_ALL_MIR: &str = "-Zalways-encode-mir";
+
+/// Keeps the MIR of every function, not only generic and inline ones, so
+/// that crates using this one can inline its calls into kernels: a public
+/// function calling a private helper is otherwise opaque to them.
+fn encode_all_mir(args: &mut Vec<String>) {
+    if !args.iter().any(|arg| arg.starts_with(ENCODE_ALL_MIR)) {
+        args.push(ENCODE_ALL_MIR.into());
+    }
+}
+
 fn read_settings(early_dcx: &EarlyDiagCtxt, inputs: Vec<String>) -> Settings {
     let replacements = match env::var(replace::VAR).map(|spec| replace::parse(&spec)) {
         Ok(Ok(replacements)) => replacements,
@@ -270,7 +286,11 @@ fn main() -> ExitCode {
             if let Ok(driver) = env::current_exe() {
                 inputs.push(utf8(&early_dcx, driver));
             }
-            read_settings(&early_dcx, inputs)
+            let settings = read_settings(&early_dcx, inputs);
+            if settings.analyzes() {
+                encode_all_mir(&mut args);
+            }
+            settings
         };
         if SETTINGS.set(settings).is_err() {
             unreachable!("the driver compiles one crate per process");

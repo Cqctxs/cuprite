@@ -111,13 +111,14 @@ fn capped_double() -> cuprite_kernel::Function {
 fn element_functions_inline_into_map_kernels() {
     use cuprite_kernel::shapes::in_place_map;
     let stage = capped_double();
-    let kernel = in_place_map("twice", Ty::U32, &[&stage, &stage], true).unwrap();
-    // The data, its length, the pass count, then each stage's scalar.
-    assert_eq!(&kernel.locals[..kernel.params], [Ty::Ptr, Ty::U64, Ty::U32, Ty::U32, Ty::U32]);
+    let kernel = in_place_map("twice", Ty::U32, &[], &[&stage, &stage], true).unwrap();
+    // The data, its length, the failure flag, the pass count, then each
+    // stage's scalar.
+    assert_eq!(&kernel.locals[..kernel.params], [Ty::Ptr, Ty::U64, Ty::Ptr, Ty::U32, Ty::U32, Ty::U32]);
     // Both copies are there, each with its own branch.
     let text = ptx::emit(&kernel);
     assert_eq!(text.matches("setp.lt.u32").count(), 3, "{text}"); // 2 stages + the pass loop
     assert!(llvm::emit(&kernel).contains("define ptx_kernel void @twice("));
     // A stage must map the element type to itself.
-    assert!(in_place_map("wrong", Ty::F32, &[&stage], false).is_err());
+    assert!(in_place_map("wrong", Ty::F32, &[], &[&stage], false).is_err());
 }

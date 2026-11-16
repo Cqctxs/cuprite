@@ -166,14 +166,20 @@ impl Builder {
         self.terminate(Terminator::Return);
     }
 
+    /// Ends the block with a failed check.
+    pub fn fail(&mut self) {
+        self.terminate(Terminator::Fail);
+    }
+
     /// Runs `function` here: binds its parameters to `args`, copies its
     /// blocks with fresh locals, and continues in a new block where it
-    /// returns. Returns the local holding its result.
+    /// returns. Where it fails, it jumps to `on_fail`, if given, and fails
+    /// otherwise. Returns the local holding its result.
     ///
     /// # Panics
     /// If the number of arguments isn't the number of parameters. Argument
     /// types are checked by [`Builder::finish`].
-    pub fn inline(&mut self, function: &Function, args: &[Operand]) -> Option<Local> {
+    pub fn inline(&mut self, function: &Function, args: &[Operand], on_fail: Option<BlockId>) -> Option<Local> {
         let callee = &function.kernel;
         assert_eq!(args.len(), callee.params, "inlining `{}`", callee.name);
         let locals: Vec<Local> = callee.locals.iter().map(|ty| self.local(*ty)).collect();
@@ -205,6 +211,7 @@ impl Builder {
                     Terminator::If(rename(condition), block(then), block(otherwise))
                 }
                 Terminator::Return => Terminator::Goto(after),
+                Terminator::Fail => on_fail.map_or(Terminator::Fail, Terminator::Goto),
             };
             self.kernel.blocks[blocks[i].0 as usize] = Block { statements, terminator };
         }

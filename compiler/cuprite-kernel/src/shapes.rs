@@ -3,27 +3,42 @@
 
 use crate::{builder::Builder, BinOp, Const, Function, Invalid, Kernel, Operand, Rvalue, Special, Ty};
 
-/// The parameters an in-place map kernel takes before its stages' scalars:
-/// the data, its length, and with `repeated` the pass count.
-pub fn in_place_map_prefix(repeated: bool) -> &'static [Ty] {
+/// An in-place map kernel's parameters before its stages' scalars: the
+/// data, its length, the failure flag, a pointer per input slice, and with
+/// `repeated` the pass count.
+pub fn in_place_map_prefix(inputs: usize, repeated: bool) -> Vec<Ty> {
+    let mut prefix = vec![Ty::Ptr, Ty::U64, Ty::Ptr];
+    prefix.extend(std::iter::repeat_n(Ty::Ptr, inputs));
     if repeated {
-        &[Ty::Ptr, Ty::U64, Ty::U32]
-    } else {
-        &[Ty::Ptr, Ty::U64]
+        prefix.push(Ty::U32);
     }
+    prefix
 }
 
-/// `data[i] = stages(data[i])` for every `i < len`, applying the stages in
-/// order, and with `repeated` doing all of that `passes` times. Each element
-/// is independent, so passes can run per element: `passes` launches over
-/// the slice and one launch looping per element compute the same.
+/// `data[i] = stages(data[i], inputs[..][i])` for every `i < len`,
+/// applying the stages in order, and with `repeated` doing all of that
+/// `passes` times. Each element is independent, so passes can run per
+/// element: `passes` launches over the slice and one launch looping per
+/// element compute the same.
 ///
-/// Each stage takes the element and then scalars of its own, and returns
-/// the new element. The kernel's parameters are
-/// [`in_place_map_prefix`], then every stage's scalars in order. One thread
-/// handles one element, in a `Grid::Linear` launch of at most `u32::MAX`
-/// threads.
-pub fn in_place_map(name: &str, element: Ty, stages: &[&Function], repeated: bool) -> Result<Kernel, Invalid> {
+/// Each stage takes the element, then one value from each input slice, in
+/// order, then scalars of its own, and returns the new element. The inputs
+/// are read-only and hold at least `len` elements. The kernel's parameters
+/// are [`in_place_map_prefix`], then every stage's scalars in order. One
+/// thread handles one element, in a `Grid::Linear` launch of at most
+/// `u32::MAX` threads.
+///
+/// Where a stage fails (`Terminator::Fail`), the thread writes 1 to the
+/// `u32` failure flag and stops without storing its element. The CPU would
+/// have panicked there, so the caller discards every result and runs the
+/// original code instead.
+pub fn in_place_map(
+    name: &str,
+    element: Ty,
+    inputs: &[Ty],
+    stages: &[&Function],
+    repeated: bool,
+) -> Result<Kernel, Invalid> {
     for stage in stages {
         let params = stage.params();
         if params.first() != Some(&element) || stage.result_ty() != Some(element) {
@@ -32,41 +47,53 @@ pub fn in_place_map(name: &str, element: Ty, stages: &[&Function], repeated: boo
                 stage.kernel.name
             )));
         }
-        if let Some(ty) = params[1..].iter().find(|ty| !ty.is_passable()) {
+        if params.get(1..=inputs.len()) != Some(inputs) {
+            return Err(Invalid(format!("stage `{}` doesn't take the inputs {inputs:?}", stage.kernel.name)));
+        }
+        if let Some(ty) = params[1 + inputs.len()..].iter().find(|ty| !ty.is_passable()) {
             return Err(Invalid(format!("stage `{}` takes a {ty:?}, which can't be passed", stage.kernel.name)));
         }
     }
-    let mut types = in_place_map_prefix(repeated).to_vec();
+    let prefix = in_place_map_prefix(inputs.len(), repeated);
+    let mut types = prefix.clone();
     for stage in stages {
-        types.extend_from_slice(&stage.params()[1..]);
+        types.extend_from_slice(&stage.params()[1 + inputs.len()..]);
     }
     let (mut b, params) = Builder::new(name, &types);
-    let (data, len) = (params[0], params[1]);
-    let mut scalars = params[in_place_map_prefix(repeated).len()..].iter().copied();
+    let (data, len, flag) = (params[0], params[1], params[2]);
+    let input_pointers = &params[3..3 + inputs.len()];
+    let mut scalars = params[prefix.len()..].iter().copied();
     let stage_scalars: Vec<Vec<Operand>> = stages
         .iter()
-        .map(|stage| (1..stage.params().len()).map(|_| scalars.next().unwrap().into()).collect())
+        .map(|stage| (1 + inputs.len()..stage.params().len()).map(|_| scalars.next().unwrap().into()).collect())
         .collect();
 
     let i = b.special(Special::X);
     let wide = b.cast(i, Ty::U64);
     let inside = b.binary(BinOp::Lt, wide, len);
-    let (work, done) = (b.block(), b.block());
+    let (work, done, failed) = (b.block(), b.block(), b.block());
     b.branch(inside, work, done);
+
+    b.switch_to(failed);
+    b.store(flag, Const::int(Ty::U32, 1));
+    b.ret();
 
     b.switch_to(work);
     let address = b.offset(data, wide, element);
     let value = b.load(address, element);
+    let input_values: Vec<Operand> =
+        input_pointers.iter().zip(inputs).map(|(&pointer, &ty)| b.index(pointer, wide, ty).into()).collect();
     let apply = |b: &mut Builder| {
         for (stage, scalars) in stages.iter().zip(&stage_scalars) {
             let mut args = vec![value.into()];
+            args.extend_from_slice(&input_values);
             args.extend_from_slice(scalars);
-            let result = b.inline(stage, &args).expect("checked above");
+            let result = b.inline(stage, &args, Some(failed)).expect("checked above");
             b.set(value, Rvalue::Use(result.into()));
         }
     };
     if repeated {
-        let passes = params[2];
+        let passes = params[prefix.len() - 1];
         let pass = b.copy(Const::int(Ty::U32, 0));
         let (head, body, exit) = (b.block(), b.block(), b.block());
         b.goto(head);

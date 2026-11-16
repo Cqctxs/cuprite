@@ -234,6 +234,17 @@ pub enum Intrinsic {
     RotateRight,
     /// `leading_zeros`, as `U32` whatever the operand's width.
     LeadingZeros,
+    /// `trailing_zeros`, as `U32`: the width when the operand is zero.
+    TrailingZeros,
+    /// `count_ones`, as `U32`.
+    CountOnes,
+}
+
+impl Intrinsic {
+    /// Counts bits of an integer, giving `U32`.
+    pub fn counts_bits(self) -> bool {
+        matches!(self, Self::LeadingZeros | Self::TrailingZeros | Self::CountOnes)
+    }
 }
 
 /// The executing thread's position in a launch.
@@ -274,6 +285,11 @@ pub enum Terminator {
     Goto(BlockId),
     If(Operand, BlockId, BlockId),
     Return,
+    /// A check the program would make failed here (an index out of
+    /// bounds, a zero divisor, an assertion): on the CPU this panics.
+    /// Inlining sends it to a block that reports the failure; in a kernel
+    /// entry point it stops the whole launch (`trap`).
+    Fail,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -373,13 +389,13 @@ impl Kernel {
                     Intrinsic::RotateLeft | Intrinsic::RotateRight => {
                         first.is_int() && types[1] == Ty::U32
                     }
-                    Intrinsic::LeadingZeros => first.is_int(),
+                    _ if intrinsic.counts_bits() => first.is_int(),
                     _ => first.is_float() && types.iter().all(|t| *t == first),
                 };
                 if !fits {
                     return fail(format!("{intrinsic:?} of {types:?}"));
                 }
-                Ok(if *intrinsic == Intrinsic::LeadingZeros { Ty::U32 } else { first })
+                Ok(if intrinsic.counts_bits() { Ty::U32 } else { first })
             }
             Rvalue::Load(pointer, loaded) => {
                 if ty(pointer) != Ty::Ptr {
@@ -459,7 +475,7 @@ impl Kernel {
                         && block_ok(t)
                         && block_ok(f)
                 }
-                Terminator::Return => true,
+                Terminator::Return | Terminator::Fail => true,
             };
             if !targets_ok {
                 return Err(Invalid(format!("block {i}: bad terminator")));

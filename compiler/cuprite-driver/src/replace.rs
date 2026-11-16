@@ -30,12 +30,13 @@ use cuprite_kernel::{
     builder::Builder, description::Description, llvm::Llvm, ptx, shapes, BinOp as KBinOp, Const, Function,
     Kernel, Ty as KTy,
 };
+use rustc_abi::FieldIdx;
 use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::{
         interpret::{Scalar, CTFE_ALLOC_SALT},
         AggregateKind, BasicBlockData, Body, BorrowKind, CallSource, CastKind, CoercionSource, ConstOperand,
-        ConstValue, Local, LocalDecl,
+        ConstValue, Local, LocalDecl, ProjectionElem, RawPtrKind, UnOp,
         Operand, Place, Rvalue, SourceInfo, Statement, StatementKind, Terminator, TerminatorKind, UnwindAction,
         START_BLOCK,
     },
@@ -46,7 +47,10 @@ use rustc_span::{
     Span, Spanned,
 };
 
-use crate::analyze::{self, Verdict};
+use crate::{
+    analyze::{self, Verdict},
+    translate::{self, Leaf},
+};
 
 pub(crate) const VAR: &str = "CUPRITE_REPLACE";
 pub(crate) const RUNTIME_VAR: &str = "CUPRITE_RUNTIME";
@@ -103,8 +107,14 @@ struct Job {
     stages: Vec<Function>,
     /// For a repeated map, how many times.
     passes: Option<Passes>,
-    /// Parameters passed as the stages' scalars, in order.
-    scalars: Vec<Local>,
+    /// Read-only slice parameters zipped with the slice, and their element
+    /// types.
+    inputs: Vec<(Local, KTy)>,
+    /// Read-only slice parameters the code indexes, and their element types.
+    tables: Vec<(Local, KTy)>,
+    /// Numbers read from the other parameters, passed as the stages'
+    /// scalars.
+    scalars: Vec<Leaf>,
 }
 
 /// `x * mul + add` over `u32`, wrapping: what a `CUPRITE_REPLACE` entry
@@ -138,6 +148,8 @@ pub(crate) fn optimized_mir<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tc
             element: KTy::U32,
             stages: vec![multiply_add(&path, replacement.mul, replacement.add)],
             passes: Some(replacement.passes),
+            inputs: Vec::new(),
+            tables: Vec::new(),
             scalars: Vec::new(),
         }
     });
@@ -150,12 +162,16 @@ pub(crate) fn optimized_mir<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tc
                 element: map.element,
                 stages: vec![map.function],
                 passes: None,
+                inputs: map.inputs,
+                tables: map.tables,
                 scalars: map.scalars,
             },
             Verdict::Repeated(maps, passes) => Job {
                 element: maps[0].element,
                 stages: maps.into_iter().map(|map| map.function).collect(),
                 passes: Some(passes),
+                inputs: Vec::new(),
+                tables: Vec::new(),
                 scalars: Vec::new(),
             },
             Verdict::Rejected(_) => return None,
@@ -181,19 +197,20 @@ pub(crate) fn optimized_mir<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tc
 fn describe(tcx: TyCtxt<'_>, path: &str, job: &Job) -> String {
     let entry = shapes::entry_name(path);
     let stages: Vec<&Function> = job.stages.iter().collect();
-    let kernel = shapes::in_place_map(&entry, job.element, &stages, job.passes.is_some())
+    let inputs: Vec<KTy> = job.inputs.iter().map(|&(_, ty)| ty).collect();
+    let kernel = shapes::in_place_map(&entry, job.element, &inputs, &stages, job.passes.is_some())
         .unwrap_or_else(|invalid| tcx.dcx().fatal(format!("cuprite: building the kernel for `{path}`: {invalid}")));
     let mut scalars = Vec::new();
     if job.passes.is_some() {
         scalars.push(KTy::U32);
     }
-    for stage in &job.stages {
-        scalars.extend_from_slice(&stage.params()[1..]);
-    }
+    scalars.extend(job.scalars.iter().map(Leaf::passed));
     Description {
         function: path.to_owned(),
         entry,
         element: job.element,
+        inputs,
+        tables: job.tables.iter().map(|&(_, ty)| ty).collect(),
         repeated: job.passes.is_some(),
         scalars,
         ptx: compile(tcx, path, &kernel),
@@ -329,16 +346,64 @@ impl<'tcx> Prologue<'_, 'tcx> {
         local
     }
 
-    /// A parameter's bits as a `u64`: integers extended, floats as their
-    /// IEEE bits, as `map_slice` expects.
+    /// A parameter's bits as a `u64`.
     fn bits(&mut self, param: Local) -> Operand<'tcx> {
+        let ty = self.body.local_decls[param].ty;
+        self.place_bits(Place::from(param), ty)
+    }
+
+    /// The bits of the number a leaf names, through its reference and
+    /// fields.
+    fn leaf_bits(&mut self, leaf: &Leaf) -> Operand<'tcx> {
+        let tcx = self.tcx;
+        let mut ty = self.body.local_decls[leaf.param].ty;
+        let mut projection = Vec::new();
+        if leaf.deref {
+            let ty::Ref(_, inner, _) = ty.kind() else { unreachable!("a leaf through a reference") };
+            ty = *inner;
+            projection.push(ProjectionElem::Deref);
+        }
+        for &index in &leaf.fields {
+            let field = translate::fields_of(tcx, ty).expect("the recognizer walked these fields")[index];
+            projection.push(ProjectionElem::Field(FieldIdx::from_usize(index), field));
+            ty = field;
+        }
+        let place = Place::from(leaf.param).project_deeper(&projection, tcx);
+        self.place_bits(place, ty)
+    }
+
+    /// An input slice's address and length, each as a `u64`.
+    fn slice_parts(&mut self, param: Local) -> [Operand<'tcx>; 2] {
         let tcx = self.tcx;
         let ty = self.body.local_decls[param].ty;
-        let value = Operand::Copy(Place::from(param));
+        let ty::Ref(_, slice, _) = ty.kind() else { unreachable!("an input is a slice reference") };
+        let ty::Slice(element) = slice.kind() else { unreachable!("an input is a slice reference") };
+        let (u64_ty, usize_ty) = (tcx.types.u64, tcx.types.usize);
+        let place = Place::from(param).project_deeper(&[ProjectionElem::Deref], tcx);
+        let raw = self.assign(Ty::new_imm_ptr(tcx, *slice), Rvalue::RawPtr(RawPtrKind::Const, place));
+        let element_ptr_ty = Ty::new_imm_ptr(tcx, *element);
+        let thin = self.assign(element_ptr_ty, Rvalue::Cast(CastKind::PtrToPtr, Operand::Copy(Place::from(raw)), element_ptr_ty));
+        let address = self.assign(
+            usize_ty,
+            Rvalue::Cast(CastKind::PointerExposeProvenance, Operand::Copy(Place::from(thin)), usize_ty),
+        );
+        let address = self.assign(u64_ty, Rvalue::Cast(CastKind::IntToInt, Operand::Copy(Place::from(address)), u64_ty));
+        let len = self.assign(usize_ty, Rvalue::UnaryOp(UnOp::PtrMetadata, Operand::Copy(Place::from(param))));
+        let len = self.assign(u64_ty, Rvalue::Cast(CastKind::IntToInt, Operand::Copy(Place::from(len)), u64_ty));
+        [Operand::Copy(Place::from(address)), Operand::Copy(Place::from(len))]
+    }
+
+    /// A number's bits as a `u64`: integers and `bool` extended, floats as
+    /// their IEEE bits, as `map_slice` expects.
+    fn place_bits(&mut self, place: Place<'tcx>, ty: Ty<'tcx>) -> Operand<'tcx> {
+        let tcx = self.tcx;
+        let value = Operand::Copy(place);
         let u64_ty = tcx.types.u64;
         let local = match ty.kind() {
             ty::Uint(ty::UintTy::U64) => return value,
-            ty::Int(_) | ty::Uint(_) => self.assign(u64_ty, Rvalue::Cast(CastKind::IntToInt, value, u64_ty)),
+            ty::Int(_) | ty::Uint(_) | ty::Bool => {
+                self.assign(u64_ty, Rvalue::Cast(CastKind::IntToInt, value, u64_ty))
+            }
             ty::Float(ty::FloatTy::F32) => {
                 let bits = self.assign(tcx.types.u32, Rvalue::Cast(CastKind::Transmute, value, tcx.types.u32));
                 self.assign(u64_ty, Rvalue::Cast(CastKind::IntToInt, Operand::Copy(Place::from(bits)), u64_ty))
@@ -395,8 +460,11 @@ fn rewrite<'tcx>(
         Some(Passes::Arg(index)) => bits.push(prologue.bits(Local::from_usize(index))),
         None => {}
     }
-    for &param in &job.scalars {
-        bits.push(prologue.bits(param));
+    for leaf in &job.scalars {
+        bits.push(prologue.leaf_bits(leaf));
+    }
+    for &(param, _) in job.inputs.iter().chain(&job.tables) {
+        bits.extend(prologue.slice_parts(param));
     }
     let u64_ty = tcx.types.u64;
     let array_ty = Ty::new_array(tcx, u64_ty, bits.len() as u64);

@@ -119,6 +119,9 @@ enum Decline {
     Unavailable(Arc<str>),
     /// A GPU session failed before committing; the slice is untouched.
     Failed(String),
+    /// A check the CPU code makes failed on the GPU, which discarded its
+    /// results: the CPU body runs, and panics where it would have.
+    CheckFailed,
 }
 
 impl fmt::Display for Decline {
@@ -132,6 +135,7 @@ impl fmt::Display for Decline {
             Self::Poisoned => f.write_str("runtime poisoned"),
             Self::Unavailable(reason) => f.write_str(reason),
             Self::Failed(reason) => f.write_str(reason),
+            Self::CheckFailed => f.write_str("a check failed on the GPU"),
         }
     }
 }
@@ -295,15 +299,42 @@ fn dispatch<T: Element>(
     if mode == Mode::Cpu {
         return Err(Decline::Mode("CUPRITE_GPU=0"));
     }
-    if values.is_empty() || passes == 0 {
-        return Err(Decline::NoWork);
-    }
     let description = &described.description;
-    if description.element.bytes() as usize != size_of::<T>() || args.len() != description.scalars.len() {
+    let scalar_count = description.scalars.len();
+    let slices = description.inputs.len() + description.tables.len();
+    if description.element.bytes() as usize != size_of::<T>() || args.len() != scalar_count + 2 * slices {
         return Err(Decline::Failed("the call doesn't match its kernel".into()));
     }
+    let (scalars, slice_parts) = args.split_at(scalar_count);
+    let slice_parts = slice_parts.as_chunks::<2>().0;
+    let (input_parts, table_parts) = slice_parts.split_at(description.inputs.len());
+    let bytes = |parts: &[[u64; 2]], types: &[Ty]| -> Vec<&[u8]> {
+        parts
+            .iter()
+            .zip(types)
+            .map(|(parts, ty)| {
+                // SAFETY: the rewritten function passes the address and
+                // length of a `&[_]` parameter of this element type, which
+                // it borrows for the whole call.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        std::ptr::with_exposed_provenance::<u8>(parts[0] as usize),
+                        parts[1] as usize * ty.bytes() as usize,
+                    )
+                }
+            })
+            .collect()
+    };
+    let inputs = bytes(input_parts, &description.inputs);
+    let tables: Vec<(&[u8], u64)> =
+        bytes(table_parts, &description.tables).into_iter().zip(table_parts.iter().map(|parts| parts[1])).collect();
+    // Like `zip`, the shortest slice decides how many elements change.
+    let len = input_parts.iter().map(|parts| parts[1] as usize).fold(values.len(), usize::min);
+    if len == 0 || passes == 0 {
+        return Err(Decline::NoWork);
+    }
     // One thread per element, numbered in 32 bits.
-    if u32::try_from(values.len()).is_err() {
+    if u32::try_from(len).is_err() {
         return Err(Decline::TooLong);
     }
     let profile = match (mode, profile()) {
@@ -325,7 +356,7 @@ fn dispatch<T: Element>(
         None => None,
         Some(profile) => {
             let open = matches!(device, Device::Ready(_));
-            let choice = policy.choose(profile, values.len(), passes, key, open);
+            let choice = policy.choose(profile, len, passes, key, open);
             if !choice.uses_gpu() {
                 return Err(Decline::Policy(choice));
             }
@@ -342,30 +373,43 @@ fn dispatch<T: Element>(
         Device::Untried => unreachable!("opened above"),
     };
     let start = Instant::now();
-    run_kernel(memory, values, description, args).map_err(Decline::Failed)?;
+    let committed = run_kernel(memory, values, description, scalars, &inputs, &tables, len).map_err(Decline::Failed)?;
     // The first region after opening also allocates for the first time,
     // which the profile already counts as startup.
     if let (Some(profile), false) = (profile, opening) {
-        let micros = start.elapsed().as_secs_f64() * 1e6;
-        policy.record(profile, values.len(), passes, key, true, micros);
+        let mut micros = start.elapsed().as_secs_f64() * 1e6;
+        if !committed {
+            // The GPU's work was wasted and the CPU runs anyway: count it as
+            // four times as slow, so a kernel that keeps failing goes back to
+            // the CPU.
+            micros *= 4.0;
+        }
+        policy.record(profile, len, passes, key, true, micros);
+    }
+    if !committed {
+        return Err(Decline::CheckFailed);
     }
     Ok(choice)
 }
 
-/// One launch of a described in-place map, committed only if it all works.
+/// One launch of a described in-place map over the first `len` elements,
+/// committed only if it all works and no check failed. Returns whether it
+/// committed.
 fn run_kernel<T: Element>(
     memory: &mut GpuMemory,
     values: &mut [T],
     description: &Description,
-    args: &[u64],
-) -> Result<(), String> {
+    scalars: &[u64],
+    inputs: &[&[u8]],
+    tables: &[(&[u8], u64)],
+    len: usize,
+) -> Result<bool, String> {
     let kernel = memory
         .kernel(&description.ptx, &description.entry)
         .map_err(|e| e.to_string())?;
-    let len = values.len();
-    let mut launch_args = vec![Arg::U64(len as u64)];
-    for (&bits, ty) in args.iter().zip(&description.scalars) {
-        launch_args.push(match ty {
+    let mut scalar_args = Vec::new();
+    for (&bits, ty) in scalars.iter().zip(&description.scalars) {
+        scalar_args.push(match ty {
             Ty::U32 => Arg::U32(bits as u32),
             Ty::I32 => Arg::I32(bits as u32 as i32),
             Ty::U64 => Arg::U64(bits),
@@ -375,12 +419,28 @@ fn run_kernel<T: Element>(
             other => return Err(format!("a {other:?} argument can't be passed")),
         });
     }
+    let mut flag = [0u32];
     let mut job = memory.job().map_err(|e| e.to_string())?;
     let data = job.in_out(values).map_err(|e| e.to_string())?;
-    launch_args.insert(0, Arg::Buffer(data));
+    let flag_buffer = job.in_out(&mut flag).map_err(|e| e.to_string())?;
+    let mut launch_args = vec![Arg::Buffer(data), Arg::U64(len as u64), Arg::Buffer(flag_buffer)];
+    for input in inputs {
+        launch_args.push(Arg::Buffer(job.input(input).map_err(|e| e.to_string())?));
+    }
+    // A repeated kernel's pass count comes before the stages' scalars;
+    // such kernels never index tables.
+    let mut scalar_args = scalar_args.into_iter();
+    if description.repeated {
+        launch_args.extend(scalar_args.next());
+    }
+    for &(table, len) in tables {
+        launch_args.push(Arg::Buffer(job.input(table).map_err(|e| e.to_string())?));
+        launch_args.push(Arg::U64(len));
+    }
+    launch_args.extend(scalar_args);
     job.launch(kernel, Grid::Linear(len as u64), &launch_args)
         .map_err(|e| e.to_string())?;
-    job.finish().map_err(|e| e.to_string())
+    job.finish_unless(flag_buffer).map_err(|e| e.to_string())
 }
 
 /// Opens the GPU; under the policy, only if it is the one profiled.
@@ -433,7 +493,7 @@ mod tests {
     // The mode and profile are read once per process, and test binaries set
     // neither, so this exercises the policy without a profile. The driver's
     // integration tests cover the GPU paths in real rewritten programs.
-    const REPEATED: &str = "cuprite kernel 1\nfunction a::repeat\nentry a__repeat\nelement u32\n\
+    const REPEATED: &str = "cuprite kernel 3\nfunction a::repeat\nentry a__repeat\nelement u32\ninputs\ntables\n\
                             repeated yes\nscalars u32\nptx\n(not reached)";
 
     #[test]

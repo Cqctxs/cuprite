@@ -32,19 +32,32 @@ use std::{
     sync::Mutex,
 };
 
-use cuprite_kernel::{Const, Function, Ty as KTy};
+use cuprite_kernel::{Function, Ty as KTy};
 use rustc_attr_ir::lang_items::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::{
-        AggregateKind, AssertKind, BasicBlock, Body, BorrowKind, Local, Operand, Place, ProjectionElem, Rvalue,
+        AggregateKind, BasicBlock, Body, BorrowKind, Local, Operand, Place, ProjectionElem, Rvalue,
         StatementKind, TerminatorKind, RETURN_PLACE,
     },
     ty::{self, Ty, TyCtxt},
 };
 use rustc_span::def_id::{LocalDefId, LOCAL_CRATE};
 
-use crate::{replace::Passes, translate};
+use crate::{
+    replace::Passes,
+    translate::{self, Lane, Leaf},
+};
+
+/// A map's parameters after the slice it changes.
+#[derive(Default)]
+struct Params {
+    /// Read-only slices of numbers, which the loop may zip with, and their
+    /// element types.
+    slices: HashMap<Local, KTy>,
+    /// The numbers in every other parameter.
+    leaves: Vec<Leaf>,
+}
 
 /// The slice parameter.
 const SLICE: Local = Local::from_u32(1);
@@ -58,10 +71,16 @@ pub(crate) const AUTO_VAR: &str = "CUPRITE_AUTO";
 #[derive(Clone, Debug)]
 pub(crate) struct Map {
     pub(crate) element: KTy,
-    /// Takes the element, then the values of `scalars`.
+    /// Takes the element, then one value of each input, then the numbers
+    /// `scalars` reads (as `Leaf::passed`).
     pub(crate) function: Function,
-    /// The function's parameters after the slice, in order.
-    pub(crate) scalars: Vec<Local>,
+    /// Read-only slice parameters zipped with the slice, and their element
+    /// types.
+    pub(crate) inputs: Vec<(Local, KTy)>,
+    /// Read-only slice parameters the code indexes, and their element types.
+    pub(crate) tables: Vec<(Local, KTy)>,
+    /// Numbers read from the function's other parameters, in order.
+    pub(crate) scalars: Vec<Leaf>,
 }
 
 #[derive(Clone, Debug)]
@@ -69,7 +88,7 @@ pub(crate) enum Verdict {
     /// One pass of a map.
     Candidate(Map),
     /// Maps applied in order, all of that `passes` times, which can stay on
-    /// the GPU throughout. None of them reads scalars.
+    /// the GPU throughout. None of them reads inputs or scalars.
     Repeated(Vec<Map>, Passes),
     Rejected(String),
 }
@@ -176,7 +195,11 @@ fn compose(tcx: TyCtxt<'_>, element: KTy, calls: &[LocalDefId], passes: Passes) 
     let mut stages = Vec::new();
     for &callee in calls {
         match verdict(tcx, callee) {
-            Some(Verdict::Candidate(map)) if map.element == element && map.scalars.is_empty() => stages.push(map),
+            Some(Verdict::Candidate(map))
+                if map.element == element && map.scalars.is_empty() && map.inputs.is_empty() && map.tables.is_empty() =>
+            {
+                stages.push(map)
+            }
             _ => {
                 return Verdict::Rejected(format!(
                     "calls `{}`, which is not a recognized map",
@@ -192,12 +215,27 @@ fn compose(tcx: TyCtxt<'_>, element: KTy, calls: &[LocalDefId], passes: Passes) 
     }
 }
 
-/// Describes a map for the report: "map over `[f32]` reading `scale`".
+/// Describes a map for the report, such as "map over `[f32]` zipped with
+/// `weights` reading `scale`".
 fn describe_map(tcx: TyCtxt<'_>, def_id: LocalDefId, map: &Map) -> String {
     let mut text = format!("map over `[{}]`", map.element.name());
+    let names = |locals: Vec<Local>| -> String {
+        let mut seen = Vec::new();
+        for local in locals {
+            if !seen.contains(&local) {
+                seen.push(local);
+            }
+        }
+        seen.iter().map(|&local| parameter(tcx, def_id, local)).collect::<Vec<_>>().join(", ")
+    };
+    if !map.inputs.is_empty() {
+        text += &format!(" zipped with {}", names(map.inputs.iter().map(|&(local, _)| local).collect()));
+    }
+    if !map.tables.is_empty() {
+        text += &format!(" indexing {}", names(map.tables.iter().map(|&(local, _)| local).collect()));
+    }
     if !map.scalars.is_empty() {
-        let names: Vec<String> = map.scalars.iter().map(|&local| parameter(tcx, def_id, local)).collect();
-        text += &format!(" reading {}", names.join(", "));
+        text += &format!(" reading {}", names(map.scalars.iter().map(|leaf| leaf.param).collect()));
     }
     text
 }
@@ -253,6 +291,10 @@ enum Known {
     IntoIter,
     /// `<[T]>::iter_mut`.
     SliceIterMut,
+    /// `<[T]>::iter`.
+    SliceIter,
+    /// `Iterator::zip`.
+    Zip,
     /// `Iterator::next`.
     Next,
     /// A non-generic, non-trait function of this crate, which a repeated
@@ -285,31 +327,53 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
     }
 
     fn recognize_map(&self) -> Result<Map> {
-        let (element, scalars) = self.check_signature(false)?;
+        let (element, params) = self.check_signature(false)?;
         self.check_parameters_unchanged()?;
         let calls = self.check_effects(false)?;
         let header = self.single_loop(&calls, "is not a single `for` loop over the slice")?;
-        let iterator_chain = self.iterator_chain(header.receiver)?;
+        let not_slice = || "iterates over something other than the slice parameter".to_string();
+        let receiver = Self::operand_local(header.receiver).ok_or_else(not_slice)?;
+        let mut chain = HashSet::new();
+        let mut plumbing = HashSet::from([receiver]);
+        let lane = self.lanes(receiver, &params.slices, &mut chain, &mut plumbing)?;
+        if lane.elements() != 1 {
+            return Err(not_slice());
+        }
+        let mut input_locals = Vec::new();
+        lane.inputs(&mut input_locals);
+        let inputs: Vec<(Local, KTy)> =
+            input_locals.iter().map(|local| (*local, params.slices[local])).collect();
+        // The other slices can be indexed, with bounds checks.
+        let mut tables: Vec<(Local, KTy)> =
+            params.slices.iter().filter(|(local, _)| !input_locals.contains(local)).map(|(&l, &t)| (l, t)).collect();
+        tables.sort_by_key(|&(local, _)| local);
 
-        let constants = self.constants_before_loop();
         let is_header = |block| self.is_header(block, header.next_block);
+        let opaque: Vec<Local> = std::iter::once(SLICE).chain(input_locals.iter().copied()).collect();
         let shape = translate::Loop {
             option: header.option,
             start: header.some,
             is_header: &is_header,
-            constants: &constants,
-            scalars: &scalars,
+            lane: &lane,
+            inputs: &inputs,
+            tables: &tables,
+            leaves: &params.leaves,
+            opaque: &opaque,
+            chain: &chain,
+            plumbing: &plumbing,
         };
         let name = format!("{}::{}", self.tcx.crate_name(LOCAL_CRATE), self.tcx.def_path_str(self.def_id));
         let translated = translate::translate(self.tcx, self.body, &name, element, &shape)?;
-        self.check_rest(&calls, &translated.blocks, &iterator_chain, &header)?;
+        self.check_rest(&calls, &translated.blocks, &chain, &header)?;
         if !translated.stores {
             return Err("does not change the slice".into());
         }
         Ok(Map {
             element,
             function: translated.function,
-            scalars,
+            inputs,
+            tables,
+            scalars: params.leaves,
         })
     }
 
@@ -323,7 +387,7 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
 
         let mut walked = HashSet::new();
         let callees = self.region_calls(header.some, header.next_block, &mut walked)?;
-        self.check_rest(&calls, &walked, &[range_setup], &header)?;
+        self.check_region_rest(&calls, &walked, &[range_setup], &header)?;
         Ok(compose(self.tcx, element, &callees, passes))
     }
 
@@ -378,9 +442,36 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         })
     }
 
-    /// Everything the loop body walk did not visit is the iterator setup,
-    /// the loop header and the exit; none of it may call, compute or write.
+    /// A map: the iterator's calls must all build the loop's iterator, and
+    /// nothing may follow the loop. `translated` holds the setup before the
+    /// loop and the body, which the kernel runs; every other call is part of
+    /// the iterator or the loop header.
     fn check_rest(
+        &self,
+        calls: &[(BasicBlock, Known)],
+        translated: &HashSet<BasicBlock>,
+        chain: &HashSet<BasicBlock>,
+        header: &LoopHeader<'_, 'tcx>,
+    ) -> Result<()> {
+        for &(block, known) in calls {
+            let iterates = matches!(
+                known,
+                Known::IntoIter | Known::SliceIterMut | Known::SliceIter | Known::Zip | Known::Next
+            );
+            if iterates && !chain.contains(&block) && block != header.next_block {
+                return Err("iterates inside the loop body".into());
+            }
+            if !translated.contains(&block) && !chain.contains(&block) && block != header.next_block {
+                return Err(format!("uses `{}` after the loop", self.callee(block)));
+            }
+        }
+        self.check_exit(header.none)
+    }
+
+    /// A region: everything the loop body walk did not visit is the
+    /// iterator setup, the loop header and the exit; none of it may call,
+    /// compute or write.
+    fn check_region_rest(
         &self,
         calls: &[(BasicBlock, Known)],
         walked: &HashSet<BasicBlock>,
@@ -403,10 +494,11 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         self.check_outside_loop(walked, header.after_next, header.next_block, header.none)
     }
 
-    /// `fn(&mut [T], scalars...) -> ()` with `T` a primitive number, or with
+    /// `fn(&mut [T], params...) -> ()` with `T` a primitive number, each
+    /// other parameter a read-only slice of numbers or plain data; or with
     /// `counted`, `fn(&mut [T])` or `fn(&mut [T], u32)`, the second being the
-    /// pass count. Returns `T` and the scalar parameters.
-    fn check_signature(&self, counted: bool) -> Result<(KTy, Vec<Local>)> {
+    /// pass count. Returns `T` and the other parameters.
+    fn check_signature(&self, counted: bool) -> Result<(KTy, Params)> {
         if self.tcx.generics_of(self.def_id).count() != 0 {
             return Err("is generic".into());
         }
@@ -428,21 +520,36 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
                 return Err(format!("takes `{count}` as its pass count, not `u32`"));
             }
         }
-        let scalars: Vec<Local> = if counted { Vec::new() } else { (2..=params).map(Local::from_usize).collect() };
-        for &local in &scalars {
-            let ty = self.body.local_decls[local].ty;
-            if !translate::kernel_ty(ty).is_some_and(|ty| ty.is_passable()) {
-                return Err(format!(
-                    "takes `{ty}` as {}, which a kernel can't take",
-                    parameter(self.tcx, self.def_id, local)
-                ));
+        let mut found = Params::default();
+        if !counted {
+            for local in (2..=params).map(Local::from_usize) {
+                let ty = self.body.local_decls[local].ty;
+                if let Some(element) = Self::slice_element(ty) {
+                    found.slices.insert(local, element);
+                    continue;
+                }
+                let leaves = translate::leaves(self.tcx, local, ty).map_err(|_| {
+                    format!("takes `{ty}` as {}, which a kernel can't take", parameter(self.tcx, self.def_id, local))
+                })?;
+                found.leaves.extend(leaves);
             }
         }
         let output = self.body.local_decls[RETURN_PLACE].ty;
         if !output.is_unit() {
             return Err(format!("returns `{output}`"));
         }
-        Ok((element, scalars))
+        Ok((element, found))
+    }
+
+    /// `T` for `&[T]` with `T` a number.
+    fn slice_element(ty: Ty<'tcx>) -> Option<KTy> {
+        match ty.kind() {
+            ty::Ref(_, inner, ty::Mutability::Not) => match inner.kind() {
+                ty::Slice(element) => translate::kernel_ty(*element).filter(|ty| *ty != KTy::Bool),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// `T` for `&mut [T]` with `T` a number.
@@ -496,10 +603,9 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         Ok(())
     }
 
-    /// Rejects anything that may panic, run a destructor or call unknown
-    /// code; returns the known calls. An assertion is allowed only if it
-    /// provably passes. Calls to functions of this crate are allowed only
-    /// with `allow_local`.
+    /// Rejects anything that may run a destructor or call unknown code;
+    /// returns the known calls. Calls to functions of this crate are
+    /// allowed only with `allow_local`.
     fn check_effects(&self, allow_local: bool) -> Result<Vec<(BasicBlock, Known)>> {
         let mut calls = Vec::new();
         for (block, data) in self.body.basic_blocks.iter_enumerated() {
@@ -528,11 +634,9 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
                     }
                     calls.push((block, known));
                 }
-                TerminatorKind::Assert { msg, .. } => {
-                    if !translate::assert_holds(self.body, block) {
-                        return Err(format!("may panic: {}", describe_assert(msg)));
-                    }
-                }
+                // Checks run on the GPU too; one that fails there sends the
+                // call back to the CPU, which panics as before.
+                TerminatorKind::Assert { .. } => {}
                 TerminatorKind::Drop { .. } => return Err("runs a destructor".into()),
                 TerminatorKind::Goto { .. }
                 | TerminatorKind::SwitchInt { .. }
@@ -561,11 +665,17 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         }
         if let Some(impl_id) = tcx.inherent_impl_of_assoc(def_id) {
             let self_ty = tcx.type_of(impl_id).instantiate_identity().skip_normalization();
-            if tcx.crate_name(impl_id.krate).as_str() == "core"
-                && matches!(self_ty.kind(), ty::Slice(_))
-                && tcx.item_name(def_id).as_str() == "iter_mut"
-            {
-                return Ok(Known::SliceIterMut);
+            if tcx.crate_name(impl_id.krate).as_str() == "core" && matches!(self_ty.kind(), ty::Slice(_)) {
+                match tcx.item_name(def_id).as_str() {
+                    "iter_mut" => return Ok(Known::SliceIterMut),
+                    "iter" => return Ok(Known::SliceIter),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(trait_id) = tcx.trait_of_assoc(def_id) {
+            if tcx.is_lang_item(trait_id, LangItem::Iterator) && tcx.item_name(def_id).as_str() == "zip" {
+                return Ok(Known::Zip);
             }
         }
         // Trait methods are excluded: the call names the trait's item, and
@@ -626,8 +736,14 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
     /// Follows moves, copies and reborrows back to a parameter or a call.
     /// Parameters are never reassigned (`check_parameters_unchanged`), so
     /// `Param` is the value passed in.
-    fn origin(&self, mut local: Local) -> Option<Origin> {
+    fn origin(&self, local: Local) -> Option<Origin> {
+        self.origin_through(local, &mut HashSet::new())
+    }
+
+    /// `origin`, recording every local passed through in `through`.
+    fn origin_through(&self, mut local: Local, through: &mut HashSet<Local>) -> Option<Origin> {
         for _ in 0..self.body.local_decls.len() {
+            through.insert(local);
             if self.is_parameter(local) {
                 return Some(Origin::Param(local));
             }
@@ -661,36 +777,82 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         }
     }
 
-    /// Checks that `next`'s receiver is an iterator over the slice
-    /// parameter, made by `into_iter` on `&mut [u32]` or by `iter_mut`.
-    /// Returns the blocks of those constructor calls.
-    fn iterator_chain(&self, receiver: &Operand<'tcx>) -> Result<Vec<BasicBlock>> {
+    /// What an iterator yields, from the calls that built it: `into_iter`
+    /// or `iter_mut` on the slice parameter, `iter` or a plain `&[T]` on an
+    /// input slice parameter, and `zip`. Records the calls' blocks in
+    /// `chain` and every local the iterator passes through in `plumbing`.
+    fn lanes(
+        &self,
+        iterator: Local,
+        slices: &HashMap<Local, KTy>,
+        chain: &mut HashSet<BasicBlock>,
+        plumbing: &mut HashSet<Local>,
+    ) -> Result<Lane> {
         let not_slice = || "iterates over something other than the slice parameter".to_string();
-        let mut chain = Vec::new();
-        let mut current = Self::operand_local(receiver).ok_or_else(not_slice)?;
-        loop {
-            let Some(Origin::Call(block)) = self.origin(current) else {
-                return Err(not_slice());
-            };
-            let TerminatorKind::Call { func, args, .. } =
-                &self.body.basic_blocks[block].terminator().kind
-            else {
-                return Err(not_slice());
-            };
-            chain.push(block);
-            let source = Self::operand_local(&args[0].node).ok_or_else(not_slice)?;
-            match (
-                self.classify(func)?,
-                self.origin(source).ok_or_else(not_slice)?,
-            ) {
-                (Known::IntoIter | Known::SliceIterMut, Origin::Param(SLICE)) => {
-                    return Ok(chain);
+        let Some(Origin::Call(block)) = self.origin_through(iterator, plumbing) else {
+            return Err(not_slice());
+        };
+        let TerminatorKind::Call { func, args, destination, .. } = &self.body.basic_blocks[block].terminator().kind
+        else {
+            return Err(not_slice());
+        };
+        chain.insert(block);
+        plumbing.insert(destination.local);
+        let argument = |index: usize| args.get(index).and_then(|arg| Self::operand_local(&arg.node)).ok_or_else(not_slice);
+        match self.classify(func)? {
+            known @ (Known::IntoIter | Known::SliceIterMut) => {
+                let source = argument(0)?;
+                match self.origin_through(source, plumbing) {
+                    Some(Origin::Param(SLICE)) => Ok(Lane::Element),
+                    // The `for` loop's identity `into_iter` on an iterator.
+                    Some(Origin::Call(_)) if known == Known::IntoIter => self.lanes(source, slices, chain, plumbing),
+                    _ => Err(not_slice()),
                 }
-                // `iter_mut()` followed by the `for` loop's identity
-                // `into_iter`.
-                (Known::IntoIter, Origin::Call(_)) if chain.len() == 1 => current = source,
-                _ => return Err(not_slice()),
             }
+            // An input slice's `iter()`, which may lead a `zip`.
+            Known::SliceIter => match self.origin_through(argument(0)?, plumbing) {
+                Some(Origin::Param(param)) if slices.contains_key(&param) => Ok(Lane::Input(param)),
+                _ => Err(not_slice()),
+            },
+            Known::Zip => {
+                let first = self.lanes(argument(0)?, slices, chain, plumbing)?;
+                let second = self.zipped(argument(1)?, slices, chain, plumbing)?;
+                Ok(Lane::Pair(Box::new(first), Box::new(second)))
+            }
+            _ => Err(not_slice()),
+        }
+    }
+
+    /// What `zip` pairs with: an input slice, as `&[T]` or `.iter()`, or
+    /// another iterator.
+    fn zipped(
+        &self,
+        source: Local,
+        slices: &HashMap<Local, KTy>,
+        chain: &mut HashSet<BasicBlock>,
+        plumbing: &mut HashSet<Local>,
+    ) -> Result<Lane> {
+        match self.origin_through(source, plumbing) {
+            Some(Origin::Param(param)) if slices.contains_key(&param) => Ok(Lane::Input(param)),
+            Some(Origin::Call(block)) => {
+                let TerminatorKind::Call { func, args, destination, .. } =
+                    &self.body.basic_blocks[block].terminator().kind
+                else {
+                    unreachable!("an origin call is a call");
+                };
+                if self.classify(func)? == Known::SliceIter {
+                    let receiver = args.first().and_then(|arg| Self::operand_local(&arg.node));
+                    if let Some(Origin::Param(param)) = receiver.and_then(|r| self.origin_through(r, plumbing)) {
+                        if slices.contains_key(&param) {
+                            chain.insert(block);
+                            plumbing.insert(destination.local);
+                            return Ok(Lane::Input(param));
+                        }
+                    }
+                }
+                self.lanes(source, slices, chain, plumbing)
+            }
+            _ => Err("zips with something other than a read-only slice parameter".into()),
         }
     }
 
@@ -864,38 +1026,6 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         }
     }
 
-    /// Locals assigned once, from a scalar constant, and never borrowed.
-    fn constants_before_loop(&self) -> HashMap<Local, Const> {
-        let mut assigned: HashMap<Local, Vec<&Rvalue<'tcx>>> = HashMap::new();
-        let mut borrowed = HashSet::new();
-        for data in self.body.basic_blocks.iter() {
-            for statement in &data.statements {
-                if let StatementKind::Assign(assign) = &statement.kind {
-                    if let Some(local) = assign.0.as_local() {
-                        assigned.entry(local).or_default().push(&assign.1);
-                    }
-                    if let Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) = &assign.1 {
-                        borrowed.insert(place.local);
-                    }
-                }
-            }
-            if let TerminatorKind::Call { destination, .. } = &data.terminator().kind {
-                if let Some(local) = destination.as_local() {
-                    assigned.entry(local).or_default().clear();
-                    borrowed.insert(local); // Never a constant.
-                }
-            }
-        }
-        assigned
-            .into_iter()
-            .filter(|(local, _)| !borrowed.contains(local))
-            .filter_map(|(local, rvalues)| match rvalues.as_slice() {
-                [Rvalue::Use(Operand::Constant(constant), _)] => Some((local, translate::constant(self.tcx, constant)?)),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// The setup before the loop and the exit after it may only move
     /// values between locals: no writes through references and no branches
     /// other than the loop's own.
@@ -930,10 +1060,22 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
                 _ => {}
             }
         }
-        // The exit must return without doing anything else.
+        self.check_exit(exit)
+    }
+
+    /// The exit must return without doing anything else: the GPU path
+    /// skips it.
+    fn check_exit(&self, exit: BasicBlock) -> Result<()> {
         let mut block = exit;
         for _ in 0..self.body.basic_blocks.len() {
-            match self.body.basic_blocks[block].terminator().kind {
+            let data = &self.body.basic_blocks[block];
+            let writes = data.statements.iter().any(|statement| {
+                matches!(&statement.kind, StatementKind::Assign(assign) if assign.0.is_indirect())
+            });
+            if writes {
+                break;
+            }
+            match data.terminator().kind {
                 TerminatorKind::Return => return Ok(()),
                 TerminatorKind::Goto { target, .. }
                 | TerminatorKind::FalseEdge {
@@ -975,17 +1117,6 @@ fn integer_constant(constant: &rustc_middle::mir::ConstOperand<'_>) -> Option<i1
         ty::Int(_) => Some(scalar.to_int(scalar.size())),
         ty::Uint(_) => i128::try_from(scalar.to_uint(scalar.size())).ok(),
         _ => None,
-    }
-}
-
-fn describe_assert<O>(msg: &AssertKind<O>) -> String {
-    match msg {
-        AssertKind::BoundsCheck { .. } => "index out of bounds".into(),
-        AssertKind::Overflow(op, ..) => format!("`{op:?}` can overflow"),
-        AssertKind::OverflowNeg(_) => "negation can overflow".into(),
-        AssertKind::DivisionByZero(_) => "division by zero".into(),
-        AssertKind::RemainderByZero(_) => "remainder by zero".into(),
-        _ => "an assertion".into(),
     }
 }
 

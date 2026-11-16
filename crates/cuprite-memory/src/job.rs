@@ -93,6 +93,17 @@ impl<'a> Job<'a> {
     pub fn finish(self) -> Result<(), MemoryError> {
         self.inner.finish()
     }
+
+    /// Like [`Job::finish`], but commits nothing if `flag`, an output or
+    /// in-out buffer of this job, holds any nonzero byte once the job is
+    /// done: a kernel uses it to report that its results must not be used.
+    /// Returns whether the results were committed.
+    ///
+    /// # Errors
+    /// As [`Job::finish`], and if `flag` isn't an output of this job.
+    pub fn finish_unless(self, flag: Buffer) -> Result<bool, MemoryError> {
+        self.inner.finish_unless(flag)
+    }
 }
 
 /// Storage one buffer owns. Keeping it together means cleanup moves one
@@ -337,7 +348,21 @@ impl<'a, B: MemoryBackend> JobCore<'a, B> {
     /// Every buffer to commit is downloaded into staging, and only once all
     /// downloads have completed is staging copied into the CPU slices. A
     /// failure before that leaves every CPU slice unchanged.
-    pub(crate) fn finish(mut self) -> Result<(), MemoryError> {
+    pub(crate) fn finish(self) -> Result<(), MemoryError> {
+        self.complete(None).map(|_| ())
+    }
+
+    pub(crate) fn finish_unless(self, flag: Buffer) -> Result<bool, MemoryError> {
+        let output = self.slots.get(flag.index).is_some_and(|slot| matches!(slot.host, Host::Output(_) | Host::InOut(_)));
+        if flag.job != self.id || !output {
+            return Err(MemoryError::Launch("the flag isn't an output of this job".into()));
+        }
+        self.complete(Some(flag.index))
+    }
+
+    /// Downloads and commits, unless the slot `veto` downloaded a nonzero
+    /// byte. Returns whether it committed.
+    fn complete(mut self, veto: Option<usize>) -> Result<bool, MemoryError> {
         if self.failed {
             // `Drop` discards the device copies after waiting for queued work.
             return Err(MemoryError::Launch(
@@ -380,14 +405,19 @@ impl<'a, B: MemoryBackend> JobCore<'a, B> {
         stats.downloads += downloads;
         stats.downloaded_bytes += downloaded_bytes;
 
+        // A flag the kernels never wrote is still zero.
+        let vetoed = veto.is_some_and(|index| {
+            let slot = &slots[index];
+            slot.downloads() && slot.storage.staging.iter().any(|&byte| byte != 0)
+        });
         for slot in slots {
             let downloads = slot.downloads();
-            if let (Host::Output(host) | Host::InOut(host), true) = (slot.host, downloads) {
+            if let (Host::Output(host) | Host::InOut(host), true, false) = (slot.host, downloads, vetoed) {
                 host.copy_from_slice(&slot.storage.staging);
             }
             self.manager.recycle(slot.storage);
         }
-        Ok(())
+        Ok(!vetoed)
     }
 }
 
@@ -587,6 +617,53 @@ mod tests {
         assert_eq!(manager.stats().downloads, 0);
         // The second wait succeeded, so nothing is quarantined.
         assert!(!manager.poisoned);
+    }
+
+    /// A nonzero flag keeps every result from the CPU slices; a zero one
+    /// commits them all, the flag included.
+    #[test]
+    fn a_raised_flag_discards_the_results() {
+        for raised in [0u32, 7] {
+            let mut manager = fake_manager();
+            let mut data = [1u32, 2];
+            let mut flag = [0u32];
+            let source = [raised];
+            let mut job = manager.job().unwrap();
+            let d = job.in_out(&mut data).unwrap();
+            let f = job.output(&mut flag).unwrap();
+            let s = job.input(&source).unwrap();
+            add_one(&mut job, d);
+            copy(&mut job, s, f);
+            let committed = job.finish_unless(f).unwrap();
+            assert_eq!(committed, raised == 0);
+            if raised == 0 {
+                assert_eq!((data, flag), ([2, 3], [0]));
+            } else {
+                assert_eq!((data, flag), ([1, 2], [0]));
+            }
+            // The manager stays usable, and the storage was pooled.
+            assert!(!manager.poisoned);
+            assert!(manager.job().unwrap().finish().is_ok());
+        }
+    }
+
+    /// A flag no kernel wrote is zero, and only an output can be a flag.
+    #[test]
+    fn flags_are_outputs_of_the_job() {
+        let mut manager = fake_manager();
+        let mut data = [1u32];
+        let mut flag = [0u32];
+        let mut job = manager.job().unwrap();
+        let d = job.in_out(&mut data).unwrap();
+        let f = job.output(&mut flag).unwrap();
+        add_one(&mut job, d);
+        assert!(job.finish_unless(f).unwrap());
+        assert_eq!(data, [2]);
+
+        let input = [0u32];
+        let mut job = manager.job().unwrap();
+        let i = job.input(&input).unwrap();
+        assert!(matches!(job.finish_unless(i), Err(MemoryError::Launch(_))));
     }
 
     /// The budget covers all of a job's buffers and is checked before
