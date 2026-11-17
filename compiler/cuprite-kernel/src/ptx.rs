@@ -196,6 +196,13 @@ impl<'k> Emitter<'k> {
             Rvalue::Binary(op, a, b) => self.binary(d, ty, *op, *a, *b),
             Rvalue::Unary(op, a) => self.unary(d, ty, *op, *a),
             Rvalue::Cast(a, to) => self.cast(d, *a, *to),
+            // Between integers of one width, `as` keeps the bits too; a
+            // float and an integer of one width share a register size.
+            Rvalue::Reinterpret(a, to) if self.ty(*a).is_int() && to.is_int() => self.cast(d, *a, *to),
+            Rvalue::Reinterpret(a, to) => {
+                let a = self.operand(*a);
+                self.line(format!("mov.b{} {d}, {a}", to.bits()));
+            }
             Rvalue::Call(intrinsic, args) => self.call(d, ty, *intrinsic, args),
             Rvalue::Load(pointer, loaded) => {
                 let pointer = self.operand(*pointer);

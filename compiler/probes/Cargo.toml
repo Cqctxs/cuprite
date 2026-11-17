@@ -23,3 +23,11 @@ palette = { version = "=0.7.7", default-features = false, features = ["std"] }
 # two more authors, used only after the error flag was built.
 strength_reduce = "=0.2.4"
 num-integer = "=0.1.47"
+# Held out for maps, calls, closures and checks: half-precision floats and a
+# pure-Rust math library, by two more authors, used only after closures and
+# `for_each` were built.
+half = "=2.7.1"
+libm = "=0.2.16"
+# Development code for the grid structure: procedural noise, whose
+# generators the grid measurement (`measure/`) ported.
+noise = "=0.9.0"

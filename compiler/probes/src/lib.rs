@@ -894,6 +894,264 @@ pub fn each_then_more(values: &mut [u32]) {
     }
 }
 
+// Held-out validation for maps, calls, closures and checks: `half` and
+// `libm`, written after closures and `for_each` were finished, with no
+// changes to them, as a user of each crate would write them.
+
+/// Rounds each value to half precision and back.
+pub fn half_round_trip(values: &mut [f32]) {
+    for value in values {
+        *value = half::f16::from_f32(*value).to_f32();
+    }
+}
+
+/// Encodes floats as half-precision bits.
+pub fn half_encode(bits: &mut [u16], values: &[f32]) {
+    for (bits, value) in bits.iter_mut().zip(values) {
+        *bits = half::f16::from_f32(*value).to_bits();
+    }
+}
+
+/// Decodes half-precision bits.
+pub fn half_decode(values: &mut [f32], bits: &[u16]) {
+    values.iter_mut().zip(bits).for_each(|(value, bits)| *value = half::f16::from_bits(*bits).to_f32());
+}
+
+/// Scales half-precision values stored as bits.
+pub fn half_scale(bits: &mut [u16], scale: f32) {
+    for bits in bits {
+        let value = half::f16::from_bits(*bits).to_f32() * scale;
+        *bits = half::f16::from_f32(value).to_bits();
+    }
+}
+
+/// Rounds each value to bfloat16 and back.
+pub fn bf16_round_trip(values: &mut [f32]) {
+    for value in values {
+        *value = half::bf16::from_f32(*value).to_f32();
+    }
+}
+
+pub fn libm_sin(values: &mut [f32]) {
+    for value in values {
+        *value = libm::sinf(*value);
+    }
+}
+
+pub fn libm_exp(values: &mut [f64]) {
+    values.iter_mut().for_each(|value| *value = libm::exp(*value));
+}
+
+pub fn libm_pow(values: &mut [f32], exponent: f32) {
+    for value in values {
+        *value = libm::powf(*value, exponent);
+    }
+}
+
+/// The angle of each point, with `values` holding the `y` coordinates.
+pub fn libm_atan2(values: &mut [f32], x: &[f32]) {
+    for (y, x) in values.iter_mut().zip(x) {
+        *y = libm::atan2f(*y, *x);
+    }
+}
+
+pub fn libm_cbrt(values: &mut [f64]) {
+    for value in values {
+        *value = libm::cbrt(*value);
+    }
+}
+
+// Arrays and bit reinterpretation (code generation): arrays as parameters,
+// locals and constants, indexed by constants and at run time, `[x; N]`,
+// slice patterns, `to_bits`, `from_bits`, byte conversions and transmutes.
+
+/// A polynomial whose coefficients are an array parameter, by Horner's
+/// rule with a run-time index.
+pub fn array_poly(values: &mut [f32], coeffs: [f32; 4]) {
+    for value in values {
+        let x = *value;
+        let mut acc = 0.0;
+        let mut i = coeffs.len();
+        while i > 0 {
+            i -= 1;
+            acc = acc * x + coeffs[i];
+        }
+        *value = acc;
+    }
+}
+
+/// An element's bytes reversed, through `to_le_bytes` and `from_le_bytes`.
+pub fn array_bytes(values: &mut [u32]) {
+    for value in values {
+        let b = value.to_le_bytes();
+        *value = u32::from_le_bytes([b[3], b[2], b[1], b[0]]);
+    }
+}
+
+/// Counts of an element's 3-bit groups in a local `[0; 8]`, written and
+/// read at run-time indices, then mixed. (`while`, since an inner `for`
+/// loop needs `Option`, an enum.)
+pub fn array_histogram(values: &mut [u32]) {
+    for value in values {
+        let mut counts = [0u32; 8];
+        let mut k = 0;
+        while k < 10 {
+            counts[((*value >> (3 * k)) & 7) as usize] += 1;
+            k += 1;
+        }
+        let mut mix = 0u32;
+        let mut i = 0;
+        while i < counts.len() {
+            mix = mix.wrapping_mul(31).wrapping_add(counts[i]);
+            i += 1;
+        }
+        *value = mix;
+    }
+}
+
+const NIBBLE_ONES: [u8; 16] = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
+
+/// A constant table indexed at run time: the low byte's ones replace it.
+pub fn array_const_table(values: &mut [u32]) {
+    for value in values {
+        let x = *value;
+        let ones = NIBBLE_ONES[(x & 15) as usize] + NIBBLE_ONES[((x >> 4) & 15) as usize];
+        *value = u32::from(ones) | (x & !0xFF);
+    }
+}
+
+/// A 2×2 matrix parameter, indexed by constants and by the element's bits.
+pub fn array_matrix(values: &mut [u32], m: [[u32; 2]; 2]) {
+    for value in values {
+        let x = *value;
+        let picked = m[(x & 1) as usize][((x >> 1) & 1) as usize];
+        *value = picked.wrapping_mul(m[0][1]).wrapping_add(x ^ m[1][0]);
+    }
+}
+
+const GRADIENTS: [(f32, f32); 4] = [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)];
+
+/// A constant table of pairs, chosen by the element's low bits.
+pub fn array_gradients(values: &mut [f32]) {
+    for value in values {
+        let (gx, gy) = GRADIENTS[(value.to_bits() & 3) as usize];
+        *value = gx * *value + gy * 0.5;
+    }
+}
+
+/// Slice patterns: an array's first and last elements and the middle, and
+/// the rest of it as a slice.
+pub fn array_patterns(values: &mut [u32]) {
+    for value in values {
+        let parts = [*value as u8, (*value >> 8) as u8, (*value >> 16) as u8, (*value >> 24) as u8];
+        let [first, middle @ .., last] = parts;
+        let whole: &[u8] = &parts;
+        let rest = match whole {
+            [_, tail @ ..] => tail.len() as u32,
+            [] => 0,
+        };
+        *value = u32::from(first) << 24 | u32::from(middle[0] ^ middle[1]) << 8 | rest << 16 | u32::from(last);
+    }
+}
+
+/// An array indexed by a parameter, whose bounds check fails from 4 on.
+pub fn array_lookup(values: &mut [u32], index: usize) {
+    for value in values {
+        let parts = [*value, *value >> 8, *value >> 16, *value >> 24];
+        *value = parts[index] ^ parts[(*value & 3) as usize];
+    }
+}
+
+/// A float's bits: the sign cleared, through `from_bits` and `to_bits`,
+/// keeping NaN payloads, and the old sign in the low bit.
+pub fn float_bits(values: &mut [u32]) {
+    for value in values {
+        let x = f32::from_bits(*value);
+        *value = x.abs().to_bits() ^ u32::from(x.is_sign_negative());
+    }
+}
+
+/// Doubles a finite, normal `f64` by adding one to its exponent bits.
+pub fn float_exponent(values: &mut [f64]) {
+    for value in values {
+        let bits = value.to_bits();
+        let exponent = (bits >> 52) & 0x7FF;
+        if exponent != 0 && exponent < 0x7FE {
+            *value = f64::from_bits(bits + (1 << 52));
+        }
+    }
+}
+
+/// An element transmuted to its halves and back, swapped.
+pub fn transmute_halves(values: &mut [u32]) {
+    for value in values {
+        // SAFETY: both are 4 bytes of plain integers.
+        let halves: [u16; 2] = unsafe { core::mem::transmute(*value) };
+        // SAFETY: as above.
+        *value = unsafe { core::mem::transmute::<[u16; 2], u32>([halves[1], halves[0]]) };
+    }
+}
+
+/// Mixed widths and a float, without padding.
+#[repr(C)]
+pub struct Mixed {
+    pub a: u8,
+    pub b: u8,
+    pub c: u16,
+    pub d: f32,
+}
+
+/// An element transmuted to a struct of mixed fields and back, changed.
+pub fn transmute_struct(values: &mut [u64]) {
+    for value in values {
+        // SAFETY: `Mixed` is 8 bytes of plain data, any bits valid.
+        let mixed: Mixed = unsafe { core::mem::transmute(*value) };
+        let changed = Mixed { a: mixed.b, b: mixed.a, c: mixed.c.rotate_left(4), d: mixed.d.abs() };
+        // SAFETY: as above.
+        *value = unsafe { core::mem::transmute::<Mixed, u64>(changed) };
+    }
+}
+
+// Development code for the grid structure: `noise`, whose generators the
+// grid measurement ported. Run before the grid shape exists, as a baseline.
+
+/// A grid of Perlin noise, row-major, `width` values per row.
+pub fn noise_grid(values: &mut [f32], width: usize, scale: f64) {
+    use noise::NoiseFn;
+    let perlin = noise::Perlin::new(7);
+    for (i, value) in values.iter_mut().enumerate() {
+        let (x, y) = (i % width, i / width);
+        *value = perlin.get([x as f64 * scale, y as f64 * scale]) as f32;
+    }
+}
+
+/// The same with Rayon, as a user wanting speed would write it.
+pub fn noise_grid_rayon(values: &mut [f32], width: usize, scale: f64) {
+    use noise::NoiseFn;
+    let perlin = noise::Perlin::new(7);
+    values.par_iter_mut().enumerate().for_each(|(i, value)| {
+        let (x, y) = (i % width, i / width);
+        *value = perlin.get([x as f64 * scale, y as f64 * scale]) as f32;
+    });
+}
+
+/// Noise along a row, at the `x` coordinates the slice holds.
+pub fn noise_row(values: &mut [f32], y: f64) {
+    use noise::NoiseFn;
+    let perlin = noise::Perlin::new(7);
+    for value in values {
+        *value = perlin.get([f64::from(*value), y]) as f32;
+    }
+}
+
+/// Fractal noise from a generator the caller built.
+pub fn noise_fbm(values: &mut [f64], fbm: &noise::Fbm<noise::Perlin>) {
+    use noise::NoiseFn;
+    for value in values {
+        *value = fbm.get([*value, 0.5, 0.25]);
+    }
+}
+
 /// Number of calls `counted` has made, for tests.
 pub fn counted_calls() -> u32 {
     CALLS.load(Ordering::Relaxed)

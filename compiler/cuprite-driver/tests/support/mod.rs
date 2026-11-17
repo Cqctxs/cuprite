@@ -11,9 +11,10 @@ use std::{
 
 /// Every variable the driver or runtime reads, cleared before each build or
 /// run so a developer's shell cannot change a test.
-pub const CUPRITE_VARS: [&str; 11] = [
+pub const CUPRITE_VARS: [&str; 12] = [
     "CUPRITE_DUMP_MIR",
     "CUPRITE_CENSUS",
+    "CUPRITE_COVERAGE",
     "CUPRITE_REPORT",
     "CUPRITE_AUTO",
     "CUPRITE_REPLACE",

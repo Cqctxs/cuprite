@@ -35,6 +35,7 @@ extern crate rustc_span;
 
 mod analyze;
 mod census;
+mod coverage;
 mod dump;
 mod replace;
 mod translate;
@@ -54,9 +55,10 @@ use rustc_session::{config::ErrorOutputType, EarlyDiagCtxt};
 use rustc_span::{def_id::LocalDefId, Symbol};
 
 /// Every setting the driver reads, recorded as build inputs.
-const TRACKED: [&str; 7] = [
+const TRACKED: [&str; 8] = [
     dump::VAR,
     census::VAR,
+    coverage::VAR,
     analyze::REPORT_VAR,
     analyze::AUTO_VAR,
     replace::VAR,
@@ -72,6 +74,7 @@ pub(crate) struct Settings {
     pub(crate) dump: Option<PathBuf>,
     pub(crate) report: Option<PathBuf>,
     pub(crate) census: Option<PathBuf>,
+    pub(crate) coverage: Option<PathBuf>,
     pub(crate) auto: bool,
     pub(crate) replacements: Vec<replace::Replacement>,
     /// Files this crate is rebuilt after: the driver itself, whose rules
@@ -87,6 +90,7 @@ impl Settings {
     fn active(&self) -> bool {
         self.dump.is_some()
             || self.census.is_some()
+            || self.coverage.is_some()
             || self.analyzes()
             || !self.replacements.is_empty()
     }
@@ -164,6 +168,9 @@ impl Callbacks for Driver {
         }
         if let Some(dir) = &settings.census {
             census::write(tcx, dir);
+        }
+        if let Some(dir) = &settings.coverage {
+            coverage::write_census(tcx, dir);
         }
         Compilation::Continue
     }
@@ -256,6 +263,7 @@ fn read_settings(early_dcx: &EarlyDiagCtxt, inputs: Vec<String>) -> Settings {
         dump: env::var_os(dump::VAR).map(PathBuf::from),
         report: env::var_os(analyze::REPORT_VAR).map(PathBuf::from),
         census: env::var_os(census::VAR).map(PathBuf::from),
+        coverage: env::var_os(coverage::VAR).map(PathBuf::from),
         auto: env::var_os(analyze::AUTO_VAR).is_some_and(|value| value == "1"),
         replacements,
         inputs,
@@ -287,7 +295,7 @@ fn main() -> ExitCode {
                 inputs.push(utf8(&early_dcx, driver));
             }
             let settings = read_settings(&early_dcx, inputs);
-            if settings.analyzes() {
+            if settings.analyzes() || settings.coverage.is_some() {
                 encode_all_mir(&mut args);
             }
             settings

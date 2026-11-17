@@ -354,6 +354,31 @@ fn casts_match_rust_as() {
         1e-310, 0.1]);
 }
 
+/// Floats to integers of their width and back, keeping every bit: NaN
+/// payloads, both zeros, subnormals.
+#[test]
+fn reinterpreting_keeps_bits() {
+    let f32_bits = [0u32, 0x8000_0000, 1, 0x8000_0001, 0x007F_FFFF, 0x3F80_0000, 0x7F80_0000, 0xFF80_0000,
+        0x7F80_0001, 0x7FC0_0000, 0xFFC0_1234, 0x7FBF_FFFF, u32::MAX];
+    let f32s: Vec<f32> = f32_bits.iter().map(|&b| f32::from_bits(b)).collect();
+    let i32s: Vec<i32> = f32_bits.iter().map(|&b| b as i32).collect();
+    unary("f32_to_bits", &f32s, |b, x| b.reinterpret(x, Ty::U32), f32::to_bits, Freedom::None);
+    unary("f32_to_i32_bits", &f32s, |b, x| b.reinterpret(x, Ty::I32), |x: f32| x.to_bits() as i32, Freedom::None);
+    unary("f32_from_bits", &f32_bits, |b, x| b.reinterpret(x, Ty::F32), f32::from_bits, Freedom::None);
+    unary("f32_from_i32_bits", &i32s, |b, x| b.reinterpret(x, Ty::F32), |x: i32| f32::from_bits(x as u32), Freedom::None);
+    unary("i32_as_u32_bits", &i32s, |b, x| b.reinterpret(x, Ty::U32), |x: i32| x as u32, Freedom::None);
+    let f64_bits = [0u64, 1 << 63, 1, 0x000F_FFFF_FFFF_FFFF, 0x3FF0_0000_0000_0000, 0x7FF0_0000_0000_0000,
+        0xFFF0_0000_0000_0000, 0x7FF0_0000_0000_0001, 0x7FF8_0000_0000_0000, 0xFFF8_0000_DEAD_BEEF, u64::MAX];
+    let f64s: Vec<f64> = f64_bits.iter().map(|&b| f64::from_bits(b)).collect();
+    let i64s: Vec<i64> = f64_bits.iter().map(|&b| b as i64).collect();
+    unary("f64_to_bits", &f64s, |b, x| b.reinterpret(x, Ty::U64), f64::to_bits, Freedom::None);
+    unary("f64_to_i64_bits", &f64s, |b, x| b.reinterpret(x, Ty::I64), |x: f64| x.to_bits() as i64, Freedom::None);
+    unary("f64_from_bits", &f64_bits, |b, x| b.reinterpret(x, Ty::F64), f64::from_bits, Freedom::None);
+    unary("f64_from_i64_bits", &i64s, |b, x| b.reinterpret(x, Ty::F64), |x: i64| f64::from_bits(x as u64), Freedom::None);
+    let i8s = [0i8, 1, -1, 127, -128];
+    unary("i8_as_u8_bits", &i8s, |b, x| b.reinterpret(x, Ty::U8), |x: i8| x as u8, Freedom::None);
+}
+
 /// `bool` operations, casts to integers, stores, and selects.
 #[test]
 fn booleans_and_selects_match() {

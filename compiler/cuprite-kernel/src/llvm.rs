@@ -152,6 +152,15 @@ impl Emitter<'_> {
                 }
             }
             Rvalue::Cast(a, to) => self.cast(*a, *to),
+            Rvalue::Reinterpret(a, to) => {
+                let from = self.ty(*a);
+                let x = self.operand(*a);
+                if lt(from) == lt(*to) {
+                    x
+                } else {
+                    self.value(format!("bitcast {} {x} to {}", lt(from), lt(*to)))
+                }
+            }
             Rvalue::Call(intrinsic, args) => self.call(ty, *intrinsic, args),
             Rvalue::Load(pointer, loaded) => {
                 let pointer = self.operand(*pointer);

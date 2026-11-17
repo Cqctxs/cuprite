@@ -365,7 +365,12 @@ impl<'tcx> Prologue<'_, 'tcx> {
         }
         for &index in &leaf.fields {
             let field = translate::fields_of(tcx, ty).expect("the recognizer walked these fields")[index];
-            projection.push(ProjectionElem::Field(FieldIdx::from_usize(index), field));
+            // An array's elements are indexed, the others' fields named.
+            projection.push(if matches!(ty.kind(), ty::Array(..)) {
+                ProjectionElem::ConstantIndex { offset: index as u64, min_length: index as u64 + 1, from_end: false }
+            } else {
+                ProjectionElem::Field(FieldIdx::from_usize(index), field)
+            });
             ty = field;
         }
         let place = Place::from(leaf.param).project_deeper(&projection, tcx);

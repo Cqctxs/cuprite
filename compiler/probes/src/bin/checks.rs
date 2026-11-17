@@ -238,6 +238,17 @@ fn main() {
         }));
     }
 
+    // An array's bounds check, with an index from a parameter.
+    for (name, index) in [("array_lookup", 2usize), ("array_lookup, out of bounds", 5)] {
+        count(check(name, &spread, |v| probes::array_lookup(v, index), |v| {
+            for value in v {
+                let x = *value;
+                let parts = [x, x >> 8, x >> 16, x >> 24];
+                *value = parts[index] ^ parts[(x & 3) as usize];
+            }
+        }));
+    }
+
     // `palette`'s `mix`, which clamps its factor.
     count(check("palette_mix", &floats, |v| probes::palette_mix(v, 0.9, 0.1, 0.5), |v| {
         use palette::Mix;

@@ -24,6 +24,9 @@
 //! - **Casts** are Rust's `as`: integers truncate or extend by the source's
 //!   signedness; integers round to the nearest float; floats saturate to
 //!   integers, with NaN becoming 0; `bool` becomes 0 or 1.
+//! - **Reinterpreting** keeps the bits and changes the type, between
+//!   integers and floats of one width, like `f32::to_bits`; NaN payloads
+//!   are kept.
 //! - **Pointers** are 64-bit addresses of global memory. A buffer argument
 //!   is one; [`Rvalue::Offset`] steps through it.
 
@@ -263,6 +266,9 @@ pub enum Rvalue {
     Unary(UnOp, Operand),
     /// Rust's `as` to the given type.
     Cast(Operand, Ty),
+    /// The same bits as the given type, an integer or float of the
+    /// operand's width: `f32::to_bits`, `f64::from_bits`.
+    Reinterpret(Operand, Ty),
     Call(Intrinsic, Vec<Operand>),
     /// The value of the given type at an address.
     Load(Operand, Ty),
@@ -372,6 +378,15 @@ impl Kernel {
                     Ok(*to)
                 } else {
                     fail(format!("cast from {from:?} to {to:?}"))
+                }
+            }
+            Rvalue::Reinterpret(a, to) => {
+                let from = ty(a);
+                let plain = |t: Ty| t.is_int() || t.is_float();
+                if plain(from) && plain(*to) && from.bits() == to.bits() {
+                    Ok(*to)
+                } else {
+                    fail(format!("reinterpreting {from:?} as {to:?}"))
                 }
             }
             Rvalue::Call(intrinsic, args) => {
@@ -488,7 +503,9 @@ impl Kernel {
 /// The operands an rvalue reads.
 pub fn rvalue_operands(rvalue: &Rvalue) -> Vec<Operand> {
     match rvalue {
-        Rvalue::Use(o) | Rvalue::Unary(_, o) | Rvalue::Cast(o, _) | Rvalue::Load(o, _) => vec![*o],
+        Rvalue::Use(o) | Rvalue::Unary(_, o) | Rvalue::Cast(o, _) | Rvalue::Reinterpret(o, _) | Rvalue::Load(o, _) => {
+            vec![*o]
+        }
         Rvalue::Binary(_, a, b) | Rvalue::Offset(a, b, _) => vec![*a, *b],
         Rvalue::Call(_, args) => args.clone(),
         Rvalue::Special(_) => Vec::new(),
@@ -504,6 +521,7 @@ impl Rvalue {
             Rvalue::Binary(op, a, b) => Rvalue::Binary(*op, f(*a), f(*b)),
             Rvalue::Unary(op, a) => Rvalue::Unary(*op, f(*a)),
             Rvalue::Cast(a, to) => Rvalue::Cast(f(*a), *to),
+            Rvalue::Reinterpret(a, to) => Rvalue::Reinterpret(f(*a), *to),
             Rvalue::Call(intrinsic, args) => Rvalue::Call(*intrinsic, args.iter().map(|a| f(*a)).collect()),
             Rvalue::Load(pointer, ty) => Rvalue::Load(f(*pointer), *ty),
             Rvalue::Offset(pointer, index, bytes) => Rvalue::Offset(f(*pointer), f(*index), *bytes),

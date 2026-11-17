@@ -108,6 +108,11 @@ impl Builder {
         self.assign(Rvalue::Cast(a.into(), to))
     }
 
+    /// The same bits as `to`, of the operand's width.
+    pub fn reinterpret(&mut self, a: impl Into<Operand>, to: Ty) -> Local {
+        self.assign(Rvalue::Reinterpret(a.into(), to))
+    }
+
     pub fn call(&mut self, intrinsic: Intrinsic, args: &[Operand]) -> Local {
         self.assign(Rvalue::Call(intrinsic, args.to_vec()))
     }

@@ -32,9 +32,25 @@
 //! The bodies rustc builds for calling an `Fn` closure through `FnOnce`, or
 //! a function item through the `Fn` traits, are inlined the same way.
 //!
-//! Supported values: integers, floats and `bool`, structs and tuples of
-//! them, closures, with references to any of those. Enums, arrays, slices,
-//! raw pointer arithmetic, coroutines and statics are refused with a
+//! # Arrays
+//!
+//! An array is held as its elements, like a tuple, up to [`MAX_ARRAY`] of
+//! them. A constant index names an element. An index known only at run time
+//! names a [`Slot::Choice`]: reading it selects among every element,
+//! writing it writes the element chosen and keeps the others. MIR checks the
+//! index first, and the check runs on the GPU too. An array as a slice
+//! keeps its elements, so its length is known. Constant tables (`&[f32; 5]`,
+//! `&[u8]`) and read-only statics of plain data become elements the same
+//! way.
+//!
+//! `transmute` (and `to_bits`, `from_le_bytes`...) reinterprets plain data
+//! by rustc's layout: each number of the result gathers the bytes it covers
+//! from the source's numbers.
+//!
+//! Supported values: integers, floats and `bool`, structs, tuples and
+//! arrays of them, closures, with references to any of those. Enums,
+//! slices other than read-only parameters and constants, raw pointer
+//! arithmetic, coroutines and statics that can change are refused with a
 //! reason.
 //!
 //! Panics must be provable away: [`assert_holds`] accepts an assertion only
@@ -56,6 +72,7 @@ use rustc_middle::{
     ty::{self, FloatTy, Instance, InstanceKind, IntTy, ShimKind, Ty, TyCtxt, TypingEnv, UintTy},
 };
 use rustc_abi::ExternAbi;
+use rustc_middle::{mir::NonDivergingIntrinsic, ty::adjustment::PointerCoercion};
 use rustc_span::def_id::DefId;
 
 type Result<T> = std::result::Result<T, String>;
@@ -93,24 +110,42 @@ pub(crate) fn constant<'tcx>(tcx: TyCtxt<'tcx>, constant: &ConstOperand<'tcx>) -
     Some(Const { ty, bits })
 }
 
-/// The field types of a struct, tuple or closure (its captures), with the
-/// generic arguments filled in. A function item has none. Errors for
-/// anything else that isn't a number.
+/// How many elements an array the kernel holds in locals may have. A run-time
+/// index chooses among all of them, so each access costs one operation per
+/// element.
+const MAX_ARRAY: u64 = 1024;
+
+/// The number of elements of an array type.
+pub(crate) fn array_len<'tcx>(tcx: TyCtxt<'tcx>, len: ty::Const<'tcx>) -> Result<usize> {
+    let len = tcx
+        .normalize_erasing_regions(TypingEnv::fully_monomorphized(), ty::Unnormalized::new(len))
+        .try_to_target_usize(tcx)
+        .ok_or("uses an array whose length isn't known")?;
+    if len > MAX_ARRAY {
+        return Err(format!("uses an array of {len} elements, more than the {MAX_ARRAY} a kernel holds in locals"));
+    }
+    Ok(len as usize)
+}
+
+/// The field types of a struct, tuple or closure (its captures), or an
+/// array's elements, with the generic arguments filled in. A function item
+/// has none. Errors for anything else that isn't a number.
 pub(crate) fn fields_of<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<Vec<Ty<'tcx>>> {
     match ty.kind() {
         ty::Tuple(fields) => Ok(fields.to_vec()),
+        // An array is held as its elements, like a tuple of them.
+        ty::Array(element, len) => Ok(vec![*element; array_len(tcx, *len)?]),
         // Captured by reference, a capture's type is the reference.
         ty::Closure(_, args) => Ok(args.as_closure().upvar_tys().to_vec()),
         ty::FnDef(..) => Ok(Vec::new()),
-        ty::Adt(adt, args) if adt.is_struct() && !adt.repr().simd() => Ok(adt
+        ty::Adt(adt, args) if adt.is_struct() && !adt.repr().simd() && !adt.is_box() => Ok(adt
             .non_enum_variant()
             .fields
             .iter()
             .map(|field| tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), field.ty(tcx, args)))
             .collect()),
-        ty::Adt(adt, _) if adt.is_enum() => Err(format!("uses the enum `{ty}`")),
         ty::Never => Ok(Vec::new()),
-        _ => Err(format!("uses a value of type `{ty}`")),
+        _ => Err(type_refusal(ty)),
     }
 }
 
@@ -258,16 +293,17 @@ pub(crate) fn method(tcx: TyCtxt<'_>, def_id: DefId) -> Option<Method> {
 
 /// What a compiler intrinsic becomes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IntrinsicOp {
+pub(crate) enum IntrinsicOp {
     Method(Method),
-    /// `likely` and `unlikely`: their argument.
-    Identity,
     /// `cold_path` and `assume`: nothing.
     Nothing,
+    /// `transmute`: the argument's bits as the result's type.
+    Transmute,
 }
 
-/// The intrinsics library code reaches after inlining, by name.
-fn intrinsic(name: &str) -> Option<IntrinsicOp> {
+/// The intrinsics library code reaches after inlining, by name: exactly
+/// those `coverage::INTRINSICS` lists as supported.
+pub(crate) fn intrinsic(name: &str) -> Option<IntrinsicOp> {
     use Intrinsic::*;
     let call = |i| Some(IntrinsicOp::Method(Method::Intrinsic(i)));
     let binary = |op| Some(IntrinsicOp::Method(Method::Binary(op)));
@@ -276,13 +312,13 @@ fn intrinsic(name: &str) -> Option<IntrinsicOp> {
         "floorf32" | "floorf64" => call(Floor),
         "ceilf32" | "ceilf64" => call(Ceil),
         "truncf32" | "truncf64" => call(Trunc),
-        "fabs" | "fabsf32" | "fabsf64" => call(Abs),
+        "fabs" => call(Abs),
         "fmaf32" | "fmaf64" => call(MulAdd),
         // `f32::min` and `max`: the other operand when one is NaN, either
         // zero when both are zeros. (`minimumf32` propagates NaN instead,
-        // which the kernel doesn't provide.)
-        "minnumf32" | "minnumf64" | "minimum_number_nsz_f32" | "minimum_number_nsz_f64" => call(Min),
-        "maxnumf32" | "maxnumf64" | "maximum_number_nsz_f32" | "maximum_number_nsz_f64" => call(Max),
+        // which the kernel doesn't provide yet.)
+        "minimum_number_nsz_f32" | "minimum_number_nsz_f64" => call(Min),
+        "maximum_number_nsz_f32" | "maximum_number_nsz_f64" => call(Max),
         "rotate_left" => call(RotateLeft),
         "rotate_right" => call(RotateRight),
         // The `_nonzero` forms are undefined at zero, so the defined counts
@@ -300,8 +336,8 @@ fn intrinsic(name: &str) -> Option<IntrinsicOp> {
         "unchecked_rem" => binary(KBinOp::Rem),
         "unchecked_shl" => binary(KBinOp::Shl),
         "unchecked_shr" => binary(KBinOp::Shr),
-        "likely" | "unlikely" => Some(IntrinsicOp::Identity),
         "cold_path" | "assume" => Some(IntrinsicOp::Nothing),
+        "transmute" => Some(IntrinsicOp::Transmute),
         _ => None,
     }
 }
@@ -615,6 +651,63 @@ pub(crate) fn translate<'tcx>(
     })
 }
 
+/// Whether `ty` is element data: built from numbers, through structs,
+/// tuples, arrays, enums, closures and references, without slices, strings,
+/// trait objects, raw pointers or function pointers. The coverage census
+/// translates functions over element data, and skips the rest (loops over
+/// slices, text, heap containers), with the reason.
+pub(crate) fn element_data<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, depth: usize) -> Result<()> {
+    if depth > 16 {
+        return Err(format!("nests `{ty}` too deeply"));
+    }
+    let walk = |ty: Ty<'tcx>| element_data(tcx, ty, depth + 1);
+    match ty.kind() {
+        ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::Never | ty::FnDef(..) => Ok(()),
+        ty::Ref(_, inner, _) => walk(*inner),
+        ty::Array(inner, _) => walk(*inner),
+        // A pattern type (`NonZero`, `NonNull`) holds its underlying type.
+        ty::Pat(inner, _) => walk(*inner),
+        ty::Tuple(fields) => fields.iter().try_for_each(walk),
+        ty::Closure(_, args) => args.as_closure().upvar_tys().iter().try_for_each(walk),
+        ty::Adt(adt, _) if adt.is_box() => Err("holds a `Box`".into()),
+        ty::Adt(adt, args) => adt
+            .all_fields()
+            .map(|field| tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), field.ty(tcx, args)))
+            .try_for_each(walk)
+            .map_err(|reason| if depth == 0 { format!("takes or returns `{ty}`, which {reason}") } else { reason }),
+        ty::Slice(_) | ty::Str => Err(format!("holds a slice or string (`{ty}`)")),
+        ty::RawPtr(..) => Err(format!("holds a raw pointer (`{ty}`)")),
+        ty::FnPtr(..) => Err(format!("holds a function pointer (`{ty}`)")),
+        ty::Dynamic(..) => Err(format!("holds a trait object (`{ty}`)")),
+        _ => Err(format!("holds `{ty}`")),
+    }
+}
+
+/// Translates a whole non-generic function or closure as a kernel function
+/// of its parameters, for the coverage census: `Ok` if the translator
+/// handles everything it does (with every call inlined), else the first
+/// refusal.
+pub(crate) fn check_function<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, body: &Body<'tcx>) -> Result<()> {
+    let (mut b, _) = Builder::new("coverage", &[]);
+    let element = b.local(KTy::U32);
+    let mut translator = Translator { tcx, b, element, stores: false, stack: vec![def_id], written: HashSet::new() };
+    let mut slots = HashMap::new();
+    for param in (1..=body.arg_count).map(Local::from_usize) {
+        let ty = body.local_decls[param].ty;
+        slots.insert(param, translator.fresh_deep(ty, 0)?);
+    }
+    let mut frame = Frame { body, slots, blocks: HashMap::new(), exit: BlockId(0), loop_rules: None };
+    frame.exit = translator.b.block();
+    translator.run_frame(&mut frame, &ordered(body, &function_region(body)), START_BLOCK)?;
+    translator.b.switch_to(frame.exit);
+    translator.local_slot(&mut frame, RETURN_PLACE)?;
+    translator
+        .b
+        .finish_function(None)
+        .map(|_| ())
+        .map_err(|invalid| format!("translated into an invalid kernel ({invalid})"))
+}
+
 /// The slot for what the iterator yields: references to the element and
 /// to this iteration's input values, paired as `zip` pairs them.
 fn lane_slot(lane: &Lane, element: KLocal, inputs: &HashMap<Local, KLocal>) -> Slot {
@@ -774,6 +867,11 @@ enum Slot {
     Slice { pointer: KLocal, len: KLocal, element: KTy },
     /// A number in a read-only slice, at an address.
     Memory { address: KLocal, ty: KTy },
+    /// An array element chosen at run time: the option `index` names.
+    /// Reading it selects among all options; writing it writes the one
+    /// chosen. `index` holds the index as it was when the place was
+    /// formed, and is below the number of options: MIR checks it first.
+    Choice { index: KLocal, options: Vec<Slot> },
 }
 
 impl Slot {
@@ -781,12 +879,26 @@ impl Slot {
         match self {
             Slot::Scalar(local) => out.push(*local),
             Slot::Fields(fields) => fields.iter().for_each(|field| field.scalars(out)),
+            Slot::Choice { index, options } => {
+                out.push(*index);
+                options.iter().for_each(|option| option.scalars(out));
+            }
             Slot::Ref(inner) | Slot::Some(inner) => inner.scalars(out),
             Slot::Slice { pointer, len, .. } => out.extend([*pointer, *len]),
             Slot::Memory { address, .. } => out.push(*address),
             Slot::Unit | Slot::Unbound | Slot::Opaque => {}
         }
     }
+}
+
+/// One projection of a place, with any run-time index already read.
+enum Step {
+    Deref,
+    Field(usize),
+    Downcast(u32),
+    Index(KLocal),
+    Constant { offset: u64, from_end: bool },
+    Subslice { from: u64, to: u64, from_end: bool },
 }
 
 /// The body-specific rules of the loop body, the outermost frame.
@@ -827,6 +939,14 @@ const MAX_DEPTH: usize = 24;
 
 fn is_ref(ty: Ty<'_>) -> bool {
     matches!(ty.kind(), ty::Ref(..) | ty::RawPtr(..))
+}
+
+fn points_to_array(ty: Ty<'_>) -> bool {
+    ty.builtin_deref(true).is_some_and(|pointee| matches!(pointee.kind(), ty::Array(..)))
+}
+
+fn points_to_slice(ty: Ty<'_>) -> bool {
+    ty.builtin_deref(true).is_some_and(|pointee| matches!(pointee.kind(), ty::Slice(_)))
 }
 
 impl<'tcx> Translator<'tcx> {
@@ -890,14 +1010,23 @@ impl<'tcx> Translator<'tcx> {
                 // The iterator's own values: only `next` uses them.
                 StatementKind::Assign(assign) if plumbing.is_some_and(|p| p.contains(&assign.0.local)) => {}
                 StatementKind::Assign(assign) => self.assign(frame, &assign.0, &assign.1)?,
-                StatementKind::Intrinsic(intrinsic) => {
-                    if !matches!(**intrinsic, rustc_middle::mir::NonDivergingIntrinsic::Assume(_)) {
-                        return Err("copies memory".into());
+                StatementKind::Intrinsic(intrinsic) => match &**intrinsic {
+                    NonDivergingIntrinsic::Assume(_) => {}
+                    NonDivergingIntrinsic::CopyNonOverlapping(_) => {
+                        return Err("copies memory (`copy_nonoverlapping`)".into());
                     }
-                }
-                StatementKind::SetDiscriminant { .. } => return Err("uses an enum".into()),
+                },
+                StatementKind::SetDiscriminant { .. } => return Err("uses an enum (sets a discriminant)".into()),
                 // Storage markers, borrow-checker annotations and no-ops.
-                _ => {}
+                StatementKind::FakeRead(_)
+                | StatementKind::StorageLive(_)
+                | StatementKind::StorageDead(_)
+                | StatementKind::PlaceMention(_)
+                | StatementKind::AscribeUserType(..)
+                | StatementKind::Coverage(_)
+                | StatementKind::ConstEvalCounter
+                | StatementKind::Nop
+                | StatementKind::BackwardIncompatibleDropHint { .. } => {}
             }
         }
         // In `for_each`'s block: its function, and what the iterator yields.
@@ -982,7 +1111,13 @@ impl<'tcx> Translator<'tcx> {
                 let target = self.target(frame, block, *target)?;
                 self.b.goto(target);
             }
-            other => return Err(format!("contains unsupported control flow `{other:?}`")),
+            // Only cleanup blocks, which the region never includes, unwind.
+            TerminatorKind::UnwindResume | TerminatorKind::UnwindTerminate(_) => {
+                return Err("unwinds".into());
+            }
+            TerminatorKind::TailCall { .. } => return Err("makes a tail call (`become`)".into()),
+            TerminatorKind::Yield { .. } | TerminatorKind::CoroutineDrop => return Err("is a coroutine".into()),
+            TerminatorKind::InlineAsm { .. } => return Err("uses inline assembly".into()),
         }
         Ok(())
     }
@@ -1016,7 +1151,8 @@ impl<'tcx> Translator<'tcx> {
         match instance.def {
             InstanceKind::Intrinsic(intrinsic_id) => {
                 let name = tcx.item_name(intrinsic_id);
-                let op = intrinsic(name.as_str()).ok_or_else(|| format!("uses the intrinsic `{name}`"))?;
+                let op = intrinsic(name.as_str())
+                    .ok_or_else(|| format!("uses the intrinsic `{name}`{}", crate::coverage::reason(name.as_str())))?;
                 self.operation(frame, op, args, destination)
             }
             InstanceKind::Item(item) if tcx.is_mir_available(item) => {
@@ -1043,19 +1179,23 @@ impl<'tcx> Translator<'tcx> {
         if op == IntrinsicOp::Nothing {
             return Ok(());
         }
+        if op == IntrinsicOp::Transmute {
+            let [arg] = args else {
+                return Err("calls a library function with unexpected arguments".into());
+            };
+            let to = destination.ty(frame.body, self.tcx).ty;
+            let value = self.transmute(frame, &arg.node, to)?;
+            return self.store(frame, destination, value);
+        }
         let args = args.iter().map(|arg| self.scalar_operand(frame, &arg.node)).collect::<Result<Vec<_>>>()?;
         let rvalue = match (op, args.as_slice()) {
             (IntrinsicOp::Method(Method::Binary(op)), [a, b]) => KRvalue::Binary(op, *a, *b),
             (IntrinsicOp::Method(Method::Neg), [a]) => KRvalue::Unary(KUnOp::Neg, *a),
             (IntrinsicOp::Method(Method::Intrinsic(intrinsic)), _) => KRvalue::Call(intrinsic, args.clone()),
-            (IntrinsicOp::Identity, [a]) => KRvalue::Use(*a),
             _ => return Err("calls a library function with unexpected arguments".into()),
         };
-        let Slot::Scalar(local) = self.place(frame, destination)? else {
-            return Err("returns a library result into something other than a number".into());
-        };
-        self.set(local, rvalue);
-        Ok(())
+        let dest = self.place(frame, destination)?;
+        self.write_number(dest, rvalue)
     }
 
     /// One iteration of `for_each`: calls `function` with `item` through
@@ -1185,6 +1325,25 @@ impl<'tcx> Translator<'tcx> {
         self.local_slot(&mut callee, RETURN_PLACE).map_err(within)
     }
 
+    /// Like `fresh`, with every reference inside bound to a fresh value of
+    /// its own: a parameter of a function translated on its own.
+    fn fresh_deep(&mut self, ty: Ty<'tcx>, depth: usize) -> Result<Slot> {
+        if depth > 16 {
+            return Err(format!("nests `{ty}` too deeply"));
+        }
+        if let Some(pointee) = ty.builtin_deref(true) {
+            return Ok(Slot::Ref(Box::new(self.fresh_deep(pointee, depth + 1)?)));
+        }
+        if kernel_ty(ty).is_some() {
+            return self.fresh(ty);
+        }
+        let fields = self.fields(ty)?;
+        if fields.is_empty() {
+            return Ok(Slot::Unit);
+        }
+        Ok(Slot::Fields(fields.into_iter().map(|field| self.fresh_deep(field, depth + 1)).collect::<Result<_>>()?))
+    }
+
     /// The slot for a fresh value of type `ty`.
     fn fresh(&mut self, ty: Ty<'tcx>) -> Result<Slot> {
         if let Some(kernel) = kernel_ty(ty) {
@@ -1226,38 +1385,86 @@ impl<'tcx> Translator<'tcx> {
     fn place(&mut self, frame: &mut Frame<'_, 'tcx>, place: &Place<'tcx>) -> Result<Slot> {
         let mut slot = self.local_slot(frame, place.local)?;
         for element in place.projection.iter() {
-            slot = match (element, slot) {
-                (ProjectionElem::Deref, Slot::Ref(inner)) => *inner,
-                (_, Slot::Opaque) => {
-                    return Err("uses a slice parameter other than through the loop's iterator".into());
-                }
-                (ProjectionElem::Deref, _) => return Err("reads through a reference it can't follow".into()),
-                (ProjectionElem::Field(field, _), Slot::Fields(fields)) => {
-                    fields.get(field.as_usize()).cloned().ok_or("uses a field that doesn't exist")?
-                }
-                (ProjectionElem::Downcast(_, variant), Slot::Some(inner)) if variant.as_u32() == 1 => {
-                    Slot::Fields(vec![*inner])
-                }
-                (ProjectionElem::Downcast(..), _) => return Err("uses an enum".into()),
-                // An element of a read-only slice. MIR checks the index
-                // before it gets here, and the check runs on the GPU too.
-                (ProjectionElem::Index(index), Slot::Slice { pointer, element, .. }) => {
+            if slot == Slot::Opaque {
+                return Err("uses a slice parameter other than through the loop's iterator".into());
+            }
+            let step = match element {
+                ProjectionElem::Deref => Step::Deref,
+                ProjectionElem::Field(field, _) => Step::Field(field.as_usize()),
+                ProjectionElem::Downcast(_, variant) => Step::Downcast(variant.as_u32()),
+                // MIR checks the index before it gets here, and the check
+                // runs on the GPU too. The index is kept as it is now: a
+                // reference to the element must not follow later changes.
+                ProjectionElem::Index(index) => {
                     let index = self.scalar_operand(frame, &Operand::Copy(Place::from(index)))?;
-                    Slot::Memory { address: self.b.offset(pointer, index, element), ty: element }
+                    Step::Index(self.b.copy(index))
                 }
-                (ProjectionElem::ConstantIndex { offset, from_end, .. }, Slot::Slice { pointer, len, element }) => {
-                    let offset = Const::int(KTy::U64, offset.into());
-                    let index = if from_end { self.b.binary(KBinOp::Sub, len, offset).into() } else { offset.into() };
-                    let index: KOperand = index;
-                    Slot::Memory { address: self.b.offset(pointer, index, element), ty: element }
-                }
-                (ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } | ProjectionElem::Subslice { .. }, _) => {
-                    return Err("indexes an array or slice".into());
-                }
-                _ => return Err(format!("uses a place the kernel can't follow (`{place:?}`)")),
+                ProjectionElem::ConstantIndex { offset, from_end, .. } => Step::Constant { offset, from_end },
+                ProjectionElem::Subslice { from, to, from_end } => Step::Subslice { from, to, from_end },
+                element => return Err(projection_refusal(&element)),
             };
+            slot = self.step(slot, &step)?;
         }
         Ok(slot)
+    }
+
+    /// The part of `slot` that `step` names.
+    fn step(&mut self, slot: Slot, step: &Step) -> Result<Slot> {
+        Ok(match (step, slot) {
+            // A step into an element chosen at run time is that step into
+            // whichever element is chosen.
+            (_, Slot::Choice { index, options }) => {
+                let options: Vec<Slot> =
+                    options.into_iter().map(|option| self.step(option, step)).collect::<Result<_>>()?;
+                // Reading one would read every slice at the index, and only
+                // the chosen one's bounds were checked.
+                if options.iter().any(|option| matches!(option, Slot::Slice { .. } | Slot::Memory { .. })) {
+                    return Err("chooses between slices at run time".into());
+                }
+                Slot::Choice { index, options }
+            }
+            (Step::Deref, Slot::Ref(inner)) => *inner,
+            (Step::Deref, _) => return Err("reads through a reference it can't follow".into()),
+            (Step::Field(field), Slot::Fields(fields)) => {
+                fields.get(*field).cloned().ok_or("uses a field that doesn't exist")?
+            }
+            (Step::Downcast(1), Slot::Some(inner)) => Slot::Fields(vec![*inner]),
+            (Step::Downcast(_), _) => return Err("uses an enum".into()),
+            // An array, held as its elements.
+            (Step::Index(index), Slot::Fields(elements)) => Slot::Choice { index: *index, options: elements },
+            (Step::Index(_), Slot::Unit) => return Err("indexes an empty array".into()),
+            (&Step::Constant { offset, from_end }, Slot::Fields(elements)) => {
+                let at = if from_end { elements.len().checked_sub(offset as usize) } else { Some(offset as usize) };
+                at.and_then(|at| elements.get(at).cloned()).ok_or("indexes past the end of an array")?
+            }
+            (&Step::Subslice { from, to, from_end }, Slot::Fields(elements)) => {
+                // An array's subslice ends at `to`; a slice's `to` elements
+                // before its end.
+                let end = if from_end { elements.len().checked_sub(to as usize) } else { Some(to as usize) };
+                let part = end
+                    .and_then(|end| elements.get(from as usize..end))
+                    .ok_or("takes a subslice past the end of an array")?;
+                if part.is_empty() { Slot::Unit } else { Slot::Fields(part.to_vec()) }
+            }
+            (&Step::Subslice { from, to, from_end: true }, Slot::Unit) if from == 0 && to == 0 => Slot::Unit,
+            // A read-only slice in memory.
+            (Step::Index(index), Slot::Slice { pointer, element, .. }) => {
+                Slot::Memory { address: self.b.offset(pointer, *index, element), ty: element }
+            }
+            (&Step::Constant { offset, from_end }, Slot::Slice { pointer, len, element }) => {
+                let offset = Const::int(KTy::U64, offset.into());
+                let index: KOperand = if from_end { self.b.binary(KBinOp::Sub, len, offset).into() } else { offset.into() };
+                Slot::Memory { address: self.b.offset(pointer, index, element), ty: element }
+            }
+            (&Step::Subslice { from, to, from_end: true }, Slot::Slice { pointer, len, element }) => {
+                let start = self.b.offset(pointer, Const::int(KTy::U64, from.into()), element);
+                let trimmed = self.b.binary(KBinOp::Sub, len, Const::int(KTy::U64, (from + to).into()));
+                Slot::Slice { pointer: start, len: trimmed, element }
+            }
+            (Step::Field(_), _) => return Err("uses a field of a value the kernel can't hold".into()),
+            (Step::Index(_) | Step::Constant { .. }, _) => return Err("indexes something other than an array or slice".into()),
+            (Step::Subslice { .. }, _) => return Err("takes a subslice of something other than an array or slice".into()),
+        })
     }
 
     /// Binds a reference local to the slot it points to. A reference
@@ -1326,6 +1533,17 @@ impl<'tcx> Translator<'tcx> {
     /// target, and one already bound must have the same target.
     fn copy_fields(&mut self, dest: &Slot, src: &Slot) -> Result<Slot> {
         match (dest, src) {
+            (_, Slot::Choice { .. }) => {
+                let src = self.resolve(src.clone())?;
+                return self.copy_fields(dest, &src);
+            }
+            // Writes the option chosen; the others keep their values.
+            (Slot::Choice { index, options }, _) => {
+                for (at, option) in options.iter().enumerate() {
+                    let chosen = self.chosen(*index, at);
+                    self.copy_where(chosen, option, src)?;
+                }
+            }
             (Slot::Scalar(d), Slot::Scalar(s)) => {
                 if d != s {
                     self.set(*d, KRvalue::Use((*s).into()));
@@ -1344,11 +1562,150 @@ impl<'tcx> Translator<'tcx> {
         Ok(dest.clone())
     }
 
+    /// Copies `src` into `dest` where `condition` holds, and leaves `dest`
+    /// as it is elsewhere. References can't be written conditionally.
+    fn copy_where(&mut self, condition: KLocal, dest: &Slot, src: &Slot) -> Result<()> {
+        match (dest, src) {
+            (Slot::Scalar(d), Slot::Scalar(s)) => {
+                if d != s {
+                    self.set(*d, KRvalue::Select(condition.into(), (*s).into(), (*d).into()));
+                }
+            }
+            (Slot::Fields(d), Slot::Fields(s)) if d.len() == s.len() => {
+                for (d, s) in d.iter().zip(s) {
+                    self.copy_where(condition, d, s)?;
+                }
+            }
+            (Slot::Choice { index, options }, _) => {
+                for (at, option) in options.iter().enumerate() {
+                    let chosen = self.chosen(*index, at);
+                    let both = self.b.binary(KBinOp::And, condition, chosen);
+                    self.copy_where(both, option, src)?;
+                }
+            }
+            (Slot::Unit, Slot::Unit) | (Slot::Unbound, Slot::Unbound) => {}
+            (Slot::Ref(d), Slot::Ref(s)) if d == s => {}
+            (Slot::Ref(_) | Slot::Unbound, Slot::Ref(_)) => return Err("chooses between references at run time".into()),
+            _ => return Err("copies between values of different shapes".into()),
+        }
+        Ok(())
+    }
+
+    /// Whether `index` chooses option `at`.
+    fn chosen(&mut self, index: KLocal, at: usize) -> KLocal {
+        let ty = self.b.ty(index);
+        self.b.binary(KBinOp::Eq, index, Const::int(ty, at as i128))
+    }
+
+    /// The value a slot holds, with an element chosen at run time read into
+    /// new locals.
+    fn resolve(&mut self, slot: Slot) -> Result<Slot> {
+        let Slot::Choice { index, options } = slot else {
+            return Ok(slot);
+        };
+        let options = options.into_iter().map(|option| self.resolve(option)).collect::<Result<Vec<_>>>()?;
+        self.select_among(index, &options)
+    }
+
+    /// The option `index` chooses, number by number. A reference chosen at
+    /// run time points to the chosen target.
+    fn select_among(&mut self, index: KLocal, options: &[Slot]) -> Result<Slot> {
+        let shapes = || "copies between values of different shapes".to_string();
+        let Some(first) = options.first() else {
+            return Err("indexes an empty array".into());
+        };
+        if options.iter().all(|option| option == first) {
+            return Ok(first.clone());
+        }
+        Ok(match first {
+            Slot::Scalar(_) => {
+                let numbers = options
+                    .iter()
+                    .map(|option| match option {
+                        Slot::Scalar(local) => Ok(*local),
+                        _ => Err(shapes()),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let value = self.b.copy(numbers[0]);
+                for (at, number) in numbers.iter().enumerate().skip(1) {
+                    let chosen = self.chosen(index, at);
+                    self.b.set(value, KRvalue::Select(chosen.into(), (*number).into(), value.into()));
+                }
+                Slot::Scalar(value)
+            }
+            Slot::Fields(fields) => {
+                let mut chosen = Vec::with_capacity(fields.len());
+                for field in 0..fields.len() {
+                    let column = options
+                        .iter()
+                        .map(|option| match option {
+                            Slot::Fields(f) if f.len() == fields.len() => Ok(f[field].clone()),
+                            _ => Err(shapes()),
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    chosen.push(self.select_among(index, &column)?);
+                }
+                Slot::Fields(chosen)
+            }
+            Slot::Ref(_) => {
+                let targets = options
+                    .iter()
+                    .map(|option| match option {
+                        Slot::Ref(target) if !matches!(**target, Slot::Slice { .. } | Slot::Memory { .. }) => {
+                            Ok((**target).clone())
+                        }
+                        Slot::Ref(_) => Err("chooses between slices at run time".to_string()),
+                        _ => Err(shapes()),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Slot::Ref(Box::new(Slot::Choice { index, options: targets }))
+            }
+            Slot::Unbound => return Err("chooses between references at run time".into()),
+            Slot::Slice { .. } | Slot::Memory { .. } => return Err("chooses between slices at run time".into()),
+            Slot::Unit | Slot::Some(_) | Slot::Opaque | Slot::Choice { .. } => return Err(shapes()),
+        })
+    }
+
+    /// The number a slot holds, read from memory or chosen at run time if
+    /// need be.
+    fn number(&mut self, slot: Slot) -> Result<KOperand> {
+        match self.resolve(slot)? {
+            Slot::Scalar(local) => Ok(local.into()),
+            Slot::Memory { address, ty } => Ok(self.b.load(address, ty).into()),
+            _ => Err("uses a value as a number that isn't one".into()),
+        }
+    }
+
+    /// Writes a number to the slot `place` names.
+    fn write_number(&mut self, dest: Slot, rvalue: KRvalue) -> Result<()> {
+        match dest {
+            Slot::Scalar(local) => self.set(local, rvalue),
+            Slot::Choice { .. } => {
+                // Typed like the options; validation checks the rvalue.
+                fn number(slot: &Slot) -> Option<KLocal> {
+                    match slot {
+                        Slot::Scalar(local) => Some(*local),
+                        Slot::Choice { options, .. } => options.first().and_then(number),
+                        _ => None,
+                    }
+                }
+                let ty = number(&dest).map(|number| self.b.ty(number)).ok_or("writes a number into something else")?;
+                let value = self.b.local(ty);
+                self.b.set(value, rvalue);
+                self.copy_fields(&dest, &Slot::Scalar(value))?;
+            }
+            Slot::Memory { .. } => return Err("writes to a read-only slice".into()),
+            _ => return Err("writes a number into something else".into()),
+        }
+        Ok(())
+    }
+
     /// A copy of `src`'s numbers in new locals.
     fn snapshot(&mut self, src: &Slot) -> Result<Slot> {
         Ok(match src {
             Slot::Scalar(local) => Slot::Scalar(self.b.copy(*local)),
             Slot::Fields(fields) => Slot::Fields(fields.iter().map(|field| self.snapshot(field)).collect::<Result<_>>()?),
+            Slot::Choice { .. } => self.resolve(src.clone())?,
             other => other.clone(),
         })
     }
@@ -1359,15 +1716,15 @@ impl<'tcx> Translator<'tcx> {
             let target = self.reference(frame, rvalue)?;
             return self.store(frame, place, target);
         }
+        // Reinterpreting bits, of numbers or of plain data.
+        if let Rvalue::Cast(CastKind::Transmute, operand, to) = rvalue {
+            let value = self.transmute(frame, operand, *to)?;
+            return self.store(frame, place, value);
+        }
         if kernel_ty(ty).is_some() {
             let value = self.scalar_rvalue(frame, rvalue)?;
-            let local = match self.place(frame, place)? {
-                Slot::Scalar(local) => local,
-                Slot::Memory { .. } => return Err("writes to a read-only slice".into()),
-                _ => return Err("writes a number into something else".into()),
-            };
-            self.set(local, value);
-            return Ok(());
+            let dest = self.place(frame, place)?;
+            return self.write_number(dest, value);
         }
         // Arithmetic with its overflow flag, which debug builds check.
         if let Rvalue::BinaryOp(op @ (BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow), operands) =
@@ -1386,23 +1743,28 @@ impl<'tcx> Translator<'tcx> {
                 let value = self.place(frame, source)?;
                 self.store(frame, place, value)
             }
+            // `[x; N]`: every element a copy of `x`.
+            Rvalue::Repeat(operand, count) => {
+                let value = self.operand_slot(frame, operand)?;
+                let count = array_len(self.tcx, *count)?;
+                let value = if count == 0 { Slot::Unit } else { Slot::Fields(vec![value; count]) };
+                self.store(frame, place, value)
+            }
             Rvalue::Aggregate(kind, operands) => {
                 match **kind {
-                    AggregateKind::Tuple => {}
+                    AggregateKind::Tuple | AggregateKind::Array(_) => {}
                     AggregateKind::Adt(adt, _, _, _, None) if self.tcx.adt_def(adt).is_struct() => {}
-                    AggregateKind::Adt(..) => return Err("builds an enum or union".into()),
-                    AggregateKind::Array(_) => return Err("builds an array".into()),
                     // A closure is its captures: values, or references to
                     // what it captured by reference.
                     AggregateKind::Closure(..) => {}
-                    _ => return Err("builds a coroutine".into()),
+                    _ => return Err(aggregate_refusal(kind)),
                 }
                 let values: Vec<Slot> =
                     operands.iter().map(|operand| self.operand_slot(frame, operand)).collect::<Result<_>>()?;
                 let value = if values.is_empty() { Slot::Unit } else { Slot::Fields(values) };
                 self.store(frame, place, value)
             }
-            _ => Err("uses an unsupported operation".into()),
+            _ => Err(rvalue_refusal(rvalue)),
         }
     }
 
@@ -1412,7 +1774,14 @@ impl<'tcx> Translator<'tcx> {
             Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => Ok(Slot::Ref(Box::new(self.place(frame, place)?))),
             Rvalue::Use(operand, _) => self.operand_slot(frame, operand),
             Rvalue::CopyForDeref(place) => self.place(frame, place),
-            Rvalue::Cast(..) => Err("converts a pointer".into()),
+            // An array as a slice: the same elements, whose length the
+            // slot knows.
+            Rvalue::Cast(CastKind::PointerCoercion(PointerCoercion::Unsize, _), operand, ty)
+                if points_to_array(operand.ty(frame.body, self.tcx)) && points_to_slice(*ty) =>
+            {
+                self.operand_slot(frame, operand)
+            }
+            Rvalue::Cast(kind, _, ty) => Err(cast_refusal(*kind, *ty)),
             _ => Err("uses a reference it can't follow".into()),
         }
     }
@@ -1421,9 +1790,8 @@ impl<'tcx> Translator<'tcx> {
         Ok(match rvalue {
             Rvalue::Use(operand, _) => KRvalue::Use(self.scalar_operand(frame, operand)?),
             Rvalue::CopyForDeref(place) => match self.place(frame, place)? {
-                Slot::Scalar(local) => KRvalue::Use(local.into()),
                 Slot::Memory { address, ty } => KRvalue::Load(address.into(), ty),
-                _ => return Err("reads something other than a number".into()),
+                slot => KRvalue::Use(self.number(slot)?),
             },
             Rvalue::BinaryOp(op, operands) => {
                 let (a, b) = (self.scalar_operand(frame, &operands.0)?, self.scalar_operand(frame, &operands.1)?);
@@ -1450,14 +1818,19 @@ impl<'tcx> Translator<'tcx> {
                     BinOp::Le => KBinOp::Le,
                     BinOp::Gt => KBinOp::Gt,
                     BinOp::Ge => KBinOp::Ge,
-                    other => return Err(format!("uses `{other:?}`, which is not supported")),
+                    other => return Err(binary_refusal(*other)),
                 };
                 KRvalue::Binary(op, a, b)
             }
-            // A read-only slice's length.
+            // A read-only slice's length, or that of an array as a slice.
             Rvalue::UnaryOp(UnOp::PtrMetadata, operand) => match self.operand_slot(frame, operand)? {
                 Slot::Ref(inner) => match *inner {
                     Slot::Slice { len, .. } => KRvalue::Use(len.into()),
+                    _ if !points_to_slice(operand.ty(frame.body, self.tcx)) => {
+                        return Err("reads the metadata of a pointer other than to a slice".into());
+                    }
+                    Slot::Fields(elements) => KRvalue::Use(Const::int(KTy::U64, elements.len() as i128).into()),
+                    Slot::Unit => KRvalue::Use(Const::int(KTy::U64, 0).into()),
                     _ => return Err("reads the length of something other than a read-only slice".into()),
                 },
                 Slot::Slice { len, .. } => KRvalue::Use(len.into()),
@@ -1468,7 +1841,7 @@ impl<'tcx> Translator<'tcx> {
                 match op {
                     UnOp::Neg => KRvalue::Unary(KUnOp::Neg, a),
                     UnOp::Not => KRvalue::Unary(KUnOp::Not, a),
-                    other => return Err(format!("uses `{other:?}`, which is not supported")),
+                    UnOp::PtrMetadata => return Err(rvalue_refusal(rvalue)),
                 }
             }
             Rvalue::Cast(kind, operand, ty) => {
@@ -1476,14 +1849,13 @@ impl<'tcx> Translator<'tcx> {
                     kind,
                     CastKind::IntToInt | CastKind::IntToFloat | CastKind::FloatToInt | CastKind::FloatToFloat
                 );
-                let to = kernel_ty(*ty).filter(|_| numeric).ok_or_else(|| format!("casts to `{ty}`"))?;
+                let to = kernel_ty(*ty).filter(|_| numeric).ok_or_else(|| cast_refusal(*kind, *ty))?;
                 KRvalue::Cast(self.scalar_operand(frame, operand)?, to)
             }
             Rvalue::Ref(..) | Rvalue::RawPtr(..) => {
                 return Err("borrows something other than the current element".into());
             }
-            Rvalue::Discriminant(_) => return Err("uses an enum".into()),
-            _ => return Err("uses an unsupported operation".into()),
+            _ => return Err(rvalue_refusal(rvalue)),
         })
     }
 
@@ -1493,11 +1865,8 @@ impl<'tcx> Translator<'tcx> {
                 .map(KOperand::Const)
                 .ok_or_else(|| format!("uses an unsupported constant of type `{}`", c.ty())),
             Operand::Copy(place) | Operand::Move(place) => {
-                match self.place(frame, place)? {
-                    Slot::Scalar(local) => Ok(local.into()),
-                    Slot::Memory { address, ty } => Ok(self.b.load(address, ty).into()),
-                    _ => Err("uses a value as a number that isn't one".into()),
-                }
+                let slot = self.place(frame, place)?;
+                self.number(slot)
             }
             Operand::RuntimeChecks(checks) => Ok(self.runtime_check(*checks).into()),
         }
@@ -1523,7 +1892,7 @@ impl<'tcx> Translator<'tcx> {
             BinOp::AddWithOverflow => KBinOp::Add,
             BinOp::SubWithOverflow => KBinOp::Sub,
             BinOp::MulWithOverflow => KBinOp::Mul,
-            other => return Err(format!("uses `{other:?}`, which is not supported")),
+            other => return Err(binary_refusal(other)),
         };
         let result = self.b.binary(kernel_op, a, b);
         if ty.bits() < 64 {
@@ -1577,7 +1946,7 @@ impl<'tcx> Translator<'tcx> {
             Operand::Constant(c) => self.constant_slot(c),
             Operand::Copy(place) | Operand::Move(place) => match self.place(frame, place)? {
                 Slot::Memory { address, ty } => Ok(Slot::Scalar(self.b.load(address, ty))),
-                slot => Ok(slot),
+                slot => self.resolve(slot),
             },
             Operand::RuntimeChecks(checks) => Ok(Slot::Scalar(self.b.copy(self.runtime_check(*checks)))),
         }
@@ -1590,7 +1959,7 @@ impl<'tcx> Translator<'tcx> {
             return Ok(Slot::Scalar(self.b.copy(scalar)));
         }
         if is_ref(ty) {
-            return Err(format!("uses a reference to constant data (`{ty}`)"));
+            return self.constant_ref(c);
         }
         let slot = self.fresh(ty)?;
         if slot == Slot::Unit {
@@ -1607,6 +1976,8 @@ impl<'tcx> Translator<'tcx> {
         let size = layout.size.bytes_usize();
         let bytes: Vec<u8> = match value {
             ConstValue::Scalar(Scalar::Int(int)) => int.to_bits(int.size()).to_le_bytes()[..size].to_vec(),
+            // A value of no size, made of empty fields.
+            ConstValue::ZeroSized => Vec::new(),
             ConstValue::Indirect { alloc_id, offset } => match tcx.global_alloc(alloc_id) {
                 GlobalAlloc::Memory(alloc) => {
                     let start = offset.bytes_usize();
@@ -1618,6 +1989,63 @@ impl<'tcx> Translator<'tcx> {
         };
         self.fill(&slot, ty, &bytes, 0)?;
         Ok(slot)
+    }
+
+    /// A reference to constant data, such as a table (`&[f32; 5]`, `&[u8]`)
+    /// or a read-only static: a reference to new locals holding its value.
+    /// A static that can change (interior mutability, `static mut`) is
+    /// refused.
+    fn constant_ref(&mut self, c: &ConstOperand<'tcx>) -> Result<Slot> {
+        let tcx = self.tcx;
+        let ty = c.ty();
+        let refusal = || format!("uses a reference to constant data (`{ty}`)");
+        let pointee = ty.builtin_deref(true).ok_or_else(refusal)?;
+        let value = c.const_.eval(tcx, self.typing_env(), c.span).map_err(|_| refusal())?;
+        let (alloc_id, offset, len) = match value {
+            ConstValue::Scalar(Scalar::Ptr(pointer, _)) => {
+                let (provenance, offset) = pointer.prov_and_relative_offset();
+                (provenance.alloc_id(), offset.bytes_usize(), None)
+            }
+            ConstValue::Slice { alloc_id, meta } => (alloc_id, 0, Some(meta)),
+            _ => return Err(refusal()),
+        };
+        let alloc = match tcx.global_alloc(alloc_id) {
+            GlobalAlloc::Memory(alloc) => alloc,
+            GlobalAlloc::Static(def_id) => {
+                let static_ty = tcx.type_of(def_id).instantiate_identity().skip_normalization();
+                if tcx.static_mutability(def_id) != Some(rustc_hir::Mutability::Not)
+                    || !static_ty.is_freeze(tcx, self.typing_env())
+                {
+                    return Err(format!("reads a static that can change (`{}`)", tcx.def_path_str(def_id)));
+                }
+                tcx.eval_static_initializer(def_id).map_err(|_| refusal())?
+            }
+            _ => return Err(refusal()),
+        };
+        let bytes = alloc.inner().inspect_with_uninit_and_ptr_outside_interpreter(0..alloc.inner().size().bytes_usize());
+        let target = match (len, pointee.kind()) {
+            (None, _) => {
+                let slot = self.fresh(pointee)?;
+                self.fill(&slot, pointee, bytes, offset)?;
+                slot
+            }
+            // A slice: its elements, one after another.
+            (Some(len), ty::Slice(element)) => {
+                if len > MAX_ARRAY {
+                    return Err(format!("uses a slice of {len} elements, more than the {MAX_ARRAY} a kernel holds in locals"));
+                }
+                let stride = self.size(*element)? as usize;
+                let mut elements = Vec::with_capacity(len as usize);
+                for index in 0..len as usize {
+                    let slot = self.fresh(*element)?;
+                    self.fill(&slot, *element, bytes, offset + index * stride)?;
+                    elements.push(slot);
+                }
+                if elements.is_empty() { Slot::Unit } else { Slot::Fields(elements) }
+            }
+            (Some(_), _) => return Err(refusal()),
+        };
+        Ok(Slot::Ref(Box::new(target)))
     }
 
     /// Sets a slot's locals from a constant's bytes, laid out as rustc lays
@@ -1648,7 +2076,257 @@ impl<'tcx> Translator<'tcx> {
             _ => Err("uses a constant holding a reference".into()),
         }
     }
+
+    /// `operand`'s bits as a value of type `to`, as `transmute` keeps them.
+    /// Both are plain data of one size, laid out as rustc lays them out,
+    /// little-endian; each number of the result gathers the bytes it covers
+    /// from the source's numbers. Bytes no number covers are padding, which
+    /// a defined transmute never reads into a number.
+    fn transmute(&mut self, frame: &mut Frame<'_, 'tcx>, operand: &Operand<'tcx>, to: Ty<'tcx>) -> Result<Slot> {
+        let from = operand.ty(frame.body, self.tcx);
+        if is_ref(from) || is_ref(to) {
+            return Err(cast_refusal(CastKind::Transmute, to));
+        }
+        let (from_size, to_size) = (self.size(from)?, self.size(to)?);
+        if from_size != to_size {
+            return Err(format!("reinterprets `{from}` as `{to}`, of another size"));
+        }
+        let value = self.operand_slot(frame, operand)?;
+        let mut sources = Vec::new();
+        self.numbers_at(&value, from, 0, &mut sources)?;
+        let result = self.fresh(to)?;
+        let mut targets = Vec::new();
+        self.numbers_at(&result, to, 0, &mut targets)?;
+        for (offset, target) in targets {
+            let ty = self.b.ty(target);
+            let width = u64::from(ty.bytes());
+            let covering: Vec<(u64, KLocal)> = sources
+                .iter()
+                .copied()
+                .filter(|&(at, source)| at < offset + width && offset < at + u64::from(self.b.ty(source).bytes()))
+                .collect();
+            let rvalue = match covering.as_slice() {
+                // The same bytes: one number reinterpreted.
+                &[(at, source)] if at == offset && self.b.ty(source).bytes() == ty.bytes() => {
+                    self.same_width(source.into(), ty)
+                }
+                _ => {
+                    let mut bits: KOperand = Const::int(KTy::U64, 0).into();
+                    for (at, source) in covering {
+                        let wide = self.unsigned_bits(source);
+                        let placed = if at >= offset {
+                            self.b.binary(KBinOp::Shl, wide, Const::int(KTy::U32, (8 * (at - offset)).into()))
+                        } else {
+                            self.b.binary(KBinOp::Shr, wide, Const::int(KTy::U32, (8 * (offset - at)).into()))
+                        };
+                        bits = self.b.binary(KBinOp::Or, bits, placed).into();
+                    }
+                    let unsigned = match width {
+                        1 => KTy::U8,
+                        2 => KTy::U16,
+                        4 => KTy::U32,
+                        _ => KTy::U64,
+                    };
+                    let narrow = self.b.cast(bits, unsigned);
+                    self.same_width(narrow.into(), ty)
+                }
+            };
+            self.set(target, rvalue);
+        }
+        Ok(result)
+    }
+
+    /// A number as another type of its width, keeping its bits. A `bool`'s
+    /// byte is 0 or 1, and only those bytes are valid `bool`s.
+    fn same_width(&mut self, value: KOperand, to: KTy) -> KRvalue {
+        let from = self.b.ty(value);
+        if from == to {
+            KRvalue::Use(value)
+        } else if to == KTy::Bool {
+            KRvalue::Binary(KBinOp::Ne, value, Const::int(from, 0).into())
+        } else if from == KTy::Bool || from.is_int() && to.is_int() {
+            KRvalue::Cast(value, to)
+        } else {
+            KRvalue::Reinterpret(value, to)
+        }
+    }
+
+    /// A number's bits, zero-extended to a `u64`.
+    fn unsigned_bits(&mut self, number: KLocal) -> KLocal {
+        let ty = self.b.ty(number);
+        let unsigned = match ty.bytes() {
+            1 => KTy::U8,
+            2 => KTy::U16,
+            4 => KTy::U32,
+            _ => KTy::U64,
+        };
+        let same = self.same_width(number.into(), unsigned);
+        let bits = self.b.assign(same);
+        self.b.cast(bits, KTy::U64)
+    }
+
+    /// The numbers of a value of type `ty`, with their offsets in its
+    /// layout from `base`.
+    fn numbers_at(&mut self, slot: &Slot, ty: Ty<'tcx>, base: u64, out: &mut Vec<(u64, KLocal)>) -> Result<()> {
+        match slot {
+            Slot::Scalar(local) => out.push((base, *local)),
+            Slot::Fields(fields) => {
+                let layout = self
+                    .tcx
+                    .layout_of(self.typing_env().as_query_input(ty))
+                    .map_err(|_| format!("uses `{ty}`, which has no layout"))?;
+                let types = self.fields(ty)?;
+                for (index, (field, field_ty)) in fields.iter().zip(types).enumerate() {
+                    self.numbers_at(field, field_ty, base + layout.fields.offset(index).bytes(), out)?;
+                }
+            }
+            Slot::Unit => {}
+            _ => return Err(format!("reinterprets the bits of `{ty}`, which holds a reference")),
+        }
+        Ok(())
+    }
+
+    fn size(&self, ty: Ty<'tcx>) -> Result<u64> {
+        self.tcx
+            .layout_of(self.typing_env().as_query_input(ty))
+            .map(|layout| layout.size.bytes())
+            .map_err(|_| format!("uses `{ty}`, which has no layout"))
+    }
 }
+
+// Refusals. Each function below matches every variant of a MIR enum, with
+// no wildcard: a toolchain that adds a variant fails to compile until it is
+// classified here (and in `docs/coverage.md`). Translation handles the
+// supported variants before reaching these.
+
+/// Why an operation can't be translated where it appears.
+fn rvalue_refusal(rvalue: &Rvalue<'_>) -> String {
+    match rvalue {
+        Rvalue::Use(..) | Rvalue::CopyForDeref(_) | Rvalue::WrapUnsafeBinder(..) => {
+            "copies a value the kernel can't hold".into()
+        }
+        Rvalue::Repeat(..) => "builds an array (`[x; N]`)".into(),
+        Rvalue::Ref(..) | Rvalue::RawPtr(..) => "borrows something it can't follow".into(),
+        Rvalue::Reborrow(ty, ..) => format!("reborrows a `{ty}` (an experimental feature)"),
+        Rvalue::ThreadLocalRef(_) => "uses a thread-local".into(),
+        Rvalue::Cast(kind, _, ty) => cast_refusal(*kind, *ty),
+        Rvalue::BinaryOp(op, _) => binary_refusal(*op),
+        Rvalue::UnaryOp(op, _) => match op {
+            UnOp::PtrMetadata => "reads the metadata of a pointer other than a read-only slice".into(),
+            UnOp::Not | UnOp::Neg => format!("uses `{op:?}` on a value the kernel can't hold"),
+        },
+        Rvalue::Discriminant(_) => "uses an enum (reads a discriminant)".into(),
+        Rvalue::Aggregate(kind, _) => aggregate_refusal(kind),
+    }
+}
+
+fn binary_refusal(op: BinOp) -> String {
+    match op {
+        BinOp::Cmp => "compares three ways (`Ord::cmp`), which gives an enum".into(),
+        BinOp::Offset => "offsets a pointer".into(),
+        BinOp::Add
+        | BinOp::AddUnchecked
+        | BinOp::AddWithOverflow
+        | BinOp::Sub
+        | BinOp::SubUnchecked
+        | BinOp::SubWithOverflow
+        | BinOp::Mul
+        | BinOp::MulUnchecked
+        | BinOp::MulWithOverflow
+        | BinOp::Div
+        | BinOp::Rem
+        | BinOp::BitXor
+        | BinOp::BitAnd
+        | BinOp::BitOr
+        | BinOp::Shl
+        | BinOp::ShlUnchecked
+        | BinOp::Shr
+        | BinOp::ShrUnchecked
+        | BinOp::Eq
+        | BinOp::Lt
+        | BinOp::Le
+        | BinOp::Ne
+        | BinOp::Ge
+        | BinOp::Gt => format!("uses `{op:?}` on values the kernel can't hold"),
+    }
+}
+
+/// Why a cast to `ty` can't be translated.
+fn cast_refusal(kind: CastKind, ty: Ty<'_>) -> String {
+    match kind {
+        CastKind::IntToInt | CastKind::FloatToInt | CastKind::FloatToFloat | CastKind::IntToFloat => {
+            format!("casts to `{ty}`, a type the kernel doesn't have")
+        }
+        CastKind::Transmute => format!("reinterprets bits as `{ty}` (a transmute)"),
+        CastKind::Subtype => format!("changes a value's type to the subtype `{ty}`"),
+        CastKind::PtrToPtr => format!("converts a pointer to `{ty}`"),
+        CastKind::PointerExposeProvenance | CastKind::PointerWithExposedProvenance => {
+            "uses a pointer as an address".into()
+        }
+        CastKind::FnPtrToPtr => "uses a function pointer as an address".into(),
+        CastKind::BoxDerefTransmute => "reads through a `Box`".into(),
+        CastKind::PointerCoercion(coercion, _) => match coercion {
+            PointerCoercion::ReifyFnPointer(..) | PointerCoercion::UnsafeFnPointer | PointerCoercion::ClosureFnPointer(..) => {
+                format!("makes a function pointer (`{ty}`)")
+            }
+            PointerCoercion::MutToConstPointer => format!("converts a pointer to `{ty}`"),
+            PointerCoercion::ArrayToPointer => "turns an array into a pointer".into(),
+            PointerCoercion::Unsize => format!("unsizes a pointer to `{ty}`"),
+        },
+    }
+}
+
+fn aggregate_refusal(kind: &AggregateKind<'_>) -> String {
+    match kind {
+        AggregateKind::Array(_) => "builds an array".into(),
+        AggregateKind::Tuple | AggregateKind::Closure(..) => "builds a value the kernel can't hold".into(),
+        AggregateKind::Adt(_, _, _, _, Some(_)) => "builds a union".into(),
+        AggregateKind::Adt(..) => "builds an enum".into(),
+        AggregateKind::Coroutine(..) | AggregateKind::CoroutineClosure(..) => "builds a coroutine".into(),
+        AggregateKind::RawPtr(..) => "builds a raw pointer from parts".into(),
+    }
+}
+
+/// Why a place projection can't be followed.
+fn projection_refusal<V, T>(element: &ProjectionElem<V, T>) -> String {
+    match element {
+        ProjectionElem::Deref => "reads through a reference it can't follow".into(),
+        ProjectionElem::Field(..) => "uses a field of a value the kernel can't hold".into(),
+        ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => "indexes an array".into(),
+        ProjectionElem::Subslice { .. } => "takes a subslice".into(),
+        ProjectionElem::Downcast(..) => "uses an enum".into(),
+        ProjectionElem::OpaqueCast(_) => "casts an opaque type".into(),
+        ProjectionElem::UnwrapUnsafeBinder(_) => "unwraps an unsafe binder".into(),
+        ProjectionElem::PhantomDeref => "reborrows through a user type (an experimental feature)".into(),
+    }
+}
+
+/// Why a value of type `ty` can't be held in kernel locals.
+fn type_refusal(ty: Ty<'_>) -> String {
+    match ty.kind() {
+        ty::Bool | ty::Int(_) | ty::Uint(_) | ty::Float(_) => format!("uses `{ty}`, a number the kernel doesn't have"),
+        ty::Char => "uses `char`".into(),
+        ty::Adt(adt, _) if adt.is_box() => format!("uses a `Box` (`{ty}`)"),
+        ty::Adt(adt, _) if adt.is_enum() => format!("uses the enum `{ty}`"),
+        ty::Adt(adt, _) if adt.is_union() => format!("uses the union `{ty}`"),
+        ty::Adt(adt, _) if adt.repr().simd() => format!("uses the SIMD vector `{ty}`"),
+        ty::Adt(..) => format!("uses a value of type `{ty}`"),
+        ty::Array(..) => format!("uses an array (`{ty}`)"),
+        ty::Slice(_) | ty::Str => format!("uses an unsized value (`{ty}`)"),
+        ty::RawPtr(..) | ty::Ref(..) => format!("uses a pointer it can't follow (`{ty}`)"),
+        ty::FnPtr(..) => format!("uses a function pointer (`{ty}`)"),
+        ty::Dynamic(..) => format!("uses a trait object (`{ty}`)"),
+        ty::Closure(..) | ty::FnDef(..) | ty::Tuple(_) | ty::Never => format!("uses a value of type `{ty}`"),
+        ty::Coroutine(..) | ty::CoroutineClosure(..) | ty::CoroutineWitness(..) => format!("uses a coroutine (`{ty}`)"),
+        ty::Foreign(_) => format!("uses an extern type (`{ty}`)"),
+        ty::Pat(..) => format!("uses a pattern type (`{ty}`)"),
+        ty::UnsafeBinder(_) => format!("uses an unsafe binder (`{ty}`)"),
+        ty::Alias(..) | ty::Param(_) | ty::Bound(..) | ty::Placeholder(_) | ty::Infer(_) | ty::Error(_) => {
+            format!("uses the unresolved type `{ty}`")
+        }
+    }
+}
+
 
 /// The blocks of `region` that can never finish normally: every path from
 /// them ends in a call that never returns (a panic), or never ends. A frame

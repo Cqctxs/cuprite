@@ -438,6 +438,54 @@ fn general_cases(state: &mut u64) -> usize {
     // Held out before, now development code: `num-integer`'s square root,
     // a closure passed to a generic fixed-point loop.
     checked += general("ni_sqrt", state, probes::ni_sqrt, |x: u64| x.isqrt());
+    // Arrays and bit reinterpretation.
+    let coeffs = [0.5f32, -1.25, 2.0, 0.75];
+    checked += general("array_poly", state, |v: &mut [f32]| probes::array_poly(v, coeffs), |x| {
+        (((0.0 * x + 0.75) * x + 2.0) * x + -1.25) * x + 0.5
+    });
+    checked += general("array_bytes", state, probes::array_bytes, u32::swap_bytes);
+    checked += general("array_histogram", state, probes::array_histogram, |x: u32| {
+        let groups: Vec<u32> = (0..10).map(|k| (x >> (3 * k)) & 7).collect();
+        (0..8u32).fold(0u32, |mix, g| mix.wrapping_mul(31).wrapping_add(groups.iter().filter(|&&n| n == g).count() as u32))
+    });
+    checked += general("array_const_table", state, probes::array_const_table, |x: u32| (x & 0xFF).count_ones() | (x & !0xFF));
+    checked += general("array_matrix", state, |v: &mut [u32]| probes::array_matrix(v, [[3, 5], [7, 11]]), |x| {
+        let picked = match (x & 1, (x >> 1) & 1) {
+            (0, 0) => 3u32,
+            (0, _) => 5,
+            (_, 0) => 7,
+            _ => 11,
+        };
+        picked.wrapping_mul(5).wrapping_add(x ^ 7)
+    });
+    checked += general("array_gradients", state, probes::array_gradients, |x: f32| {
+        let (gx, gy) = match x.to_bits() & 3 {
+            0 => (1.0, 0.0),
+            1 => (0.0, 1.0),
+            2 => (-1.0, 0.0),
+            _ => (0.0, -1.0),
+        };
+        gx * x + gy * 0.5
+    });
+    checked += general("array_patterns", state, probes::array_patterns, |x: u32| {
+        (x & 0xFF) << 24 | (((x >> 8) ^ (x >> 16)) & 0xFF) << 8 | 3 << 16 | x >> 24
+    });
+    checked += general("float_bits", state, probes::float_bits, |x: u32| (x & 0x7FFF_FFFF) ^ (x >> 31));
+    checked += general("float_exponent", state, probes::float_exponent, |x: f64| {
+        if x.is_normal() && (x.to_bits() >> 52) & 0x7FF < 0x7FE { x * 2.0 } else { x }
+    });
+    // Held out before, now development code: `half`'s bfloat16, rounded to
+    // nearest even on the bits.
+    checked += general("bf16_round_trip", state, probes::bf16_round_trip, |x: f32| {
+        let bits = x.to_bits();
+        if x.is_nan() { f32::NAN } else { f32::from_bits(bits.wrapping_add(0x7FFF + ((bits >> 16) & 1)) & 0xFFFF_0000) }
+    });
+    checked += general("transmute_halves", state, probes::transmute_halves, |x: u32| x.rotate_left(16));
+    checked += general("transmute_struct", state, probes::transmute_struct, |x: u64| {
+        let c = u64::from(((x >> 16) as u16).rotate_left(4));
+        let d = (x >> 32) & 0x7FFF_FFFF;
+        (x >> 8) & 0xFF | (x & 0xFF) << 8 | c << 16 | d << 32
+    });
     checked
 }
 
