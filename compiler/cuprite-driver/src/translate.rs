@@ -47,11 +47,23 @@
 //! by rustc's layout: each number of the result gathers the bytes it covers
 //! from the source's numbers.
 //!
-//! Supported values: integers, floats and `bool`, structs, tuples and
-//! arrays of them, closures, with references to any of those. Enums,
-//! slices other than read-only parameters and constants, raw pointer
-//! arithmetic, coroutines and statics that can change are refused with a
-//! reason.
+//! # Enums
+//!
+//! An enum is held as its discriminant's value and every variant's fields
+//! ([`Slot::Enum`]); only the active variant's fields mean anything.
+//! Building a variant sets the discriminant and that variant's fields;
+//! `match` reads the discriminant and switches on it, as MIR does. Layout
+//! matters only where bytes do: constant enums and `transmute` read and
+//! write the tag or niche (`Option<NonZero<u32>>`'s `None` is a zero) as
+//! rustc's layout stores it. `Ord::cmp` of numbers gives `Ordering`'s
+//! discriminant directly. A `char` is held as its `u32` code, and a pattern
+//! type (`NonZero`'s field) as the number it restricts.
+//!
+//! Supported values: integers, floats, `bool` and `char`, structs, tuples,
+//! arrays and enums of them, closures, with references to any of those.
+//! Slices other than read-only parameters and constants, unions, raw
+//! pointer arithmetic, coroutines and statics that can change are refused
+//! with a reason.
 //!
 //! Panics must be provable away: [`assert_holds`] accepts an assertion only
 //! when its condition folds to a constant that passes, as for a division by
@@ -71,7 +83,7 @@ use rustc_middle::{
     },
     ty::{self, FloatTy, Instance, InstanceKind, IntTy, ShimKind, Ty, TyCtxt, TypingEnv, UintTy},
 };
-use rustc_abi::ExternAbi;
+use rustc_abi::{ExternAbi, TagEncoding, VariantIdx, Variants};
 use rustc_middle::{mir::NonDivergingIntrinsic, ty::adjustment::PointerCoercion};
 use rustc_span::def_id::DefId;
 
@@ -95,10 +107,23 @@ pub(crate) fn kernel_ty(ty: Ty<'_>) -> Option<KTy> {
     })
 }
 
+/// The kernel type a number is held in inside a kernel: as `kernel_ty`, and
+/// a `char` as its `u32` code, a pattern type (`NonZero`'s field) as the
+/// type it restricts. Only valid values ever reach these, so the kernel
+/// computes on them as the CPU does. Parameters and slices take only
+/// `kernel_ty`'s types.
+pub(crate) fn held_ty(ty: Ty<'_>) -> Option<KTy> {
+    match ty.kind() {
+        ty::Char => Some(KTy::U32),
+        ty::Pat(inner, _) => held_ty(*inner),
+        _ => kernel_ty(ty),
+    }
+}
+
 /// A scalar constant of a supported type, evaluating it if it's an
 /// unevaluated constant such as an associated `const`.
 pub(crate) fn constant<'tcx>(tcx: TyCtxt<'tcx>, constant: &ConstOperand<'tcx>) -> Option<Const> {
-    let ty = kernel_ty(constant.ty())?;
+    let ty = held_ty(constant.ty())?;
     let scalar = match constant.const_.try_to_scalar_int() {
         Some(scalar) => scalar,
         None => match constant.const_.eval(tcx, TypingEnv::fully_monomorphized(), constant.span).ok()? {
@@ -872,6 +897,11 @@ enum Slot {
     /// chosen. `index` holds the index as it was when the place was
     /// formed, and is below the number of options: MIR checks it first.
     Choice { index: KLocal, options: Vec<Slot> },
+    /// An enum: its discriminant's value, and each variant's fields
+    /// (`Fields`, or `Unit` for none), whatever variant is active. Only the
+    /// active variant's fields mean anything. As a value being stored, a
+    /// `Unit` variant is one it doesn't write.
+    Enum { tag: KLocal, variants: Vec<Slot> },
 }
 
 impl Slot {
@@ -879,6 +909,10 @@ impl Slot {
         match self {
             Slot::Scalar(local) => out.push(*local),
             Slot::Fields(fields) => fields.iter().for_each(|field| field.scalars(out)),
+            Slot::Enum { tag, variants } => {
+                out.push(*tag);
+                variants.iter().for_each(|variant| variant.scalars(out));
+            }
             Slot::Choice { index, options } => {
                 out.push(*index);
                 options.iter().for_each(|option| option.scalars(out));
@@ -1016,7 +1050,14 @@ impl<'tcx> Translator<'tcx> {
                         return Err("copies memory (`copy_nonoverlapping`)".into());
                     }
                 },
-                StatementKind::SetDiscriminant { .. } => return Err("uses an enum (sets a discriminant)".into()),
+                StatementKind::SetDiscriminant { place, variant_index } => {
+                    let ty = place.ty(frame.body, self.tcx).ty;
+                    let value = self.discriminant(ty, *variant_index)?;
+                    match self.place(frame, place)? {
+                        Slot::Enum { tag, .. } => self.set(tag, KRvalue::Use(value.into())),
+                        _ => return Err("sets the discriminant of something other than an enum".into()),
+                    }
+                }
                 // Storage markers, borrow-checker annotations and no-ops.
                 StatementKind::FakeRead(_)
                 | StatementKind::StorageLive(_)
@@ -1334,25 +1375,82 @@ impl<'tcx> Translator<'tcx> {
         if let Some(pointee) = ty.builtin_deref(true) {
             return Ok(Slot::Ref(Box::new(self.fresh_deep(pointee, depth + 1)?)));
         }
-        if kernel_ty(ty).is_some() {
+        if held_ty(ty).is_some() {
             return self.fresh(ty);
         }
+        if let Some((tag, variants)) = self.enum_shape(ty)? {
+            let tag = self.b.local(tag);
+            let variants = variants
+                .into_iter()
+                .map(|fields| self.fresh_fields_deep(fields, depth))
+                .collect::<Result<_>>()?;
+            return Ok(Slot::Enum { tag, variants });
+        }
         let fields = self.fields(ty)?;
+        self.fresh_fields_deep(fields, depth)
+    }
+
+    fn fresh_fields_deep(&mut self, fields: Vec<Ty<'tcx>>, depth: usize) -> Result<Slot> {
         if fields.is_empty() {
             return Ok(Slot::Unit);
         }
         Ok(Slot::Fields(fields.into_iter().map(|field| self.fresh_deep(field, depth + 1)).collect::<Result<_>>()?))
     }
 
+    /// The kernel type of an enum's discriminant and each variant's field
+    /// types, if `ty` is an enum.
+    fn enum_shape(&self, ty: Ty<'tcx>) -> Result<Option<(KTy, Vec<Vec<Ty<'tcx>>>)>> {
+        let ty::Adt(adt, args) = ty.kind() else {
+            return Ok(None);
+        };
+        if !adt.is_enum() {
+            return Ok(None);
+        }
+        let tcx = self.tcx;
+        let discriminant = ty.discriminant_ty(tcx);
+        let tag = kernel_ty(discriminant)
+            .ok_or_else(|| format!("uses the enum `{ty}`, whose discriminant is a `{discriminant}`"))?;
+        let variants = adt
+            .variants()
+            .iter()
+            .map(|variant| {
+                variant
+                    .fields
+                    .iter()
+                    .map(|field| tcx.normalize_erasing_regions(self.typing_env(), field.ty(tcx, args)))
+                    .collect()
+            })
+            .collect();
+        Ok(Some((tag, variants)))
+    }
+
+    /// The value of the discriminant of `ty`'s variant `variant`.
+    fn discriminant(&self, ty: Ty<'tcx>, variant: VariantIdx) -> Result<Const> {
+        let tag = kernel_ty(ty.discriminant_ty(self.tcx)).ok_or_else(|| format!("uses the enum `{ty}`"))?;
+        let value = ty
+            .discriminant_for_variant(self.tcx, variant)
+            .ok_or_else(|| format!("uses `{ty}`, which has no variant {}", variant.as_usize()))?;
+        Ok(Const::int(tag, value.val as i128))
+    }
+
     /// The slot for a fresh value of type `ty`.
     fn fresh(&mut self, ty: Ty<'tcx>) -> Result<Slot> {
-        if let Some(kernel) = kernel_ty(ty) {
+        if let Some(kernel) = held_ty(ty) {
             return Ok(Slot::Scalar(self.b.local(kernel)));
         }
         if is_ref(ty) {
             return Ok(Slot::Unbound);
         }
+        if let Some((tag, variants)) = self.enum_shape(ty)? {
+            let tag = self.b.local(tag);
+            let variants = variants.into_iter().map(|fields| self.fresh_fields(fields)).collect::<Result<_>>()?;
+            return Ok(Slot::Enum { tag, variants });
+        }
         let fields = self.fields(ty)?;
+        self.fresh_fields(fields)
+    }
+
+    fn fresh_fields(&mut self, fields: Vec<Ty<'tcx>>) -> Result<Slot> {
         if fields.is_empty() {
             return Ok(Slot::Unit);
         }
@@ -1429,6 +1527,9 @@ impl<'tcx> Translator<'tcx> {
                 fields.get(*field).cloned().ok_or("uses a field that doesn't exist")?
             }
             (Step::Downcast(1), Slot::Some(inner)) => Slot::Fields(vec![*inner]),
+            (Step::Downcast(variant), Slot::Enum { variants, .. }) => {
+                variants.get(*variant as usize).cloned().ok_or("uses a variant that doesn't exist")?
+            }
             (Step::Downcast(_), _) => return Err("uses an enum".into()),
             // An array, held as its elements.
             (Step::Index(index), Slot::Fields(elements)) => Slot::Choice { index: *index, options: elements },
@@ -1553,6 +1654,18 @@ impl<'tcx> Translator<'tcx> {
                 let fields = d.iter().zip(s).map(|(d, s)| self.copy_fields(d, s)).collect::<Result<_>>()?;
                 return Ok(Slot::Fields(fields));
             }
+            // The discriminant, and each variant the value writes.
+            (Slot::Enum { tag: d, variants: dv }, Slot::Enum { tag: s, variants: sv }) if dv.len() == sv.len() => {
+                if d != s {
+                    self.set(*d, KRvalue::Use((*s).into()));
+                }
+                let variants = dv
+                    .iter()
+                    .zip(sv)
+                    .map(|(d, s)| if *s == Slot::Unit { Ok(d.clone()) } else { self.copy_fields(d, s) })
+                    .collect::<Result<_>>()?;
+                return Ok(Slot::Enum { tag: *d, variants });
+            }
             (Slot::Unit, Slot::Unit) | (Slot::Unbound, Slot::Unbound) => {}
             (Slot::Unbound, Slot::Ref(_)) => return Ok(src.clone()),
             (Slot::Ref(d), Slot::Ref(s)) if d == s => {}
@@ -1581,6 +1694,16 @@ impl<'tcx> Translator<'tcx> {
                     let chosen = self.chosen(*index, at);
                     let both = self.b.binary(KBinOp::And, condition, chosen);
                     self.copy_where(both, option, src)?;
+                }
+            }
+            (Slot::Enum { tag: d, variants: dv }, Slot::Enum { tag: s, variants: sv }) if dv.len() == sv.len() => {
+                if d != s {
+                    self.set(*d, KRvalue::Select(condition.into(), (*s).into(), (*d).into()));
+                }
+                for (d, s) in dv.iter().zip(sv) {
+                    if *s != Slot::Unit {
+                        self.copy_where(condition, d, s)?;
+                    }
                 }
             }
             (Slot::Unit, Slot::Unit) | (Slot::Unbound, Slot::Unbound) => {}
@@ -1647,6 +1770,23 @@ impl<'tcx> Translator<'tcx> {
                 }
                 Slot::Fields(chosen)
             }
+            Slot::Enum { variants, .. } => {
+                let mut tags = Vec::with_capacity(options.len());
+                let mut columns = vec![Vec::with_capacity(options.len()); variants.len()];
+                for option in options {
+                    let Slot::Enum { tag, variants: v } = option else { return Err(shapes()) };
+                    if v.len() != variants.len() {
+                        return Err(shapes());
+                    }
+                    tags.push(Slot::Scalar(*tag));
+                    for (column, variant) in columns.iter_mut().zip(v) {
+                        column.push(variant.clone());
+                    }
+                }
+                let Slot::Scalar(tag) = self.select_among(index, &tags)? else { return Err(shapes()) };
+                let variants = columns.iter().map(|column| self.select_among(index, column)).collect::<Result<_>>()?;
+                Slot::Enum { tag, variants }
+            }
             Slot::Ref(_) => {
                 let targets = options
                     .iter()
@@ -1706,6 +1846,10 @@ impl<'tcx> Translator<'tcx> {
             Slot::Scalar(local) => Slot::Scalar(self.b.copy(*local)),
             Slot::Fields(fields) => Slot::Fields(fields.iter().map(|field| self.snapshot(field)).collect::<Result<_>>()?),
             Slot::Choice { .. } => self.resolve(src.clone())?,
+            Slot::Enum { tag, variants } => Slot::Enum {
+                tag: self.b.copy(*tag),
+                variants: variants.iter().map(|variant| self.snapshot(variant)).collect::<Result<_>>()?,
+            },
             other => other.clone(),
         })
     }
@@ -1721,7 +1865,7 @@ impl<'tcx> Translator<'tcx> {
             let value = self.transmute(frame, operand, *to)?;
             return self.store(frame, place, value);
         }
-        if kernel_ty(ty).is_some() {
+        if held_ty(ty).is_some() {
             let value = self.scalar_rvalue(frame, rvalue)?;
             let dest = self.place(frame, place)?;
             return self.write_number(dest, value);
@@ -1733,6 +1877,23 @@ impl<'tcx> Translator<'tcx> {
             let (a, b) = (self.scalar_operand(frame, &operands.0)?, self.scalar_operand(frame, &operands.1)?);
             let (result, overflowed) = self.with_overflow(*op, a, b)?;
             return self.store(frame, place, Slot::Fields(vec![Slot::Scalar(result), Slot::Scalar(overflowed)]));
+        }
+        // `Ord::cmp` of numbers: `Less`, `Equal` or `Greater`, whose
+        // discriminants are -1, 0 and 1.
+        if let Rvalue::BinaryOp(BinOp::Cmp, operands) = rvalue {
+            let (mut a, mut b) = (self.scalar_operand(frame, &operands.0)?, self.scalar_operand(frame, &operands.1)?);
+            if self.b.ty(a) == KTy::Bool {
+                a = self.b.cast(a, KTy::U8).into();
+                b = self.b.cast(b, KTy::U8).into();
+            }
+            let Some((tag_ty, variants)) = self.enum_shape(ty)? else {
+                return Err(binary_refusal(BinOp::Cmp));
+            };
+            let (less, greater) = (self.b.binary(KBinOp::Lt, a, b), self.b.binary(KBinOp::Gt, a, b));
+            let above = self.b.select(greater, Const::int(tag_ty, 1), Const::int(tag_ty, 0));
+            let tag = self.b.select(less, Const::int(tag_ty, -1), above);
+            let value = Slot::Enum { tag, variants: vec![Slot::Unit; variants.len()] };
+            return self.store(frame, place, value);
         }
         match rvalue {
             Rvalue::Use(operand, _) => {
@@ -1749,6 +1910,23 @@ impl<'tcx> Translator<'tcx> {
                 let count = array_len(self.tcx, *count)?;
                 let value = if count == 0 { Slot::Unit } else { Slot::Fields(vec![value; count]) };
                 self.store(frame, place, value)
+            }
+            // An enum's variant: its discriminant and its fields, leaving the
+            // other variants alone.
+            Rvalue::Aggregate(kind, operands)
+                if matches!(**kind, AggregateKind::Adt(adt, _, _, _, None) if self.tcx.adt_def(adt).is_enum()) =>
+            {
+                let AggregateKind::Adt(_, variant, ..) = **kind else { unreachable!("matched above") };
+                let Some((_, shape)) = self.enum_shape(ty)? else { return Err(aggregate_refusal(kind)) };
+                let tag = self.discriminant(ty, variant)?;
+                let tag = self.b.copy(tag);
+                let values: Vec<Slot> =
+                    operands.iter().map(|operand| self.operand_slot(frame, operand)).collect::<Result<_>>()?;
+                let mut variants = vec![Slot::Unit; shape.len()];
+                if !values.is_empty() {
+                    variants[variant.as_usize()] = Slot::Fields(values);
+                }
+                self.store(frame, place, Slot::Enum { tag, variants })
             }
             Rvalue::Aggregate(kind, operands) => {
                 match **kind {
@@ -1822,6 +2000,14 @@ impl<'tcx> Translator<'tcx> {
                 };
                 KRvalue::Binary(op, a, b)
             }
+            // An enum's discriminant.
+            Rvalue::Discriminant(place) => {
+                let slot = self.place(frame, place)?;
+                match self.resolve(slot)? {
+                    Slot::Enum { tag, .. } => KRvalue::Use(tag.into()),
+                    _ => return Err(rvalue_refusal(rvalue)),
+                }
+            }
             // A read-only slice's length, or that of an array as a slice.
             Rvalue::UnaryOp(UnOp::PtrMetadata, operand) => match self.operand_slot(frame, operand)? {
                 Slot::Ref(inner) => match *inner {
@@ -1849,7 +2035,7 @@ impl<'tcx> Translator<'tcx> {
                     kind,
                     CastKind::IntToInt | CastKind::IntToFloat | CastKind::FloatToInt | CastKind::FloatToFloat
                 );
-                let to = kernel_ty(*ty).filter(|_| numeric).ok_or_else(|| cast_refusal(*kind, *ty))?;
+                let to = held_ty(*ty).filter(|_| numeric).ok_or_else(|| cast_refusal(*kind, *ty))?;
                 KRvalue::Cast(self.scalar_operand(frame, operand)?, to)
             }
             Rvalue::Ref(..) | Rvalue::RawPtr(..) => {
@@ -2053,7 +2239,7 @@ impl<'tcx> Translator<'tcx> {
     fn fill(&mut self, slot: &Slot, ty: Ty<'tcx>, bytes: &[u8], base: usize) -> Result<()> {
         match slot {
             Slot::Scalar(local) => {
-                let kernel = kernel_ty(ty).ok_or("uses a constant of an unexpected type")?;
+                let kernel = held_ty(ty).ok_or("uses a constant of an unexpected type")?;
                 let size = kernel.bytes() as usize;
                 let mut buffer = [0u8; 8];
                 buffer[..size].copy_from_slice(bytes.get(base..base + size).ok_or("reads past a constant")?);
@@ -2072,8 +2258,68 @@ impl<'tcx> Translator<'tcx> {
                 }
                 Ok(())
             }
+            Slot::Enum { tag, variants } => {
+                let (variant, offsets) = self.constant_variant(ty, bytes, base)?;
+                let discriminant = self.discriminant(ty, variant)?;
+                self.b.set(*tag, KRvalue::Use(discriminant.into()));
+                let Some((_, shape)) = self.enum_shape(ty)? else {
+                    return Err(format!("uses a constant of type `{ty}` that isn't plain data"));
+                };
+                if let Slot::Fields(fields) = &variants[variant.as_usize()] {
+                    for ((field, field_ty), offset) in fields.iter().zip(&shape[variant.as_usize()]).zip(offsets) {
+                        self.fill(field, *field_ty, bytes, base + offset)?;
+                    }
+                }
+                Ok(())
+            }
             Slot::Unit => Ok(()),
             _ => Err("uses a constant holding a reference".into()),
+        }
+    }
+
+    /// Which variant a constant enum at `base` in `bytes` holds, and where
+    /// its fields are, from rustc's layout: a tag holding the discriminant,
+    /// or a niche, a field's invalid values standing for other variants.
+    fn constant_variant(&self, ty: Ty<'tcx>, bytes: &[u8], base: usize) -> Result<(VariantIdx, Vec<usize>)> {
+        let tcx = self.tcx;
+        let layout = tcx
+            .layout_of(self.typing_env().as_query_input(ty))
+            .map_err(|_| format!("uses a constant of type `{ty}` without a layout"))?;
+        let ty::Adt(adt, _) = ty.kind() else {
+            return Err(format!("uses a constant of type `{ty}` that isn't plain data"));
+        };
+        match &layout.variants {
+            Variants::Empty => Err(format!("uses a constant of the uninhabited type `{ty}`")),
+            Variants::Single { index } => {
+                let count = adt.variant(*index).fields.len();
+                Ok((*index, (0..count).map(|field| layout.fields.offset(field).bytes_usize()).collect()))
+            }
+            Variants::Multiple { tag, tag_encoding, tag_field, variants } => {
+                let size = tag.size(&tcx).bytes_usize();
+                let at = base + layout.fields.offset(tag_field.as_usize()).bytes_usize();
+                let mut buffer = [0u8; 16];
+                buffer[..size].copy_from_slice(bytes.get(at..at + size).ok_or("reads past a constant")?);
+                let raw = u128::from_le_bytes(buffer);
+                let mask = if size >= 16 { u128::MAX } else { (1u128 << (8 * size)) - 1 };
+                let variant = match tag_encoding {
+                    TagEncoding::Direct => adt
+                        .discriminants(tcx)
+                        .find(|(_, discriminant)| discriminant.val & mask == raw)
+                        .map(|(variant, _)| variant)
+                        .ok_or_else(|| format!("uses a constant of type `{ty}` with no valid variant"))?,
+                    TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
+                        let relative = raw.wrapping_sub(*niche_start) & mask;
+                        let count = u128::from(niche_variants.last.as_u32() - niche_variants.start.as_u32());
+                        if relative <= count {
+                            VariantIdx::from_u32(niche_variants.start.as_u32() + relative as u32)
+                        } else {
+                            *untagged_variant
+                        }
+                    }
+                };
+                let offsets = variants[variant].field_offsets.iter().map(|offset| offset.bytes_usize()).collect();
+                Ok((variant, offsets))
+            }
         }
     }
 
@@ -2081,7 +2327,8 @@ impl<'tcx> Translator<'tcx> {
     /// Both are plain data of one size, laid out as rustc lays them out,
     /// little-endian; each number of the result gathers the bytes it covers
     /// from the source's numbers. Bytes no number covers are padding, which
-    /// a defined transmute never reads into a number.
+    /// a defined transmute never reads into a number. Enums are read and
+    /// written through their tags or niches, as their layout stores them.
     fn transmute(&mut self, frame: &mut Frame<'_, 'tcx>, operand: &Operand<'tcx>, to: Ty<'tcx>) -> Result<Slot> {
         let from = operand.ty(frame.body, self.tcx);
         if is_ref(from) || is_ref(to) {
@@ -2092,48 +2339,195 @@ impl<'tcx> Translator<'tcx> {
             return Err(format!("reinterprets `{from}` as `{to}`, of another size"));
         }
         let value = self.operand_slot(frame, operand)?;
-        let mut sources = Vec::new();
-        self.numbers_at(&value, from, 0, &mut sources)?;
         let result = self.fresh(to)?;
-        let mut targets = Vec::new();
-        self.numbers_at(&result, to, 0, &mut targets)?;
-        for (offset, target) in targets {
-            let ty = self.b.ty(target);
-            let width = u64::from(ty.bytes());
-            let covering: Vec<(u64, KLocal)> = sources
-                .iter()
-                .copied()
-                .filter(|&(at, source)| at < offset + width && offset < at + u64::from(self.b.ty(source).bytes()))
-                .collect();
-            let rvalue = match covering.as_slice() {
-                // The same bytes: one number reinterpreted.
-                &[(at, source)] if at == offset && self.b.ty(source).bytes() == ty.bytes() => {
-                    self.same_width(source.into(), ty)
-                }
-                _ => {
-                    let mut bits: KOperand = Const::int(KTy::U64, 0).into();
-                    for (at, source) in covering {
-                        let wide = self.unsigned_bits(source);
-                        let placed = if at >= offset {
-                            self.b.binary(KBinOp::Shl, wide, Const::int(KTy::U32, (8 * (at - offset)).into()))
-                        } else {
-                            self.b.binary(KBinOp::Shr, wide, Const::int(KTy::U32, (8 * (offset - at)).into()))
-                        };
-                        bits = self.b.binary(KBinOp::Or, bits, placed).into();
-                    }
-                    let unsigned = match width {
-                        1 => KTy::U8,
-                        2 => KTy::U16,
-                        4 => KTy::U32,
-                        _ => KTy::U64,
-                    };
-                    let narrow = self.b.cast(bits, unsigned);
-                    self.same_width(narrow.into(), ty)
-                }
-            };
-            self.set(target, rvalue);
-        }
+        self.decode(&result, to, 0, &value, from)?;
         Ok(result)
+    }
+
+    /// Sets `dest`, of type `ty`, from the bytes at `base` of `src`, a value
+    /// of type `src_ty`.
+    fn decode(&mut self, dest: &Slot, ty: Ty<'tcx>, base: u64, src: &Slot, src_ty: Ty<'tcx>) -> Result<()> {
+        match dest {
+            Slot::Scalar(local) => {
+                let kernel = self.b.ty(*local);
+                let width = u64::from(kernel.bytes());
+                let rvalue = match src {
+                    // The same bytes: one number reinterpreted.
+                    Slot::Scalar(number) if base == 0 && self.b.ty(*number).bytes() == kernel.bytes() => {
+                        self.same_width((*number).into(), kernel)
+                    }
+                    _ => {
+                        let bits = self.gather(src, src_ty, 0, base, width)?;
+                        let narrow = self.b.cast(bits, unsigned_of(width));
+                        self.same_width(narrow.into(), kernel)
+                    }
+                };
+                self.set(*local, rvalue);
+            }
+            Slot::Fields(fields) => {
+                let layout = self.layout(ty)?;
+                let types = self.fields(ty)?;
+                for (index, (field, field_ty)) in fields.iter().zip(types).enumerate() {
+                    self.decode(field, field_ty, base + layout.fields.offset(index).bytes(), src, src_ty)?;
+                }
+            }
+            Slot::Unit => {}
+            Slot::Enum { tag, variants } => {
+                let layout = self.layout(ty)?;
+                let Some((tag_ty, shape)) = self.enum_shape(ty)? else {
+                    return Err(format!("reinterprets bits as `{ty}`"));
+                };
+                for (index, variant) in variants.iter().enumerate() {
+                    let (Slot::Fields(fields), Some(offsets)) = (variant, variant_offsets(&layout, index)) else {
+                        continue;
+                    };
+                    for ((field, field_ty), offset) in fields.iter().zip(&shape[index]).zip(offsets) {
+                        self.decode(field, *field_ty, base + offset, src, src_ty)?;
+                    }
+                }
+                let discriminant: KOperand = match &layout.variants {
+                    Variants::Empty => return Err(format!("reinterprets bits as the uninhabited `{ty}`")),
+                    Variants::Single { index } => self.discriminant(ty, *index)?.into(),
+                    Variants::Multiple { tag: scalar, tag_encoding, tag_field, .. } => {
+                        let size = scalar.size(&self.tcx).bytes();
+                        if size > 8 {
+                            return Err(format!("reinterprets bits as `{ty}`, whose tag is wider than 64 bits"));
+                        }
+                        let at = base + layout.fields.offset(tag_field.as_usize()).bytes();
+                        let raw = self.gather(src, src_ty, 0, at, size)?;
+                        match tag_encoding {
+                            // The tag is the discriminant, in its width and
+                            // signedness.
+                            TagEncoding::Direct => {
+                                let narrow = self.b.cast(raw, unsigned_of(size));
+                                let signed = matches!(scalar.primitive(), rustc_abi::Primitive::Int(_, true));
+                                let narrow = if signed { self.b.cast(narrow, signed_of(size)) } else { narrow };
+                                self.b.cast(narrow, tag_ty).into()
+                            }
+                            // Tag values from `niche_start` on stand for the
+                            // niche variants in order; others for the
+                            // untagged variant.
+                            TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
+                                let mask = if size == 8 { u64::MAX } else { (1u64 << (8 * size)) - 1 };
+                                let start = Const::int(KTy::U64, i128::from(*niche_start as u64));
+                                let shifted = self.b.binary(KBinOp::Sub, raw, start);
+                                let relative = self.b.binary(KBinOp::And, shifted, Const::int(KTy::U64, mask.into()));
+                                let mut chosen: KOperand = self.discriminant(ty, *untagged_variant)?.into();
+                                let (first, last) = (niche_variants.start.as_u32(), niche_variants.last.as_u32());
+                                for variant in first..=last {
+                                    let step = Const::int(KTy::U64, (variant - first).into());
+                                    let is = self.b.binary(KBinOp::Eq, relative, step);
+                                    let value = self.discriminant(ty, VariantIdx::from_u32(variant))?;
+                                    chosen = self.b.select(is, value, chosen).into();
+                                }
+                                chosen
+                            }
+                        }
+                    }
+                };
+                self.set(*tag, KRvalue::Use(discriminant));
+            }
+            _ => return Err(format!("reinterprets bits as `{ty}`, which holds a reference")),
+        }
+        Ok(())
+    }
+
+    /// The bits of the bytes `offset..offset + width` (at most 8) of `src`,
+    /// a value of type `ty` laid out from `base`, zero-extended to a `u64`.
+    fn gather(&mut self, src: &Slot, ty: Ty<'tcx>, base: u64, offset: u64, width: u64) -> Result<KOperand> {
+        let zero = KOperand::from(Const::int(KTy::U64, 0));
+        Ok(match src {
+            Slot::Scalar(number) => {
+                let size = u64::from(self.b.ty(*number).bytes());
+                if base >= offset + width || offset >= base + size {
+                    return Ok(zero);
+                }
+                let wide = self.unsigned_bits(*number);
+                self.place_bits(wide.into(), base, offset).into()
+            }
+            Slot::Fields(fields) => {
+                let layout = self.layout(ty)?;
+                let types = self.fields(ty)?;
+                let mut bits = zero;
+                for (index, (field, field_ty)) in fields.iter().zip(types).enumerate() {
+                    let at = base + layout.fields.offset(index).bytes();
+                    if at >= offset + width || offset >= at + self.size(field_ty)? {
+                        continue;
+                    }
+                    let part = self.gather(field, field_ty, at, offset, width)?;
+                    bits = self.or(bits, part);
+                }
+                bits
+            }
+            Slot::Unit => zero,
+            // Each variant's bytes, with its tag, chosen by the discriminant.
+            Slot::Enum { tag, variants } => {
+                let layout = self.layout(ty)?;
+                let Some((_, shape)) = self.enum_shape(ty)? else {
+                    return Err(format!("reinterprets the bits of `{ty}`"));
+                };
+                let mut chosen = zero;
+                for (index, variant) in variants.iter().enumerate() {
+                    let Some(offsets) = variant_offsets(&layout, index) else { continue };
+                    let mut bits = zero;
+                    if let Slot::Fields(fields) = variant {
+                        for ((field, field_ty), field_offset) in fields.iter().zip(&shape[index]).zip(offsets) {
+                            let at = base + field_offset;
+                            if at >= offset + width || offset >= at + self.size(*field_ty)? {
+                                continue;
+                            }
+                            let part = self.gather(field, *field_ty, at, offset, width)?;
+                            bits = self.or(bits, part);
+                        }
+                    }
+                    if let Variants::Multiple { tag: scalar, tag_encoding, tag_field, .. } = &layout.variants {
+                        let size = scalar.size(&self.tcx).bytes();
+                        let at = base + layout.fields.offset(tag_field.as_usize()).bytes();
+                        let stored = match tag_encoding {
+                            TagEncoding::Direct => Some(self.discriminant(ty, VariantIdx::from_usize(index))?.bits),
+                            TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
+                                let (first, last) = (niche_variants.start.as_usize(), niche_variants.last.as_usize());
+                                (index != untagged_variant.as_usize() && (first..=last).contains(&index))
+                                    .then(|| (*niche_start as u64).wrapping_add((index - first) as u64))
+                            }
+                        };
+                        if let Some(stored) = stored.filter(|_| at < offset + width && offset < at + size) {
+                            let mask = if size >= 8 { u64::MAX } else { (1u64 << (8 * size)) - 1 };
+                            let constant = KOperand::from(Const::int(KTy::U64, (stored & mask).into()));
+                            let placed = self.place_bits(constant, at, offset);
+                            bits = self.or(bits, placed.into());
+                        }
+                    }
+                    let discriminant = self.discriminant(ty, VariantIdx::from_usize(index))?;
+                    let is = self.b.binary(KBinOp::Eq, *tag, discriminant);
+                    chosen = self.b.select(is, bits, chosen).into();
+                }
+                chosen
+            }
+            _ => return Err(format!("reinterprets the bits of `{ty}`, which holds a reference")),
+        })
+    }
+
+    /// `bits`, of a value at `at`, moved to where they fall in a range
+    /// starting at `offset`.
+    fn place_bits(&mut self, bits: KOperand, at: u64, offset: u64) -> KLocal {
+        if at >= offset {
+            self.b.binary(KBinOp::Shl, bits, Const::int(KTy::U32, (8 * (at - offset)).into()))
+        } else {
+            self.b.binary(KBinOp::Shr, bits, Const::int(KTy::U32, (8 * (offset - at)).into()))
+        }
+    }
+
+    fn or(&mut self, a: KOperand, b: KOperand) -> KOperand {
+        if a == KOperand::from(Const::int(KTy::U64, 0)) {
+            b
+        } else {
+            self.b.binary(KBinOp::Or, a, b).into()
+        }
+    }
+
+    fn layout(&self, ty: Ty<'tcx>) -> Result<rustc_middle::ty::layout::TyAndLayout<'tcx>> {
+        self.tcx.layout_of(self.typing_env().as_query_input(ty)).map_err(|_| format!("uses `{ty}`, which has no layout"))
     }
 
     /// A number as another type of its width, keeping its bits. A `bool`'s
@@ -2154,36 +2548,9 @@ impl<'tcx> Translator<'tcx> {
     /// A number's bits, zero-extended to a `u64`.
     fn unsigned_bits(&mut self, number: KLocal) -> KLocal {
         let ty = self.b.ty(number);
-        let unsigned = match ty.bytes() {
-            1 => KTy::U8,
-            2 => KTy::U16,
-            4 => KTy::U32,
-            _ => KTy::U64,
-        };
-        let same = self.same_width(number.into(), unsigned);
+        let same = self.same_width(number.into(), unsigned_of(u64::from(ty.bytes())));
         let bits = self.b.assign(same);
         self.b.cast(bits, KTy::U64)
-    }
-
-    /// The numbers of a value of type `ty`, with their offsets in its
-    /// layout from `base`.
-    fn numbers_at(&mut self, slot: &Slot, ty: Ty<'tcx>, base: u64, out: &mut Vec<(u64, KLocal)>) -> Result<()> {
-        match slot {
-            Slot::Scalar(local) => out.push((base, *local)),
-            Slot::Fields(fields) => {
-                let layout = self
-                    .tcx
-                    .layout_of(self.typing_env().as_query_input(ty))
-                    .map_err(|_| format!("uses `{ty}`, which has no layout"))?;
-                let types = self.fields(ty)?;
-                for (index, (field, field_ty)) in fields.iter().zip(types).enumerate() {
-                    self.numbers_at(field, field_ty, base + layout.fields.offset(index).bytes(), out)?;
-                }
-            }
-            Slot::Unit => {}
-            _ => return Err(format!("reinterprets the bits of `{ty}`, which holds a reference")),
-        }
-        Ok(())
     }
 
     fn size(&self, ty: Ty<'tcx>) -> Result<u64> {
@@ -2362,4 +2729,37 @@ fn doomed(frame: &Frame<'_, '_>, region: &[BasicBlock]) -> HashSet<BasicBlock> {
         }
     }
     region.iter().copied().filter(|block| !finishing.contains(block)).collect()
+}
+
+/// The unsigned kernel integer of `bytes` bytes.
+fn unsigned_of(bytes: u64) -> KTy {
+    match bytes {
+        1 => KTy::U8,
+        2 => KTy::U16,
+        4 => KTy::U32,
+        _ => KTy::U64,
+    }
+}
+
+/// The signed kernel integer of `bytes` bytes.
+fn signed_of(bytes: u64) -> KTy {
+    match bytes {
+        1 => KTy::I8,
+        2 => KTy::I16,
+        4 => KTy::I32,
+        _ => KTy::I64,
+    }
+}
+
+/// Where variant `index`'s fields are in an enum's layout, if the variant
+/// can exist.
+fn variant_offsets(layout: &rustc_middle::ty::layout::TyAndLayout<'_>, index: usize) -> Option<Vec<u64>> {
+    match &layout.variants {
+        Variants::Empty => None,
+        Variants::Single { index: only } => (only.as_usize() == index)
+            .then(|| (0..layout.fields.count()).map(|field| layout.fields.offset(field).bytes()).collect()),
+        Variants::Multiple { variants, .. } => {
+            Some(variants[VariantIdx::from_usize(index)].field_offsets.iter().map(|offset| offset.bytes()).collect())
+        }
+    }
 }

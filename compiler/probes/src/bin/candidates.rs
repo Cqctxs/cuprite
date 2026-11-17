@@ -480,6 +480,55 @@ fn general_cases(state: &mut u64) -> usize {
         let bits = x.to_bits();
         if x.is_nan() { f32::NAN } else { f32::from_bits(bits.wrapping_add(0x7FFF + ((bits >> 16) & 1)) & 0xFFFF_0000) }
     });
+    // Enums.
+    checked += general("enum_option", state, probes::enum_option, |x: u32| {
+        if x % 2 == 0 { x / 2 } else { x.wrapping_mul(3).wrapping_add(1) }
+    });
+    checked += general("enum_match", state, probes::enum_match, |x: f32| match x.to_bits() & 3 {
+        0 => 3.0 * x * x,
+        1 => x * x,
+        2 => x * 0.5,
+        _ => 0.0,
+    });
+    checked += general("enum_ordering", state, |v: &mut [i32]| probes::enum_ordering(v, 0), |x| {
+        let rank = if x < 0 { 0 } else if x == 0 { 1 } else { 2 };
+        rank + x.clamp(-5, 100)
+    });
+    checked += general("enum_partial_cmp", state, probes::enum_partial_cmp, |x: f32| {
+        if x.is_nan() { 2.0 } else if x < 0.5 { -1.0 } else if x == 0.5 { 0.0 } else { 1.0 }
+    });
+    checked += general("enum_inner_for", state, probes::enum_inner_for, |x: u32| {
+        let mut acc = 0u32;
+        for k in 0..8 {
+            acc = acc.wrapping_mul(31).wrapping_add((x >> k) & 1);
+        }
+        acc ^ (x >> 24) ^ (x >> 16) ^ (x >> 8)
+    });
+    checked += general("enum_iter_sum", state, probes::enum_iter_sum, |x: u32| {
+        x.to_le_bytes().iter().map(|&b| u32::from(b)).filter(|b| b % 3 != 0).sum()
+    });
+    checked += general("enum_char", state, probes::enum_char, |x: u32| {
+        let c = x & 0x7F;
+        match c {
+            0x30..=0x39 => c - 0x30,
+            0x41..=0x46 => c - 0x41 + 10,
+            0x61..=0x66 => c - 0x61 + 10,
+            0x67..=0x7A => c - 32,
+            _ => c + 1000,
+        }
+    });
+    checked += general("enum_nonzero", state, probes::enum_nonzero, |x: u32| {
+        if x == 0 { 32 } else { x.trailing_zeros() + x.leading_zeros() * 64 }
+    });
+    checked += general("enum_table", state, probes::enum_table, |x: u32| {
+        let applied = match x & 3 {
+            0 => x.wrapping_add(3),
+            1 => x.wrapping_mul(5),
+            2 => x ^ 0xFF,
+            _ => x,
+        };
+        applied.rotate_left([1, 4, 2][((x >> 2) % 3) as usize])
+    });
     checked += general("transmute_halves", state, probes::transmute_halves, |x: u32| x.rotate_left(16));
     checked += general("transmute_struct", state, probes::transmute_struct, |x: u64| {
         let c = u64::from(((x >> 16) as u16).rotate_left(4));

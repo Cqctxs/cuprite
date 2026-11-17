@@ -1112,6 +1112,157 @@ pub fn transmute_struct(values: &mut [u64]) {
     }
 }
 
+// Enums (code generation): `Option`, user enums with data, `Ordering` from
+// `Ord::cmp` and `partial_cmp`, inner `for` loops (whose `next` returns
+// `Option`), `char`, `NonZero`, constant tables of enums, and `unwrap`.
+
+fn checked_half(x: u32) -> Option<u32> {
+    if x % 2 == 0 { Some(x / 2) } else { None }
+}
+
+/// An `Option` from a helper, with a default: one Collatz step.
+pub fn enum_option(values: &mut [u32]) {
+    for value in values {
+        *value = checked_half(*value).unwrap_or(value.wrapping_mul(3).wrapping_add(1));
+    }
+}
+
+/// A shape, with data in each variant.
+pub enum Shape {
+    Circle(f32),
+    Square(f32),
+    Rect { w: f32, h: f32 },
+    Empty,
+}
+
+fn area(shape: Shape) -> f32 {
+    match shape {
+        Shape::Circle(r) => 3.0 * r * r,
+        Shape::Square(s) => s * s,
+        Shape::Rect { w, h } => w * h,
+        Shape::Empty => 0.0,
+    }
+}
+
+/// A user enum built from the element's bits and matched by a helper.
+pub fn enum_match(values: &mut [f32]) {
+    for value in values {
+        let x = *value;
+        let shape = match x.to_bits() & 3 {
+            0 => Shape::Circle(x),
+            1 => Shape::Square(x),
+            2 => Shape::Rect { w: x, h: 0.5 },
+            _ => Shape::Empty,
+        };
+        *value = area(shape);
+    }
+}
+
+/// `Ord::cmp` on integers, matched and through `max_by` and `min_by`. (`max`
+/// and `min` use the `integer_max` and `integer_min` intrinsics, step 5.)
+pub fn enum_ordering(values: &mut [i32], limit: i32) {
+    for value in values {
+        let rank = match (*value).cmp(&limit) {
+            std::cmp::Ordering::Less => 0,
+            std::cmp::Ordering::Equal => 1,
+            std::cmp::Ordering::Greater => 2,
+        };
+        let bounded = std::cmp::min_by(std::cmp::max_by(*value, -5, |a: &i32, b: &i32| a.cmp(b)), 100, |a: &i32, b: &i32| a.cmp(b));
+        *value = rank + bounded;
+    }
+}
+
+/// `partial_cmp` on floats: an `Option<Ordering>`, `None` for NaN.
+pub fn enum_partial_cmp(values: &mut [f32]) {
+    for value in values {
+        *value = match (*value).partial_cmp(&0.5) {
+            Some(std::cmp::Ordering::Less) => -1.0,
+            Some(std::cmp::Ordering::Equal) => 0.0,
+            Some(std::cmp::Ordering::Greater) => 1.0,
+            None => 2.0,
+        };
+    }
+}
+
+/// Inner `for` loops over ranges in the loop body.
+pub fn enum_inner_for(values: &mut [u32]) {
+    for value in values {
+        let mut acc = 0u32;
+        for k in 0..8 {
+            acc = acc.wrapping_mul(31).wrapping_add((*value >> k) & 1);
+        }
+        for k in (1..=3).rev() {
+            acc ^= *value >> (8 * k);
+        }
+        *value = acc;
+    }
+}
+
+/// An iterator chain inside the loop body, summed.
+pub fn enum_iter_sum(values: &mut [u32]) {
+    for value in values {
+        let x = *value;
+        *value = (0..4u32).map(|k| (x >> (8 * k)) & 0xFF).filter(|byte| byte % 3 != 0).sum();
+    }
+}
+
+/// `char`: built from a code, then classified and converted.
+pub fn enum_char(values: &mut [u32]) {
+    for value in values {
+        *value = match char::from_u32(*value & 0x7F) {
+            Some(c) if c.is_ascii_hexdigit() => c.to_digit(16).unwrap_or(99),
+            Some(c) if c.is_ascii_lowercase() => c.to_ascii_uppercase() as u32,
+            Some(c) => c as u32 + 1000,
+            None => 2000,
+        };
+    }
+}
+
+/// `NonZero`: an `Option` held in the value's own zero.
+pub fn enum_nonzero(values: &mut [u32]) {
+    for value in values {
+        *value = std::num::NonZeroU32::new(*value).map_or(32, |n| n.trailing_zeros() + n.leading_zeros() * 64);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Op {
+    Add(u32),
+    Mul(u32),
+    Xor(u32),
+    Nop,
+}
+
+const OPS: [Op; 4] = [Op::Add(3), Op::Mul(5), Op::Xor(0xFF), Op::Nop];
+const FLAGS: [Option<bool>; 3] = [Some(true), None, Some(false)];
+
+/// Constant tables of enums, chosen at run time: tags, and a niche
+/// (`None` in a `bool`'s spare values).
+pub fn enum_table(values: &mut [u32]) {
+    for value in values {
+        let x = *value;
+        let applied = match OPS[(x & 3) as usize] {
+            Op::Add(n) => x.wrapping_add(n),
+            Op::Mul(n) => x.wrapping_mul(n),
+            Op::Xor(n) => x ^ n,
+            Op::Nop => x,
+        };
+        let flag = match FLAGS[((x >> 2) % 3) as usize] {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 4,
+        };
+        *value = applied.rotate_left(flag);
+    }
+}
+
+/// `unwrap` of a `checked_div`, which panics for a zero divisor.
+pub fn enum_unwrap(values: &mut [u32], divisor: u32) {
+    for value in values {
+        *value = value.checked_div(divisor).unwrap();
+    }
+}
+
 // Development code for the grid structure: `noise`, whose generators the
 // grid measurement ported. Run before the grid shape exists, as a baseline.
 

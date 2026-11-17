@@ -85,6 +85,20 @@ const COMMON: &[(&str, &str)] = &[
     ("float_exponent", "candidate: map over `[f64]`"),
     ("transmute_halves", "candidate: map over `[u32]`"),
     ("transmute_struct", "candidate: map over `[u64]`"),
+    // Enums.
+    ("<Op as std::clone::Clone>::clone", "rejected: takes `&Op`, not a `&mut` slice of numbers"),
+    ("area", "rejected: takes `Shape`, not a `&mut` slice of numbers"),
+    ("checked_half", "rejected: takes `u32`, not a `&mut` slice of numbers"),
+    ("enum_char", "candidate: map over `[u32]`"),
+    ("enum_inner_for", "candidate: map over `[u32]`"),
+    ("enum_iter_sum", "candidate: map over `[u32]`"),
+    ("enum_match", "candidate: map over `[f32]`"),
+    ("enum_nonzero", "candidate: map over `[u32]`"),
+    ("enum_option", "candidate: map over `[u32]`"),
+    ("enum_ordering", "candidate: map over `[i32]` reading `limit`"),
+    ("enum_partial_cmp", "candidate: map over `[f32]`"),
+    ("enum_table", "candidate: map over `[u32]`"),
+    ("enum_unwrap", "candidate: map over `[u32]` reading `divisor`"),
     ("normalize_range", "candidate: map over `[f32]` reading `low`, `high`"),
     ("normalized_y", "candidate: map over `[f32]`"),
     ("numbered", "rejected: carries a value from one element to the next"),
@@ -142,16 +156,16 @@ const COMMON: &[(&str, &str)] = &[
 /// rustc inlines differently in debug and release builds, which changes
 /// where some refusals are found.
 const DEBUG: &[(&str, &str)] = &[
-    ("noise_row", "rejected: calls `noise::Perlin::new`, which calls `noise::permutationtable::PermutationTable::new`, which calls `<std::ops::Range<usize> as std::iter::Iterator>::next`, which calls `<std::ops::Range<usize> as std::iter::range::RangeIteratorImpl>::spec_next`, which builds an enum"),
+    ("noise_row", "rejected: calls `noise::Perlin::new`, which calls `noise::permutationtable::PermutationTable::new`, which calls `<rand_xorshift::XorShiftRng as rand_core::SeedableRng>::from_seed`, which calls `rand_core::le::read_u32_into`, which calls `core::slice::<impl [u32]>::iter_mut`, which calls `std::slice::IterMut::<'_, u32>::new`, which reinterprets bits as `std::ptr::NonNull<[u32]>` (a transmute)"),
     ("half_decode", "rejected: calls `<{closure} as std::ops::FnMut<((&mut f32, &u16),)>>::call_mut`, which calls `half::f16::to_f32`, which calls `half::binary16::arch::f16_to_f32`, which calls `std_detect::detect::arch::x86::__is_feature_detected::f16c`, which calls `std_detect::detect::cache::test`, which reads a static that can change (`std_detect::detect::cache::CACHE`)"),
     ("half_encode", "rejected: calls `half::f16::from_f32`, which calls `half::binary16::arch::f32_to_f16`, which calls `std_detect::detect::arch::x86::__is_feature_detected::f16c`, which calls `std_detect::detect::cache::test`, which reads a static that can change (`std_detect::detect::cache::CACHE`)"),
     ("half_round_trip", "rejected: calls `half::f16::from_f32`, which calls `half::binary16::arch::f32_to_f16`, which calls `std_detect::detect::arch::x86::__is_feature_detected::f16c`, which calls `std_detect::detect::cache::test`, which reads a static that can change (`std_detect::detect::cache::CACHE`)"),
     ("half_scale", "rejected: calls `half::f16::to_f32`, which calls `half::binary16::arch::f16_to_f32`, which calls `std_detect::detect::arch::x86::__is_feature_detected::f16c`, which calls `std_detect::detect::cache::test`, which reads a static that can change (`std_detect::detect::cache::CACHE`)"),
-    ("libm_atan2", "rejected: calls `libm::atan2f`, which calls `libm::atanf`, which calls `core::slice::<impl [f32]>::get::<usize>`, which calls `<usize as std::slice::SliceIndex<[f32]>>::get`, which uses the enum `std::option::Option<&f32>`"),
-    ("libm_cbrt", "rejected: calls `libm::cbrt`, which builds an enum"),
+    ("libm_atan2", "rejected: calls `libm::atan2f`, which calls `libm::atanf`, which calls `std::ptr::read_volatile::<f32>`, which converts a pointer to `*const ()`"),
+    ("libm_cbrt", "rejected: calls `libm::cbrt`, which calls `libm::math::cbrt::cbrt_round`, which calls `<f64 as libm::math::support::float_traits::Float>::fma`, which calls `libm::fma`, which calls `libm::math::arch::x86::fma::fma`, which reads a static that can change (`libm::math::arch::x86::fma::fma::FUNC`)"),
     ("libm_exp", "rejected: calls `<{closure} as std::ops::FnMut<(&mut f64,)>>::call_mut`, which calls `libm::exp`, which calls `std::ptr::read_volatile::<f32>`, which converts a pointer to `*const ()`"),
-    ("libm_pow", "rejected: calls `libm::powf`, which calls `core::slice::<impl [f32]>::get::<usize>`, which calls `<usize as std::slice::SliceIndex<[f32]>>::get`, which uses the enum `std::option::Option<&f32>`"),
-    ("libm_sin", "rejected: calls `libm::sinf`, which calls `libm::math::rem_pio2f::rem_pio2f`, which calls `libm::math::rem_pio2_large::rem_pio2_large`, which calls `core::slice::<impl [usize]>::get::<usize>`, which calls `<usize as std::slice::SliceIndex<[usize]>>::get`, which uses the enum `std::option::Option<&usize>`"),
+    ("libm_pow", "rejected: calls `libm::powf`, which calls `libm::scalbnf`, which calls `libm::math::generic::scalbn::scalbn::<f32>`, which calls `<i32 as std::cmp::Ord>::max`, which uses the intrinsic `integer_max`, which isn't translated yet (exact)"),
+    ("libm_sin", "rejected: calls `libm::sinf`, which calls `libm::math::rem_pio2f::rem_pio2f`, which calls `libm::math::rem_pio2_large::rem_pio2_large`, which calls `libm::scalbn`, which calls `libm::math::generic::scalbn::scalbn::<f64>`, which calls `<i32 as std::cmp::Ord>::max`, which uses the intrinsic `integer_max`, which isn't translated yet (exact)"),
     ("ni_sqrt", "rejected: calls `<u64 as num_integer::Roots>::sqrt`, which calls `<u64 as num_integer::Roots>::sqrt::go`, which casts to `u128`, a type the kernel doesn't have"),
     ("palette_linear", "rejected: calls `palette::rgb::Rgb::into_linear::<f32>`, which calls `<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear`, which calls `<bool as palette::bool_mask::LazySelect<f32>>::lazy_select::<{closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#0}}, {closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#1}}>`, which calls `<{closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#1}} as std::ops::FnOnce<()>>::call_once`, which calls `<f32 as palette::num::Powf>::powf`, which calls `std::f32::<impl f32>::powf`, which uses the intrinsic `powf32`, which isn't exact on the GPU: the CPU calls the platform's math library, whose results the GPU can't reproduce bit for bit"),
     ("palette_saturation", "rejected: calls `<palette::Hsv as palette::FromColor<palette::rgb::Rgb>>::from_color`, which calls `<palette::Hsv as palette::convert::FromColorUnclamped<palette::rgb::Rgb>>::from_color_unclamped`, which calls `std::any::TypeId::of::<bool>`, which uses a constant holding a reference"),
@@ -163,10 +177,10 @@ const RELEASE: &[(&str, &str)] = &[
     ("half_round_trip", "rejected: calls `half::f16::from_f32`, which calls `half::binary16::arch::f32_to_f16`, which calls `std_detect::detect::cache::test`, which reads a static that can change (`std_detect::detect::cache::CACHE`)"),
     ("half_scale", "rejected: calls `half::f16::to_f32`, which calls `half::binary16::arch::f16_to_f32`, which calls `std_detect::detect::cache::test`, which reads a static that can change (`std_detect::detect::cache::CACHE`)"),
     ("libm_atan2", "rejected: calls `libm::atan2f`, which calls `libm::atanf`, which uses the intrinsic `volatile_load`, which accesses memory as volatile"),
-    ("libm_cbrt", "rejected: calls `libm::cbrt`, which uses the enum `libm::math::support::env::Round`"),
+    ("libm_cbrt", "rejected: calls `libm::cbrt`, which calls `libm::math::cbrt::cbrt_round`, which calls `<f64 as libm::math::support::float_traits::Float>::fma`, which calls `libm::fma`, which calls `libm::math::arch::x86::fma::fma`, which reads a static that can change (`libm::math::arch::x86::fma::fma::FUNC`)"),
     ("libm_exp", "rejected: calls `<{closure} as std::ops::FnMut<(&mut f64,)>>::call_mut`, which calls `libm::exp`, which uses the intrinsic `volatile_load`, which accesses memory as volatile"),
-    ("libm_pow", "rejected: calls `libm::powf`, which compares three ways (`Ord::cmp`), which gives an enum"),
-    ("libm_sin", "rejected: calls `libm::sinf`, which calls `libm::math::rem_pio2f::rem_pio2f`, which calls `libm::math::rem_pio2_large::rem_pio2_large`, which calls `<std::ops::RangeInclusive<usize> as std::iter::Iterator>::next`, which builds an enum"),
+    ("libm_pow", "rejected: calls `libm::powf`, which calls `libm::scalbnf`, which calls `libm::math::generic::scalbn::scalbn::<f32>`, which uses the intrinsic `integer_max`, which isn't translated yet (exact)"),
+    ("libm_sin", "rejected: calls `libm::sinf`, which calls `libm::math::rem_pio2f::rem_pio2f`, which calls `libm::math::rem_pio2_large::rem_pio2_large`, which calls `libm::scalbn`, which calls `libm::math::generic::scalbn::scalbn::<f64>`, which uses the intrinsic `integer_max`, which isn't translated yet (exact)"),
     ("ni_sqrt", "candidate: map over `[u64]`"),
     ("palette_linear", "rejected: calls `palette::rgb::Rgb::into_linear::<f32>`, which calls `<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear`, which calls `<bool as palette::bool_mask::LazySelect<f32>>::lazy_select::<{closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#0}}, {closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#1}}>`, which calls `<{closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#1}} as std::ops::FnOnce<()>>::call_once`, which calls `<f32 as palette::num::Powf>::powf`, which uses the intrinsic `powf32`, which isn't exact on the GPU: the CPU calls the platform's math library, whose results the GPU can't reproduce bit for bit"),
     ("palette_saturation", "rejected: calls `<palette::Hsv as palette::FromColor<palette::rgb::Rgb>>::from_color`, which calls `<palette::Hsv as palette::convert::FromColorUnclamped<palette::rgb::Rgb>>::from_color_unclamped`, which uses a constant holding a reference"),
@@ -252,7 +266,7 @@ fn checks(name: &'static str, release: bool) -> std::path::PathBuf {
 const FAILED_CHECK: &str = "-> cpu (a check failed on the GPU)";
 
 /// Runtime calls the checks program makes.
-const CHECK_CALLS: usize = 30;
+const CHECK_CALLS: usize = 32;
 
 /// Calls whose checks pass keep the GPU's results; calls where one fails
 /// fall back to the CPU, which panics with the same message and leaves the
@@ -261,14 +275,14 @@ const CHECK_CALLS: usize = 30;
 /// by a divisor and by zero, and GCDs) and `strength_reduce` (by a
 /// divisor, a power of two and zero), and a closure indexing a captured
 /// table, which may be empty, and an array indexed by a parameter, in
-/// bounds and out.
+/// bounds and out, and an `unwrap` that fails for a zero divisor.
 #[test]
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "needs an NVIDIA GPU; enable the gpu-tests feature"
 )]
 fn failed_checks_on_the_gpu_behave_like_the_cpu() {
-    for (name, release, failed) in [("checks-debug", false, 14), ("checks-release", true, 11)] {
+    for (name, release, failed) in [("checks-debug", false, 15), ("checks-release", true, 12)] {
         let trace = run(&checks(name, release), true, &[]);
         let calls = trace.lines().filter(|line| line.starts_with("cuprite: ")).count();
         assert_eq!(calls, CHECK_CALLS, "{name}:\n{trace}");
@@ -336,7 +350,8 @@ fn rewritten_candidates_match_the_cpu_on_the_gpu() {
     // which have no work below 4 elements. Then 9 maps with closures, and
     // `ni_sqrt` (accepted in release builds). Then 5 maps with `for_each`,
     // and `par_saxpy`, zipped with an input 3 shorter. Then 11 maps with
-    // arrays and bit reinterpretation, and `half`'s `bf16_round_trip`.
+    // arrays and bit reinterpretation, and `half`'s `bf16_round_trip`. Then 9
+    // maps with enums.
     let with_work = LENGTHS - 3;
     let gpu_calls = 9 * non_empty + 3 * 2 * non_empty + non_empty + (7 + 5 + 8 + 3) * non_empty
         + 2 * 2 * non_empty
@@ -345,7 +360,8 @@ fn rewritten_candidates_match_the_cpu_on_the_gpu() {
         + (9 + 1) * non_empty
         + 5 * non_empty
         + with_work
-        + (11 + 1) * non_empty;
+        + (11 + 1) * non_empty
+        + 9 * non_empty;
     assert_eq!(trace.matches("-> gpu").count(), gpu_calls, "{trace}");
     for (passes, functions) in REGIONS {
         let calls = trace.matches(&format!("passes={passes} -> gpu")).count();

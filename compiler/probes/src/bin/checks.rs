@@ -249,6 +249,15 @@ fn main() {
         }));
     }
 
+    // `unwrap` of an `Option`, `None` for a zero divisor.
+    for (name, divisor) in [("enum_unwrap", 7u32), ("enum_unwrap, by zero", 0)] {
+        count(check(name, &spread, |v| probes::enum_unwrap(v, divisor), |v| {
+            for value in v {
+                *value = value.checked_div(divisor).unwrap();
+            }
+        }));
+    }
+
     // `palette`'s `mix`, which clamps its factor.
     count(check("palette_mix", &floats, |v| probes::palette_mix(v, 0.9, 0.1, 0.5), |v| {
         use palette::Mix;

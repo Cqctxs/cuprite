@@ -344,7 +344,9 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
     }
 
     fn recognize(&self) -> Result<Verdict> {
-        if self.counts_passes() {
+        // A loop over a range that calls maps repeats them; a range loop
+        // inside a loop over the slice is part of that loop's body.
+        if self.counts_passes() && !self.iterates_slice() {
             self.recognize_region()
         } else {
             Ok(Verdict::Candidate(self.recognize_map()?))
@@ -362,9 +364,7 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         if !has_next && !eaches.is_empty() {
             return self.recognize_each(element, params, &calls, &eaches);
         }
-        let header = self.single_loop(&calls, "is not a single `for` loop over the slice")?;
-        let receiver = Self::operand_local(header.receiver).ok_or_else(Self::not_slice)?;
-        let traced = self.trace(receiver, &params)?;
+        let (header, traced) = self.outer_loop(&calls, &params)?;
         let is_header = |block| self.is_header(block, header.next_block);
         let iteration = translate::Iteration::For { option: header.option, start: header.some, is_header: &is_header };
         let translated = self.translate_map(element, &params, &traced, iteration)?;
@@ -485,6 +485,14 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
 
     /// True if the function loops over an integer `Range`, which makes it a
     /// candidate for the repeated-map rule.
+    /// Whether a `for` loop iterates over the slice parameter.
+    fn iterates_slice(&self) -> bool {
+        let (Ok((_, params)), Ok(calls)) = (self.check_signature(false), self.check_effects(false)) else {
+            return false;
+        };
+        self.outer_loop(&calls, &params).is_ok()
+    }
+
     fn counts_passes(&self) -> bool {
         let tcx = self.tcx;
         let is_integer_range = |ty: Ty<'tcx>| {
@@ -499,6 +507,33 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
                     && is_integer_range(args.type_at(0))
             }))
         })
+    }
+
+    /// The `for` loop over the slice parameter, and its iterator traced. Other
+    /// `for` loops may run inside its body, as calls `translate` inlines;
+    /// with several loops, the outer one is the one whose iterator traces
+    /// back to the slice.
+    fn outer_loop(&self, calls: &[(BasicBlock, Known)], params: &Params) -> Result<(LoopHeader<'a, 'tcx>, Traced)> {
+        let nexts: Vec<BasicBlock> =
+            calls.iter().filter(|(_, known)| *known == Known::Next).map(|&(block, _)| block).collect();
+        let mut outer = Vec::new();
+        let mut first_error = None;
+        for &next in &nexts {
+            let header = self.single_loop(&[(next, Known::Next)], "is not a single `for` loop over the slice")?;
+            let traced = Self::operand_local(header.receiver)
+                .ok_or_else(Self::not_slice)
+                .and_then(|receiver| self.trace(receiver, params));
+            match traced {
+                Ok(traced) => outer.push((header, traced)),
+                Err(error) => first_error = first_error.or(Some(error)),
+            }
+        }
+        match (outer.len(), nexts.len()) {
+            (_, 0) => Err("is not a single `for` loop over the slice".into()),
+            (1, _) => Ok(outer.pop().expect("one loop")),
+            (0, 1) => Err(first_error.expect("the loop's error")),
+            _ => Err("contains more than one loop".into()),
+        }
     }
 
     /// The one `next` call, which must be a `for` loop's.
@@ -546,7 +581,10 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         header: &LoopHeader<'_, 'tcx>,
     ) -> Result<()> {
         for &(block, known) in calls {
-            if known.iterates() && !chain.contains(&block) && block != header.next_block {
+            // Loops inside the body are calls `translate` inlined; one over
+            // a slice parameter fails there.
+            let inner = translated.contains(&block) && !chain.contains(&block);
+            if known.iterates() && !inner && !chain.contains(&block) && block != header.next_block {
                 return Err("iterates inside the loop body".into());
             }
             if !translated.contains(&block) && !chain.contains(&block) && block != header.next_block {
