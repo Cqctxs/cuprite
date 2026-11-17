@@ -2,6 +2,8 @@
 //! Candidates are shapes a first GPU version could plausibly accept;
 //! rejections are shapes it must refuse. Nothing here knows about Cuprite.
 
+#![feature(float_minimum_maximum, uint_carryless_mul)]
+
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use rayon::prelude::*;
@@ -1493,6 +1495,134 @@ pub fn wide_bits(values: &mut [u64]) {
         let counts = wide.leading_zeros() + wide.trailing_zeros() * 7 + wide.count_ones() * 131;
         let swapped = wide.swap_bytes() ^ u128::from_be_bytes((wide >> 3).to_le_bytes()).rotate_left(1);
         *value = u64::from(counts) ^ swapped as u64 ^ (swapped >> 64) as u64;
+    }
+}
+
+// The exact intrinsics: library methods whose intrinsics the GPU builds
+// from several operations.
+
+/// `f32::round`: ties away from zero.
+pub fn exact_round(values: &mut [f32]) {
+    for value in values {
+        *value = value.round();
+    }
+}
+
+/// `f64::round` and `round_ties_even`.
+pub fn exact_round_f64(values: &mut [f64]) {
+    for value in values {
+        *value = value.round() + value.round_ties_even() * 0.25;
+    }
+}
+
+/// `copysign` of `f32` and `f64`. The signs come from negation and bits,
+/// never from arithmetic on a NaN, whose sign Rust leaves unspecified.
+pub fn exact_copysign(values: &mut [f32]) {
+    for value in values {
+        let sign = f64::from_bits(u64::from(value.to_bits()) << 32);
+        let wide = 2.5f64.copysign(-sign);
+        *value = (value.abs() * 0.5).copysign(-*value) + wide as f32;
+    }
+}
+
+/// `f32::minimum` and `maximum` (NaN propagates; `-0.0 < 0.0`), by bits,
+/// with every NaN as one value, since a NaN's bits are unspecified.
+pub fn exact_minimum(values: &mut [u32]) {
+    for value in values {
+        let x = f32::from_bits(*value);
+        let low = x.minimum(-0.0).minimum(f32::from_bits(*value ^ 0x8000_0000));
+        let high = x.maximum(0.0).maximum(1.5);
+        let bits = |f: f32| if f.is_nan() { 0x7FC0_0000 } else { f.to_bits() };
+        *value = bits(low) ^ bits(high).rotate_left(7);
+    }
+}
+
+/// `Ord::max` and `min` of integers.
+pub fn exact_int_minmax(values: &mut [i32]) {
+    for value in values {
+        let wide = i64::from(*value).max(-1_000_000).min(i64::from(*value >> 3 ^ 77));
+        *value = (*value).max(-5).min(1 << 20) ^ wide as i32 ^ (*value as u32).max(7) as i32;
+    }
+}
+
+/// `saturating_add` and `saturating_sub` of `i32`.
+pub fn exact_saturating(values: &mut [i32]) {
+    for value in values {
+        *value = value.saturating_add(*value >> 1).saturating_sub(1 << 30) ^ value.saturating_sub(i32::MAX / 2);
+    }
+}
+
+/// Saturating `u8` and `i64`.
+pub fn exact_saturating_u8(values: &mut [u8]) {
+    for value in values {
+        *value = value.saturating_add(100).saturating_sub(*value / 3) ^ (*value as i8).saturating_sub(-60) as u8;
+    }
+}
+
+pub fn exact_saturating_i64(values: &mut [i64]) {
+    for value in values {
+        *value = value.saturating_add(*value).saturating_sub(i64::MAX / 3 * value.signum()) ^ (*value as u64).saturating_sub(1 << 62) as i64;
+    }
+}
+
+/// `to_int_unchecked`, on values its contract allows.
+pub fn exact_float_to_int(values: &mut [u32]) {
+    for value in values {
+        let x = f32::from_bits(*value);
+        let int = if x.abs() < 2e9 { unsafe { x.to_int_unchecked::<i32>() } } else { 7 };
+        let byte = if x.is_nan() { 0 } else { unsafe { x.abs().min(255.0).to_int_unchecked::<u8>() } };
+        *value = int as u32 ^ u32::from(byte) << 24;
+    }
+}
+
+/// `reverse_bits` of several widths.
+pub fn exact_reverse(values: &mut [u32]) {
+    for value in values {
+        let wide = (u64::from(*value) * 0x1_0001).reverse_bits();
+        let long = (u128::from(*value) << 70 | 5).reverse_bits();
+        *value = value.reverse_bits() ^ (wide >> 7) as u32 ^ u32::from((*value as u8).reverse_bits()) ^ (long >> 40) as u32;
+    }
+}
+
+/// `funnel_shl` and `funnel_shr`, with shifts from the data.
+pub fn exact_funnel(values: &mut [u32]) {
+    for value in values {
+        let left = value.funnel_shl(value.rotate_left(13), *value & 31);
+        let right = value.funnel_shr(!*value, (*value >> 5) & 31);
+        *value = left ^ right.rotate_left(3);
+    }
+}
+
+/// `carryless_mul` and `carrying_mul_add`.
+pub fn exact_products(values: &mut [u64]) {
+    for value in values {
+        let carryless = value.carryless_mul(0x87 | *value >> 50) ^ u64::from((*value as u16).carryless_mul(0x1021));
+        let (low, high) = value.carrying_mul_add(0x9E37_79B9_7F4A_7C15, *value >> 7, 12_345);
+        *value = carryless ^ low ^ high.rotate_left(17);
+    }
+}
+
+/// `black_box`, and `pow`, which asks `is_val_statically_known` about its
+/// base and exponent. (`hint::select_unpredictable` wraps its values in
+/// `MaybeUninit`, a union, so it isn't here yet.)
+pub fn exact_hints(values: &mut [u32]) {
+    for value in values {
+        let chosen = if *value & 1 == 0 { value.wrapping_mul(3) } else { *value ^ 0xFF };
+        *value = std::hint::black_box(chosen) ^ value.wrapping_pow(*value & 7) ^ 3u32.wrapping_pow(*value >> 28);
+    }
+}
+
+/// `mem::swap` of arrays (`typed_swap_nonoverlapping`) and array `==` of
+/// bytes (`raw_eq`).
+pub fn exact_swap_eq(values: &mut [u32]) {
+    for value in values {
+        let mut a = value.to_le_bytes();
+        let mut b = value.rotate_left(16).to_be_bytes();
+        if a[0] & 1 == 1 {
+            std::mem::swap(&mut a, &mut b);
+        }
+        let same = u32::from(a == b) << 31 | u32::from(a == [0; 4]) << 30;
+        *value = u32::from_le_bytes(a) ^ same;
     }
 }
 

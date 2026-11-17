@@ -207,6 +207,48 @@ fn general_indexed<T: Element>(
     LENGTHS.len()
 }
 
+/// `x` rounded to an integer by its bits, ties away from zero (`away`) or
+/// to even, without the library's rounding.
+fn round_bits(x: f64, away: bool) -> f64 {
+    let bits = x.to_bits();
+    let exponent = ((bits >> 52) & 0x7FF) as i64 - 1023;
+    let sign = bits & 1 << 63;
+    if exponent >= 52 {
+        return x; // Already an integer, or infinite, or NaN.
+    }
+    if exponent < -1 {
+        return f64::from_bits(sign); // Below one half.
+    }
+    let mantissa = bits & ((1 << 52) - 1) | 1 << 52;
+    let shift = 52 - exponent;
+    let (dropped, half) = (mantissa & ((1 << shift) - 1), 1u64 << (shift - 1));
+    let mut kept = mantissa >> shift;
+    if dropped > half || dropped == half && (away || kept & 1 == 1) {
+        kept += 1;
+    }
+    f64::from_bits((kept as f64).to_bits() | sign)
+}
+
+fn clamp(value: i128, min: i128, max: i128) -> i128 {
+    if value < min {
+        min
+    } else if value > max {
+        max
+    } else {
+        value
+    }
+}
+
+/// The low `bits` bits of `value`, in reverse order, bit by bit.
+fn reverse(value: u128, bits: u32) -> u128 {
+    (0..bits).fold(0, |reversed, i| reversed | ((value >> i) & 1) << (bits - 1 - i))
+}
+
+/// The low 64 bits of the carry-less product, bit by bit.
+fn carryless(a: u64, b: u64) -> u64 {
+    (0..64).filter(|i| b >> i & 1 == 1).fold(0, |product, i| product ^ a << i)
+}
+
 /// x86's float to `i32` conversion: rounded or truncated, and `i32::MIN`
 /// for NaN and out of range.
 fn x86_to_i32(x: f32, round: bool) -> i32 {
@@ -531,6 +573,16 @@ fn general_cases(state: &mut u64) -> usize {
     // Held out before, now development code: `num-integer`'s square root,
     // a closure passed to a generic fixed-point loop.
     checked += general("ni_sqrt", state, probes::ni_sqrt, |x: u64| x.isqrt());
+    // Held out, accepted since the exact intrinsics (`integer_min`):
+    // `strength_reduce`'s 64-bit division, against plain `/` and `%`.
+    for divisor in [7u64, 1 << 40, u64::MAX, 3] {
+        checked += general(
+            &format!("sr_div_rem by {divisor}"),
+            state,
+            |v: &mut [u64]| probes::sr_div_rem(v, divisor),
+            |x: u64| x / divisor + x % divisor,
+        );
+    }
     // Arrays and bit reinterpretation.
     let coeffs = [0.5f32, -1.25, 2.0, 0.75];
     checked += general("array_poly", state, |v: &mut [f32]| probes::array_poly(v, coeffs), |x| {
@@ -682,6 +734,84 @@ fn general_cases(state: &mut u64) -> usize {
         let counts = wide.leading_zeros() + wide.trailing_zeros() * 7 + wide.count_ones() * 131;
         let swapped = wide.swap_bytes() ^ (wide >> 3).swap_bytes().rotate_left(1);
         u64::from(counts) ^ swapped as u64 ^ (swapped >> 64) as u64
+    });
+    // The exact intrinsics. The references avoid the library methods:
+    // rounding by bits, saturation in `i128`, bit reversal and carry-less
+    // products by loops, and funnel shifts by concatenating in `u64`.
+    checked += general("exact_round", state, probes::exact_round, |x: f32| round_bits(f64::from(x), true) as f32);
+    checked += general("exact_round_f64", state, probes::exact_round_f64, |x: f64| {
+        round_bits(x, true) + round_bits(x, false) * 0.25
+    });
+    checked += general("exact_copysign", state, probes::exact_copysign, |x: f32| {
+        let negative = x.to_bits() >> 31 == 1;
+        let wide = f64::from_bits(2.5f64.to_bits() | u64::from(!negative) << 63);
+        let half = f32::from_bits(x.to_bits() & 0x7FFF_FFFF) * 0.5;
+        f32::from_bits(half.to_bits() & 0x7FFF_FFFF | u32::from(!negative) << 31) + wide as f32
+    });
+    checked += general("exact_minimum", state, probes::exact_minimum, |v: u32| {
+        let x = f32::from_bits(v);
+        let bits = |f: f32| if f.is_nan() { 0x7FC0_0000 } else { f.to_bits() };
+        // The smallest of `x`, `-0.0` and `-x` is `-|x|`.
+        let low = if x.is_nan() { f32::NAN } else { f32::from_bits(v | 0x8000_0000) };
+        let high = if x.is_nan() { f32::NAN } else if x > 1.5 { x } else { 1.5 };
+        bits(low) ^ bits(high).rotate_left(7)
+    });
+    checked += general("exact_int_minmax", state, probes::exact_int_minmax, |x: i32| {
+        let floor = if i64::from(x) > -1_000_000 { i64::from(x) } else { -1_000_000 };
+        let wide = if floor < i64::from(x >> 3 ^ 77) { floor } else { i64::from(x >> 3 ^ 77) };
+        let low = if x > -5 { x } else { -5 };
+        let both = if low < 1 << 20 { low } else { 1 << 20 };
+        let unsigned = if x as u32 > 7 { x as u32 } else { 7 };
+        both ^ wide as i32 ^ unsigned as i32
+    });
+    checked += general("exact_saturating", state, probes::exact_saturating, |x: i32| {
+        let range = |v: i128| clamp(v, i32::MIN.into(), i32::MAX.into()) as i32;
+        let first = range(i128::from(range(i128::from(x) + i128::from(x >> 1))) - (1 << 30));
+        first ^ range(i128::from(x) - i128::from(i32::MAX / 2))
+    });
+    checked += general("exact_saturating_u8", state, probes::exact_saturating_u8, |x: u8| {
+        let first = clamp(clamp(i128::from(x) + 100, 0, 255) - i128::from(x / 3), 0, 255) as u8;
+        first ^ clamp(i128::from(x as i8) + 60, -128, 127) as i8 as u8
+    });
+    checked += general("exact_saturating_i64", state, probes::exact_saturating_i64, |x: i64| {
+        let range = |v: i128| clamp(v, i64::MIN.into(), i64::MAX.into());
+        let first = range(range(2 * i128::from(x)) - i128::from(i64::MAX / 3) * i128::from(x.signum()));
+        first as i64 ^ clamp(i128::from(x as u64) - (1 << 62), 0, u64::MAX.into()) as u64 as i64
+    });
+    checked += general("exact_float_to_int", state, probes::exact_float_to_int, |v: u32| {
+        let x = f64::from(f32::from_bits(v));
+        let int = if x.abs() < 2e9 { x.trunc() as i64 as i32 } else { 7 };
+        let byte = if x.is_nan() { 0 } else if x.abs() > 255.0 { 255 } else { x.abs().trunc() as u8 };
+        int as u32 ^ u32::from(byte) << 24
+    });
+    checked += general("exact_reverse", state, probes::exact_reverse, |v: u32| {
+        let wide = reverse(u128::from(v) * 0x1_0001, 64) as u64;
+        let long = reverse(u128::from(v) << 70 | 5, 128);
+        reverse(v.into(), 32) as u32 ^ (wide >> 7) as u32 ^ reverse(u128::from(v as u8), 8) as u32 ^ (long >> 40) as u32
+    });
+    checked += general("exact_funnel", state, probes::exact_funnel, |v: u32| {
+        let joined = |a: u32, b: u32| u64::from(a) << 32 | u64::from(b);
+        let left = ((joined(v, v.rotate_left(13)) << (v & 31)) >> 32) as u32;
+        let right = (joined(v, !v) >> ((v >> 5) & 31)) as u32;
+        left ^ right.rotate_left(3)
+    });
+    checked += general("exact_products", state, probes::exact_products, |v: u64| {
+        let carryless = carryless(v, 0x87 | v >> 50) ^ carryless(v & 0xFFFF, 0x1021) & 0xFFFF;
+        let full = u128::from(v) * 0x9E37_79B9_7F4A_7C15 + u128::from(v >> 7) + 12_345;
+        carryless ^ full as u64 ^ ((full >> 64) as u64).rotate_left(17)
+    });
+    checked += general("exact_hints", state, probes::exact_hints, |v: u32| {
+        let chosen = if v & 1 == 0 { v.wrapping_mul(3) } else { v ^ 0xFF };
+        let power = |base: u32, exponent: u32| (0..exponent).fold(1u32, |acc, _| acc.wrapping_mul(base));
+        chosen ^ power(v, v & 7) ^ power(3, v >> 28)
+    });
+    checked += general("exact_swap_eq", state, probes::exact_swap_eq, |v: u32| {
+        let (first, second) = (v.to_le_bytes(), v.rotate_left(16).to_be_bytes());
+        let a = if first[0] & 1 == 1 { second } else { first };
+        let b = if first[0] & 1 == 1 { first } else { second };
+        let equal = |x: [u8; 4], y: [u8; 4]| (0..4).all(|i| x[i] == y[i]);
+        let same = u32::from(equal(a, b)) << 31 | u32::from(equal(a, [0; 4])) << 30;
+        u32::from_le_bytes(a) ^ same
     });
     // Runtime CPU feature detection: the GPU follows the host's answer.
     let ssse3 = is_x86_feature_detected!("ssse3");

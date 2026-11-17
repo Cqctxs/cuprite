@@ -107,7 +107,7 @@ use rustc_middle::{
     ty::{self, FloatTy, Instance, InstanceKind, IntTy, ShimKind, Ty, TyCtxt, TypingEnv, UintTy},
 };
 use rustc_abi::{ExternAbi, TagEncoding, VariantIdx, Variants};
-use rustc_middle::{mir::NonDivergingIntrinsic, ty::adjustment::PointerCoercion};
+use rustc_middle::{mir::NonDivergingIntrinsic, ty::adjustment::PointerCoercion, ty::layout::ValidityRequirement};
 use rustc_span::def_id::DefId;
 
 type Result<T> = std::result::Result<T, String>;
@@ -373,10 +373,13 @@ pub(crate) enum IntrinsicOp {
     Simd,
     /// `bswap`: an integer's bytes reversed.
     ByteSwap,
+    /// An intrinsic built from several kernel operations
+    /// (`Translator::exact`).
+    Exact,
 }
 
 /// The `simd_*` intrinsics translated lane by lane.
-const SIMD: [&str; 51] = [
+const SIMD: [&str; 57] = [
     "simd_insert", "simd_extract", "simd_insert_dyn", "simd_extract_dyn", "simd_splat", "simd_add", "simd_sub",
     "simd_mul", "simd_div", "simd_rem", "simd_shl", "simd_shr", "simd_and", "simd_or", "simd_xor", "simd_cast",
     "simd_as", "simd_neg", "simd_fabs", "simd_minimum_number_nsz", "simd_maximum_number_nsz", "simd_eq", "simd_ne",
@@ -384,7 +387,8 @@ const SIMD: [&str; 51] = [
     "simd_reduce_add_ordered", "simd_reduce_mul_ordered", "simd_reduce_all", "simd_reduce_any", "simd_reduce_max",
     "simd_reduce_min", "simd_reduce_and", "simd_reduce_or", "simd_reduce_xor", "simd_bitmask", "simd_select",
     "simd_select_bitmask", "simd_bswap", "simd_ctlz", "simd_ctpop", "simd_cttz", "simd_ceil", "simd_floor",
-    "simd_trunc", "simd_fsqrt", "simd_fma",
+    "simd_trunc", "simd_fsqrt", "simd_fma", "simd_round", "simd_round_ties_even", "simd_bitreverse",
+    "simd_funnel_shl", "simd_funnel_shr", "simd_carryless_mul",
 ];
 
 /// The intrinsics library code reaches after inlining, by name: exactly
@@ -422,13 +426,28 @@ pub(crate) fn intrinsic(name: &str) -> Option<IntrinsicOp> {
         "unchecked_rem" => binary(KBinOp::Rem),
         "unchecked_shl" => binary(KBinOp::Shl),
         "unchecked_shr" => binary(KBinOp::Shr),
+        "round_ties_even_f32" | "round_ties_even_f64" => call(RoundTiesEven),
+        // The operands of a disjoint `or` share no set bits.
+        "disjoint_bitor" => binary(KBinOp::Or),
         "cold_path" | "assume" => Some(IntrinsicOp::Nothing),
+        name if name.starts_with("prefetch_") => Some(IntrinsicOp::Nothing),
         "transmute" => Some(IntrinsicOp::Transmute),
         "bswap" => Some(IntrinsicOp::ByteSwap),
         name if SIMD.contains(&name) => Some(IntrinsicOp::Simd),
+        name if EXACT.contains(&name) => Some(IntrinsicOp::Exact),
         _ => None,
     }
 }
+
+/// The intrinsics built from several kernel operations
+/// (`Translator::exact`).
+const EXACT: [&str; 26] = [
+    "float_to_int_unchecked", "is_val_statically_known", "integer_min", "integer_max", "copysignf32",
+    "copysignf64", "saturating_add", "saturating_sub", "roundf32", "roundf64", "minimumf32", "minimumf64",
+    "maximumf32", "maximumf64", "bitreverse", "unchecked_funnel_shl", "unchecked_funnel_shr", "carryless_mul",
+    "carrying_mul_add", "black_box", "select_unpredictable", "raw_eq", "typed_swap_nonoverlapping",
+    "assert_inhabited", "assert_zero_valid", "assert_mem_uninitialized_valid",
+];
 
 /// True if the assertion ending `block` always passes: its condition folds
 /// to the expected constant.
@@ -915,6 +934,9 @@ fn successors(kind: &TerminatorKind<'_>) -> Vec<BasicBlock> {
         | TerminatorKind::Drop { target, .. }
         | TerminatorKind::Call { target: Some(target), .. } => vec![*target],
         TerminatorKind::SwitchInt { targets, .. } => targets.all_targets().to_vec(),
+        // Assembly continues: a block with it isn't a panic path, and is
+        // refused when it is translated.
+        TerminatorKind::InlineAsm { targets, .. } => targets.to_vec(),
         _ => Vec::new(),
     }
 }
@@ -1313,6 +1335,9 @@ impl<'tcx> Translator<'tcx> {
                     .ok_or_else(|| format!("uses the intrinsic `{name}`{}", crate::coverage::reason(name.as_str())))?;
                 if op == IntrinsicOp::Simd {
                     return self.simd(frame, name.as_str(), args, destination);
+                }
+                if op == IntrinsicOp::Exact {
+                    return self.exact(frame, name.as_str(), instance.args, args, destination);
                 }
                 self.operation(frame, op, args, destination)
             }
@@ -2115,9 +2140,12 @@ impl<'tcx> Translator<'tcx> {
                 self.operand_slot(frame, operand)
             }
             // A pointer to the same bytes as another type: a view sharing
-            // the numbers they hold.
+            // the numbers they hold. A transmute between references or
+            // pointers is the same cast (array `==` makes one).
             Rvalue::Cast(
-                kind @ (CastKind::PtrToPtr | CastKind::PointerCoercion(PointerCoercion::MutToConstPointer, _)),
+                kind @ (CastKind::PtrToPtr
+                | CastKind::Transmute
+                | CastKind::PointerCoercion(PointerCoercion::MutToConstPointer, _)),
                 operand,
                 ty,
             ) => {
@@ -2986,6 +3014,7 @@ impl<'tcx> Translator<'tcx> {
             "simd_floor" => Some(Intrinsic::Floor),
             "simd_ceil" => Some(Intrinsic::Ceil),
             "simd_trunc" => Some(Intrinsic::Trunc),
+            "simd_round_ties_even" => Some(Intrinsic::RoundTiesEven),
             "simd_minimum_number_nsz" => Some(Intrinsic::Min),
             "simd_maximum_number_nsz" => Some(Intrinsic::Max),
             "simd_fma" => Some(Intrinsic::MulAdd),
@@ -3109,11 +3138,33 @@ impl<'tcx> Translator<'tcx> {
                     }
                     rvalues
                 }
-                "simd_bswap" => {
+                "simd_bswap" | "simd_bitreverse" | "simd_round" => {
                     let mut rvalues = Vec::new();
                     for lane in self.lane_numbers(&arg(0)?)? {
-                        let swapped = self.byte_swap(lane);
-                        rvalues.push(KRvalue::Use(swapped.into()));
+                        let result = match name {
+                            "simd_bswap" => self.byte_swap(lane),
+                            "simd_bitreverse" => self.bit_reverse(lane),
+                            _ => self.round_away(lane),
+                        };
+                        rvalues.push(KRvalue::Use(result.into()));
+                    }
+                    rvalues
+                }
+                "simd_carryless_mul" => {
+                    let (a, b) = (self.lane_numbers(&arg(0)?)?, self.lane_numbers(&arg(1)?)?);
+                    let mut rvalues = Vec::new();
+                    for (a, b) in a.into_iter().zip(b) {
+                        rvalues.push(KRvalue::Use(self.carryless(a, b).into()));
+                    }
+                    rvalues
+                }
+                // The shift is a vector of the lanes' type.
+                "simd_funnel_shl" | "simd_funnel_shr" => {
+                    let (a, b, shift) =
+                        (self.lane_numbers(&arg(0)?)?, self.lane_numbers(&arg(1)?)?, self.lane_numbers(&arg(2)?)?);
+                    let mut rvalues = Vec::new();
+                    for ((a, b), shift) in a.into_iter().zip(b).zip(shift) {
+                        rvalues.push(KRvalue::Use(self.funnel(name == "simd_funnel_shl", a, b, shift).into()));
                     }
                     rvalues
                 }
@@ -3127,6 +3178,251 @@ impl<'tcx> Translator<'tcx> {
             self.set(lane, rvalue);
         }
         self.store(frame, destination, result)
+    }
+
+    /// An intrinsic built from several kernel operations, as its
+    /// documentation defines it.
+    fn exact(
+        &mut self,
+        frame: &mut Frame<'_, 'tcx>,
+        name: &str,
+        generic_args: ty::GenericArgsRef<'tcx>,
+        args: &[rustc_span::Spanned<Operand<'tcx>>],
+        destination: &Place<'tcx>,
+    ) -> Result<()> {
+        let tcx = self.tcx;
+        let unexpected = || format!("uses the intrinsic `{name}` with unexpected arguments");
+        let dest_ty = destination.ty(frame.body, tcx).ty;
+        // The value a pointer or reference argument points to.
+        let target = |slot: Slot| match slot {
+            Slot::Ref(target) => Ok(*target),
+            _ => Err(format!("uses the intrinsic `{name}` through a pointer to data of another type")),
+        };
+        // Intrinsics over whole values.
+        match (name, args) {
+            // rustc's checks that `mem::zeroed`, `MaybeUninit::assume_init`
+            // and the like are valid for their type. A type that fails
+            // panics on the CPU every time.
+            ("assert_inhabited" | "assert_zero_valid" | "assert_mem_uninitialized_valid", []) => {
+                let requirement = match name {
+                    "assert_inhabited" => ValidityRequirement::Inhabited,
+                    "assert_zero_valid" => ValidityRequirement::Zero,
+                    _ => ValidityRequirement::UninitMitigated0x01Fill,
+                };
+                let ty = generic_args.type_at(0);
+                return match tcx.check_validity_requirement((requirement, self.typing_env().as_query_input(ty))) {
+                    Ok(true) => Ok(()),
+                    _ => Err(format!("uses the intrinsic `{name}` for `{ty}`, which always panics")),
+                };
+            }
+            // Its contract allows `false` for any value.
+            ("is_val_statically_known", [_]) => {
+                let dest = self.place(frame, destination)?;
+                return self.write_number(dest, KRvalue::Use(Const::bool(false).into()));
+            }
+            ("black_box", [value]) => {
+                let value = self.operand_slot(frame, &value.node)?;
+                return self.store(frame, destination, value);
+            }
+            ("select_unpredictable", [condition, yes, no]) => {
+                let condition = self.scalar_operand(frame, &condition.node)?;
+                let condition = self.b.copy(condition);
+                let yes = self.operand_slot(frame, &yes.node)?;
+                let no = self.operand_slot(frame, &no.node)?;
+                let result = self.snapshot(&no)?;
+                self.copy_where(condition, &result, &yes)?;
+                return self.store(frame, destination, result);
+            }
+            ("typed_swap_nonoverlapping", [x, y]) => {
+                let x = target(self.operand_slot(frame, &x.node)?)?;
+                let y = target(self.operand_slot(frame, &y.node)?)?;
+                let old = self.snapshot(&x)?;
+                if self.copy(&x, &y)? != x || self.copy(&y, &old)? != y {
+                    return Err("swaps values holding references".into());
+                }
+                return Ok(());
+            }
+            // Compares the bytes, which its contract requires to be
+            // initialized: a float compares by its bits.
+            ("raw_eq", [a, b]) => {
+                let ty = generic_args.type_at(0);
+                let a = target(self.operand_slot(frame, &a.node)?)?;
+                let b = target(self.operand_slot(frame, &b.node)?)?;
+                let size = self.size(ty)?;
+                let mut equal: KOperand = Const::bool(true).into();
+                for offset in (0..size).step_by(8) {
+                    let width = (size - offset).min(8);
+                    let x = self.gather(&a, ty, 0, offset, width)?;
+                    let y = self.gather(&b, ty, 0, offset, width)?;
+                    let same = self.b.binary(KBinOp::Eq, x, y);
+                    equal = self.b.binary(KBinOp::And, equal, same).into();
+                }
+                let dest = self.place(frame, destination)?;
+                return self.write_number(dest, KRvalue::Use(equal));
+            }
+            _ => {}
+        }
+        let values = args.iter().map(|arg| self.scalar_operand(frame, &arg.node)).collect::<Result<Vec<_>>>()?;
+        let result: KOperand = match (name, values.as_slice()) {
+            // Undefined where `as` would saturate, so `as` is right for
+            // every defined use.
+            ("float_to_int_unchecked", &[value]) => {
+                let to = held_ty(dest_ty).filter(|ty| ty.is_int()).ok_or_else(unexpected)?;
+                self.b.cast(value, to).into()
+            }
+            ("integer_min" | "integer_max", &[a, b]) => {
+                let op = if name == "integer_min" { KBinOp::Gt } else { KBinOp::Lt };
+                let first = self.b.binary(op, a, b);
+                self.b.select(first, a, b).into()
+            }
+            ("copysignf32" | "copysignf64", &[magnitude, sign]) => self.copysign(magnitude, sign).into(),
+            ("saturating_add" | "saturating_sub", &[a, b]) => self.saturating(name == "saturating_add", a, b)?.into(),
+            ("roundf32" | "roundf64", &[value]) => self.round_away(value).into(),
+            ("minimumf32" | "minimumf64" | "maximumf32" | "maximumf64", &[a, b]) => {
+                self.float_extreme(name.starts_with("minimum"), a, b).into()
+            }
+            ("bitreverse", &[value]) => self.bit_reverse(value).into(),
+            ("unchecked_funnel_shl" | "unchecked_funnel_shr", &[a, b, shift]) => {
+                self.funnel(name == "unchecked_funnel_shl", a, b, shift).into()
+            }
+            ("carryless_mul", &[a, b]) => self.carryless(a, b).into(),
+            // `a * b + c + d` at double width: the low half (unsigned) and
+            // the high half, as a tuple.
+            ("carrying_mul_add", &[a, b, c, d]) => {
+                let ty = self.b.ty(a);
+                if ty.bits() > 64 {
+                    return Err(format!("uses the intrinsic `{name}` on `{ty:?}`, which needs 256-bit integers"));
+                }
+                let bytes = u64::from(ty.bytes());
+                let wide = if ty.is_signed() { signed_of(2 * bytes) } else { unsigned_of(2 * bytes) };
+                let [a, b, c, d] = [a, b, c, d].map(|operand| self.b.cast(operand, wide));
+                let product = self.b.binary(KBinOp::Mul, a, b);
+                let sum = self.b.binary(KBinOp::Add, product, c);
+                let sum = self.b.binary(KBinOp::Add, sum, d);
+                let high_bits = self.b.binary(KBinOp::Shr, sum, Const::int(KTy::U32, i128::from(ty.bits())));
+                let result = self.fresh(dest_ty)?;
+                let Slot::Fields(halves) = &result else { return Err(unexpected()) };
+                let [Slot::Scalar(low), Slot::Scalar(high)] = halves.as_slice() else { return Err(unexpected()) };
+                let (low, high) = (*low, *high);
+                self.set(low, KRvalue::Cast(sum.into(), unsigned_of(bytes)));
+                self.set(high, KRvalue::Cast(high_bits.into(), ty));
+                return self.store(frame, destination, result);
+            }
+            _ => return Err(unexpected()),
+        };
+        let dest = self.place(frame, destination)?;
+        self.write_number(dest, KRvalue::Use(result))
+    }
+
+    /// The float `magnitude` with the sign bit of `sign`.
+    fn copysign(&mut self, magnitude: KOperand, sign: KOperand) -> KLocal {
+        let ty = self.b.ty(magnitude);
+        let bits_ty = unsigned_of(u64::from(ty.bytes()));
+        let sign_bit = 1u128 << (ty.bits() - 1);
+        let (m, s) = (self.b.reinterpret(magnitude, bits_ty), self.b.reinterpret(sign, bits_ty));
+        let m = self.b.binary(KBinOp::And, m, Const { ty: bits_ty, bits: sign_bit - 1 });
+        let s = self.b.binary(KBinOp::And, s, Const { ty: bits_ty, bits: sign_bit });
+        let bits = self.b.binary(KBinOp::Or, m, s);
+        self.b.reinterpret(bits, ty)
+    }
+
+    /// `f32::round`: to the nearest integer, ties away from zero. The
+    /// fraction `value - trunc(value)` is exact, and where it is nonzero
+    /// the value is below 2^52, so adding one is exact too. NaN and the
+    /// infinities keep `trunc`'s result (their fraction is NaN).
+    fn round_away(&mut self, value: KOperand) -> KLocal {
+        let ty = self.b.ty(value);
+        let (half, one) = if ty == KTy::F32 { (Const::f32(0.5), Const::f32(1.0)) } else { (Const::f64(0.5), Const::f64(1.0)) };
+        let truncated = self.b.call(Intrinsic::Trunc, &[value]);
+        let fraction = self.b.binary(KBinOp::Sub, value, truncated);
+        let size = self.b.call(Intrinsic::Abs, &[fraction.into()]);
+        let far = self.b.binary(KBinOp::Ge, size, half);
+        let step = self.copysign(one.into(), value);
+        let away = self.b.binary(KBinOp::Add, truncated, step);
+        self.b.select(far, away, truncated)
+    }
+
+    /// `f32::minimum` or `maximum`: NaN if either operand is, and `-0.0`
+    /// below `0.0`.
+    fn float_extreme(&mut self, minimum: bool, a: KOperand, b: KOperand) -> KLocal {
+        let ty = self.b.ty(a);
+        let bits_ty = unsigned_of(u64::from(ty.bytes()));
+        let a_nan = self.b.binary(KBinOp::Ne, a, a);
+        let b_nan = self.b.binary(KBinOp::Ne, b, b);
+        let nan = self.b.binary(KBinOp::Or, a_nan, b_nan);
+        let propagated = self.b.binary(KBinOp::Add, a, b);
+        // Equal operands differ only in a zero's sign: `minimum` takes the
+        // sign bit if either has it, `maximum` only if both do.
+        let (x, y) = (self.b.reinterpret(a, bits_ty), self.b.reinterpret(b, bits_ty));
+        let merged = self.b.binary(if minimum { KBinOp::Or } else { KBinOp::And }, x, y);
+        let equal = self.b.reinterpret(merged, ty);
+        let (first, second) = if minimum { (KBinOp::Lt, KBinOp::Gt) } else { (KBinOp::Gt, KBinOp::Lt) };
+        let a_wins = self.b.binary(first, a, b);
+        let b_wins = self.b.binary(second, a, b);
+        let picked = self.b.select(b_wins, b, equal);
+        let picked = self.b.select(a_wins, a, picked);
+        self.b.select(nan, propagated, picked)
+    }
+
+    /// An integer with its bits in reverse order: neighbors swapped in
+    /// pairs, then pairs, then nibbles, then the bytes reversed.
+    fn bit_reverse(&mut self, value: KOperand) -> KLocal {
+        let ty = self.b.ty(value);
+        let bytes = u64::from(ty.bytes());
+        let unsigned = unsigned_of(bytes);
+        let width_mask = u128::MAX >> (128 - ty.bits());
+        let mut bits: KOperand = self.b.cast(value, unsigned).into();
+        for (shift, pattern) in [(1, 0x55u8), (2, 0x33), (4, 0x0F)] {
+            let mask = Const { ty: unsigned, bits: u128::from_le_bytes([pattern; 16]) & width_mask };
+            let amount = Const::int(KTy::U32, shift);
+            let low = self.b.binary(KBinOp::And, bits, mask);
+            let up = self.b.binary(KBinOp::Shl, low, amount);
+            let high = self.b.binary(KBinOp::Shr, bits, amount);
+            let down = self.b.binary(KBinOp::And, high, mask);
+            bits = self.b.binary(KBinOp::Or, up, down).into();
+        }
+        let swapped = self.byte_swap(bits);
+        self.b.cast(swapped, ty)
+    }
+
+    /// `a` and `b` concatenated (`a` high), shifted left by `shift`, the
+    /// high half (`funnel_shl`); or shifted right, the low half
+    /// (`funnel_shr`). The shift is below the width, as the contract
+    /// requires; at zero the result is `a` or `b`, which the kernel's
+    /// masked shifts can't give.
+    fn funnel(&mut self, left: bool, a: KOperand, b: KOperand, shift: KOperand) -> KLocal {
+        let ty = self.b.ty(a);
+        let unsigned = unsigned_of(u64::from(ty.bytes()));
+        let (a, b) = (self.b.cast(a, unsigned), self.b.cast(b, unsigned));
+        let shift = self.b.cast(shift, KTy::U32);
+        let rest = self.b.binary(KBinOp::Sub, Const::int(KTy::U32, i128::from(ty.bits())), shift);
+        let (a_shift, b_shift, unshifted) = if left { (shift, rest, a) } else { (rest, shift, b) };
+        let high = self.b.binary(KBinOp::Shl, a, a_shift);
+        let low = self.b.binary(KBinOp::Shr, b, b_shift);
+        let joined = self.b.binary(KBinOp::Or, high, low);
+        let zero = self.b.binary(KBinOp::Eq, shift, Const::int(KTy::U32, 0));
+        let bits = self.b.select(zero, unshifted, joined);
+        self.b.cast(bits, ty)
+    }
+
+    /// The low half of the carry-less product: `a << i` xored in for each
+    /// set bit `i` of `b`.
+    fn carryless(&mut self, a: KOperand, b: KOperand) -> KLocal {
+        let ty = self.b.ty(a);
+        let unsigned = unsigned_of(u64::from(ty.bytes()));
+        let (a, b) = (self.b.cast(a, unsigned), self.b.cast(b, unsigned));
+        let zero = Const::int(unsigned, 0);
+        let mut product: KOperand = zero.into();
+        for index in 0..ty.bits() {
+            let amount = Const::int(KTy::U32, i128::from(index));
+            let shifted_b = self.b.binary(KBinOp::Shr, b, amount);
+            let bit = self.b.binary(KBinOp::And, shifted_b, Const::int(unsigned, 1));
+            let set = self.b.binary(KBinOp::Ne, bit, zero);
+            let shifted_a = self.b.binary(KBinOp::Shl, a, amount);
+            let term = self.b.select(set, shifted_a, zero);
+            product = self.b.binary(KBinOp::Xor, product, term).into();
+        }
+        self.b.cast(product, ty)
     }
 
     /// `a + b` or `a - b` of integers, clamped to the type's range.
@@ -3163,7 +3459,8 @@ impl<'tcx> Translator<'tcx> {
                 self.b.select(wrapped, Const::int(ty, 0), result)
             });
         }
-        // Signed 64 bits: on overflow, the result saturates toward `a`'s sign.
+        // Signed 64 and 128 bits: on overflow, the result saturates toward
+        // `a`'s sign.
         let checked = if add { BinOp::AddWithOverflow } else { BinOp::SubWithOverflow };
         let (result, overflowed) = self.with_overflow(checked, a, b)?;
         let negative = self.b.binary(KBinOp::Lt, a, Const::int(ty, 0));

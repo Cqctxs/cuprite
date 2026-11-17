@@ -117,6 +117,21 @@ const COMMON: &[(&str, &str)] = &[
     ("wide_float", "candidate: map over `[u64]`"),
     ("wide_mul_hash", "candidate: map over `[u64]`"),
     ("wide_signed", "candidate: map over `[i64]`"),
+    // The exact intrinsics.
+    ("exact_copysign", "candidate: map over `[f32]`"),
+    ("exact_float_to_int", "candidate: map over `[u32]`"),
+    ("exact_funnel", "candidate: map over `[u32]`"),
+    ("exact_hints", "candidate: map over `[u32]`"),
+    ("exact_int_minmax", "candidate: map over `[i32]`"),
+    ("exact_minimum", "candidate: map over `[u32]`"),
+    ("exact_products", "candidate: map over `[u64]`"),
+    ("exact_reverse", "candidate: map over `[u32]`"),
+    ("exact_round", "candidate: map over `[f32]`"),
+    ("exact_round_f64", "candidate: map over `[f64]`"),
+    ("exact_saturating", "candidate: map over `[i32]`"),
+    ("exact_saturating_i64", "candidate: map over `[i64]`"),
+    ("exact_saturating_u8", "candidate: map over `[u8]`"),
+    ("exact_swap_eq", "candidate: map over `[u32]`"),
     ("normalize_range", "candidate: map over `[f32]` reading `low`, `high`"),
     ("normalized_y", "candidate: map over `[f32]`"),
     ("numbered", "rejected: carries a value from one element to the next"),
@@ -173,7 +188,7 @@ const COMMON: &[(&str, &str)] = &[
 /// rustc inlines differently in debug and release builds, which changes
 /// where some refusals are found.
 const DEBUG: &[(&str, &str)] = &[
-    ("sr_div_rem", "rejected: calls `strength_reduce::StrengthReducedU64::new`, which calls `strength_reduce::long_division::divide_128_max_by_64`, which calls `strength_reduce::long_division::divide_128_by_64_preshifted`, which calls `std::cmp::min::<u64>`, which calls `<u64 as std::cmp::Ord>::min`, which uses the intrinsic `integer_min`, which isn't translated yet (exact)"),
+    ("sr_div_rem", "candidate: map over `[u64]` reading `divisor`"),
     ("noise_row", "rejected: calls `noise::Perlin::new`, which calls `noise::permutationtable::PermutationTable::new`, which calls `<rand_xorshift::XorShiftRng as rand_core::SeedableRng>::from_seed`, which calls `rand_core::le::read_u32_into`, which calls `core::slice::<impl [u32]>::iter_mut`, which calls `std::slice::IterMut::<'_, u32>::new`, which reinterprets bits as `std::ptr::NonNull<[u32]>` (a transmute)"),
     ("half_decode", "rejected: calls `<{closure} as std::ops::FnMut<((&mut f32, &u16),)>>::call_mut`, which calls `half::f16::to_f32`, which calls `half::binary16::arch::f16_to_f32`, which calls `half::binary16::arch::x86::f16_to_f32_x86_f16c`, which calls `std::arch::x86_64::_mm_cvtph_ps`, which uses `f16`, a number the kernel doesn't have"),
     ("half_encode", "candidate: map over `[u16]` zipped with `values` with the host's CPU features"),
@@ -182,14 +197,14 @@ const DEBUG: &[(&str, &str)] = &[
     ("libm_atan2", "rejected: calls `libm::atan2f`, which calls `libm::atanf`, which calls `std::ptr::read_volatile::<f32>`, which calls `std::ptr::read_volatile::precondition_check`, which calls `std::ptr::const_ptr::<impl *const ()>::is_aligned_to`, which reinterprets bits as `usize` (a transmute)"),
     ("libm_cbrt", "rejected: calls `libm::cbrt`, which calls `libm::math::cbrt::cbrt_round`, which calls `<f64 as libm::math::support::float_traits::Float>::fma`, which calls `libm::fma`, which calls `libm::math::arch::x86::fma::fma`, which reads a static that can change (`libm::math::arch::x86::fma::fma::FUNC`)"),
     ("libm_exp", "rejected: calls `<{closure} as std::ops::FnMut<(&mut f64,)>>::call_mut`, which calls `libm::exp`, which calls `std::ptr::read_volatile::<f32>`, which calls `std::ptr::read_volatile::precondition_check`, which calls `std::ptr::const_ptr::<impl *const ()>::is_aligned_to`, which reinterprets bits as `usize` (a transmute)"),
-    ("libm_pow", "rejected: calls `libm::powf`, which calls `libm::scalbnf`, which calls `libm::math::generic::scalbn::scalbn::<f32>`, which calls `<i32 as std::cmp::Ord>::max`, which uses the intrinsic `integer_max`, which isn't translated yet (exact)"),
-    ("libm_sin", "rejected: calls `libm::sinf`, which calls `libm::math::rem_pio2f::rem_pio2f`, which calls `libm::math::rem_pio2_large::rem_pio2_large`, which calls `libm::scalbn`, which calls `libm::math::generic::scalbn::scalbn::<f64>`, which calls `<i32 as std::cmp::Ord>::max`, which uses the intrinsic `integer_max`, which isn't translated yet (exact)"),
+    ("libm_pow", "rejected: calls `libm::powf`, which calls `libm::sqrtf`, which calls `libm::math::arch::x86::sqrtf`, which uses inline assembly"),
+    ("libm_sin", "rejected: calls `libm::sinf`, which calls `std::ptr::read_volatile::<f32>`, which calls `std::ptr::read_volatile::precondition_check`, which calls `std::ptr::const_ptr::<impl *const ()>::is_aligned_to`, which reinterprets bits as `usize` (a transmute)"),
     ("ni_sqrt", "rejected: calls `<u64 as num_integer::Roots>::sqrt`, which calls `<u64 as num_integer::Roots>::sqrt::go`, which calls `num_integer::roots::karatsuba_sqrt`, which calls `<u64 as num_integer::Roots>::sqrt` recursively"),
     ("palette_linear", "rejected: calls `palette::rgb::Rgb::into_linear::<f32>`, which calls `<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear`, which calls `<bool as palette::bool_mask::LazySelect<f32>>::lazy_select::<{closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#0}}, {closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#1}}>`, which calls `<{closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#1}} as std::ops::FnOnce<()>>::call_once`, which calls `<f32 as palette::num::Powf>::powf`, which calls `std::f32::<impl f32>::powf`, which uses the intrinsic `powf32`, which isn't exact on the GPU: the CPU calls the platform's math library, whose results the GPU can't reproduce bit for bit"),
     ("palette_saturation", "rejected: calls `<palette::Hsv as palette::FromColor<palette::rgb::Rgb>>::from_color`, which calls `<palette::Hsv as palette::convert::FromColorUnclamped<palette::rgb::Rgb>>::from_color_unclamped`, which calls `std::any::TypeId::of::<bool>`, which uses a constant holding a reference"),
 ];
 const RELEASE: &[(&str, &str)] = &[
-    ("sr_div_rem", "rejected: calls `strength_reduce::StrengthReducedU64::new`, which calls `strength_reduce::long_division::divide_128_max_by_64`, which calls `strength_reduce::long_division::divide_128_by_64_preshifted`, which uses the intrinsic `integer_min`, which isn't translated yet (exact)"),
+    ("sr_div_rem", "candidate: map over `[u64]` reading `divisor`"),
     ("noise_row", "rejected: calls `noise::Perlin::new`, which calls `noise::permutationtable::PermutationTable::new`, which calls `<rand_xorshift::XorShiftRng as rand_core::SeedableRng>::from_seed`, which calls `rand_core::le::read_u32_into`, which reinterprets bits as `std::ptr::NonNull<[u32]>` (a transmute)"),
     ("half_decode", "rejected: calls `<{closure} as std::ops::FnMut<((&mut f32, &u16),)>>::call_mut`, which calls `half::binary16::arch::x86::f16_to_f32_x86_f16c`, which uses `f16`, a number the kernel doesn't have"),
     ("half_encode", "candidate: map over `[u16]` zipped with `values` with the host's CPU features"),
@@ -198,8 +213,8 @@ const RELEASE: &[(&str, &str)] = &[
     ("libm_atan2", "rejected: calls `libm::atan2f`, which calls `libm::atanf`, which uses the intrinsic `volatile_load`, which accesses memory as volatile"),
     ("libm_cbrt", "rejected: calls `libm::cbrt`, which calls `libm::math::cbrt::cbrt_round`, which calls `<f64 as libm::math::support::float_traits::Float>::fma`, which calls `libm::fma`, which calls `libm::math::arch::x86::fma::fma`, which reads a static that can change (`libm::math::arch::x86::fma::fma::FUNC`)"),
     ("libm_exp", "rejected: calls `<{closure} as std::ops::FnMut<(&mut f64,)>>::call_mut`, which calls `libm::exp`, which uses the intrinsic `volatile_load`, which accesses memory as volatile"),
-    ("libm_pow", "rejected: calls `libm::powf`, which calls `libm::scalbnf`, which calls `libm::math::generic::scalbn::scalbn::<f32>`, which uses the intrinsic `integer_max`, which isn't translated yet (exact)"),
-    ("libm_sin", "rejected: calls `libm::sinf`, which calls `libm::math::rem_pio2f::rem_pio2f`, which calls `libm::math::rem_pio2_large::rem_pio2_large`, which calls `libm::scalbn`, which calls `libm::math::generic::scalbn::scalbn::<f64>`, which uses the intrinsic `integer_max`, which isn't translated yet (exact)"),
+    ("libm_pow", "rejected: calls `libm::powf`, which uses inline assembly"),
+    ("libm_sin", "rejected: calls `libm::sinf`, which calls `libm::math::rem_pio2f::rem_pio2f`, which calls `libm::math::rem_pio2_large::rem_pio2_large`, which indexes past the end of an array"),
     ("ni_sqrt", "candidate: map over `[u64]`"),
     ("palette_linear", "rejected: calls `palette::rgb::Rgb::into_linear::<f32>`, which calls `<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear`, which calls `<bool as palette::bool_mask::LazySelect<f32>>::lazy_select::<{closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#0}}, {closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#1}}>`, which calls `<{closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#1}} as std::ops::FnOnce<()>>::call_once`, which calls `<f32 as palette::num::Powf>::powf`, which uses the intrinsic `powf32`, which isn't exact on the GPU: the CPU calls the platform's math library, whose results the GPU can't reproduce bit for bit"),
     ("palette_saturation", "rejected: calls `<palette::Hsv as palette::FromColor<palette::rgb::Rgb>>::from_color`, which calls `<palette::Hsv as palette::convert::FromColorUnclamped<palette::rgb::Rgb>>::from_color_unclamped`, which uses a constant holding a reference"),
@@ -374,7 +389,8 @@ fn rewritten_candidates_match_the_cpu_on_the_gpu() {
     // maps with enums. Then 9 with SIMD: `simd_roots`, 5 with SSE, 2 with
     // runtime feature detection, and `half`'s `half_encode`; and
     // `pointer_views`, reading through pointer casts. Then 4 with 128-bit
-    // integers.
+    // integers, and 14 with the exact intrinsics, and the held-out
+    // `sr_div_rem` with 4 divisors.
     let with_work = LENGTHS - 3;
     let gpu_calls = 9 * non_empty + 3 * 2 * non_empty + non_empty + (7 + 5 + 8 + 3) * non_empty
         + 2 * 2 * non_empty
@@ -386,6 +402,8 @@ fn rewritten_candidates_match_the_cpu_on_the_gpu() {
         + (11 + 1) * non_empty
         + 9 * non_empty
         + (9 + 1) * non_empty
+        + 4 * non_empty
+        + 14 * non_empty
         + 4 * non_empty;
     assert_eq!(trace.matches("-> gpu").count(), gpu_calls, "{trace}");
     for (passes, functions) in REGIONS {
