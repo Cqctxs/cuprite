@@ -231,6 +231,11 @@ impl Builder {
         Ok(function)
     }
 
+    /// The kernel so far, unchecked.
+    pub fn into_kernel(self) -> Kernel {
+        self.kernel
+    }
+
     pub fn finish(self) -> Result<Kernel, Invalid> {
         self.kernel.validate()?;
         Ok(self.kernel)

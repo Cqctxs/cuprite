@@ -1444,6 +1444,58 @@ pub fn pointer_write(values: &mut [u64]) {
     }
 }
 
+// 128-bit integers (code generation): wide products, division, signed
+// arithmetic, float conversions and bit operations, which kernels compute
+// as pairs of 64-bit halves.
+
+/// The high half of a 64-by-64-bit product, as hash functions and
+/// "fast range" reductions use it.
+pub fn wide_mul_hash(values: &mut [u64]) {
+    for value in values {
+        let product = u128::from(*value) * 0x9E37_79B9_7F4A_7C15;
+        *value = (product >> 64) as u64 ^ product as u64;
+    }
+}
+
+/// A 128-bit value divided by a 64-bit parameter, which can be zero.
+pub fn wide_divide(values: &mut [u64], divisor: u64) {
+    for value in values {
+        let wide = u128::from(*value) << 64 | 0x1234_5678;
+        let quotient = wide / u128::from(divisor);
+        *value = (quotient >> 32) as u64 ^ (wide % u128::from(divisor)) as u64;
+    }
+}
+
+/// Signed 128-bit arithmetic: products, division by a constant, shifts.
+pub fn wide_signed(values: &mut [i64]) {
+    for value in values {
+        let wide = i128::from(*value) * -3 + i128::MAX / 7;
+        let mixed = (wide >> 70) ^ (wide << 5) ^ (wide / -1_000_003);
+        *value = mixed as i64 ^ (mixed >> 64) as i64;
+    }
+}
+
+/// 128-bit integers to and from floats, rounding and saturating.
+pub fn wide_float(values: &mut [u64]) {
+    for value in values {
+        let wide = u128::from(*value) << 40 | u128::from(*value >> 7);
+        let float = wide as f64 * 0.75;
+        let back = float as u128;
+        let signed = -(float * 1e10) as i128;
+        *value = back as u64 ^ (back >> 64) as u64 ^ signed as u64 ^ ((signed >> 100) as u64).rotate_left(3);
+    }
+}
+
+/// 128-bit bit counts, rotations and byte swaps.
+pub fn wide_bits(values: &mut [u64]) {
+    for value in values {
+        let wide = u128::from(*value) << 17 ^ u128::from(*value).rotate_right(29);
+        let counts = wide.leading_zeros() + wide.trailing_zeros() * 7 + wide.count_ones() * 131;
+        let swapped = wide.swap_bytes() ^ u128::from_be_bytes((wide >> 3).to_le_bytes()).rotate_left(1);
+        *value = u64::from(counts) ^ swapped as u64 ^ (swapped >> 64) as u64;
+    }
+}
+
 // Development code for the grid structure: `noise`, whose generators the
 // grid measurement ported. Run before the grid shape exists, as a baseline.
 

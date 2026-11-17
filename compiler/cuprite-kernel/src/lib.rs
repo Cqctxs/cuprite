@@ -24,6 +24,9 @@
 //! - **Casts** are Rust's `as`: integers truncate or extend by the source's
 //!   signedness; integers round to the nearest float; floats saturate to
 //!   integers, with NaN becoming 0; `bool` becomes 0 or 1.
+//! - **128-bit integers** have the same semantics as the others;
+//!   [`wide::lower`] turns them into pairs of 64-bit halves before either
+//!   backend sees them.
 //! - **Reinterpreting** keeps the bits and changes the type, between
 //!   integers and floats of one width, like `f32::to_bits`; NaN payloads
 //!   are kept.
@@ -35,6 +38,7 @@ pub mod description;
 pub mod llvm;
 pub mod ptx;
 pub mod shapes;
+pub mod wide;
 
 use std::fmt;
 
@@ -50,6 +54,10 @@ pub enum Ty {
     U16,
     U32,
     U64,
+    /// 128-bit integers, which `wide::lower` turns into pairs of 64-bit
+    /// halves before either backend sees them.
+    I128,
+    U128,
     F32,
     F64,
     /// A global-memory address.
@@ -64,6 +72,7 @@ impl Ty {
             Ty::I16 | Ty::U16 => 16,
             Ty::I32 | Ty::U32 | Ty::F32 => 32,
             Ty::I64 | Ty::U64 | Ty::F64 | Ty::Ptr => 64,
+            Ty::I128 | Ty::U128 => 128,
         }
     }
 
@@ -79,12 +88,12 @@ impl Ty {
     pub fn is_int(self) -> bool {
         matches!(
             self,
-            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64
+            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128
         )
     }
 
     pub fn is_signed(self) -> bool {
-        matches!(self, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64)
+        matches!(self, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128)
     }
 
     /// What a launch can pass as an argument: `cuprite_memory::Arg`.
@@ -104,6 +113,8 @@ impl Ty {
             Ty::U16 => "u16",
             Ty::U32 => "u32",
             Ty::U64 => "u64",
+            Ty::I128 => "i128",
+            Ty::U128 => "u128",
             Ty::F32 => "f32",
             Ty::F64 => "f64",
             Ty::Ptr => "ptr",
@@ -112,7 +123,8 @@ impl Ty {
 
     pub fn from_name(name: &str) -> Option<Ty> {
         [
-            Ty::Bool, Ty::I8, Ty::I16, Ty::I32, Ty::I64, Ty::U8, Ty::U16, Ty::U32, Ty::U64, Ty::F32, Ty::F64, Ty::Ptr,
+            Ty::Bool, Ty::I8, Ty::I16, Ty::I32, Ty::I64, Ty::U8, Ty::U16, Ty::U32, Ty::U64, Ty::I128, Ty::U128, Ty::F32,
+            Ty::F64, Ty::Ptr,
         ]
         .into_iter()
         .find(|ty| ty.name() == name)
@@ -125,12 +137,12 @@ pub struct Local(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlockId(pub u32);
 
-/// A constant: its type and its bits, zero-extended to 64. A signed
+/// A constant: its type and its bits, zero-extended to 128. A signed
 /// integer holds its two's-complement bits; a float its IEEE bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Const {
     pub ty: Ty,
-    pub bits: u64,
+    pub bits: u128,
 }
 
 impl Const {
@@ -144,10 +156,10 @@ impl Const {
     /// An integer of type `ty`, truncated to its width.
     pub fn int(ty: Ty, value: i128) -> Self {
         assert!(ty.is_int(), "{ty:?} is not an integer type");
-        let mask = if ty.bits() == 64 { u64::MAX } else { (1u64 << ty.bits()) - 1 };
+        let mask = if ty.bits() == 128 { u128::MAX } else { (1u128 << ty.bits()) - 1 };
         Self {
             ty,
-            bits: (value as u64) & mask,
+            bits: (value as u128) & mask,
         }
     }
 
@@ -161,14 +173,14 @@ impl Const {
     pub fn f64(value: f64) -> Self {
         Self {
             ty: Ty::F64,
-            bits: value.to_bits(),
+            bits: value.to_bits().into(),
         }
     }
 
     /// The value as a signed integer, for signed types.
-    pub fn signed(self) -> i64 {
-        let shift = 64 - self.ty.bits();
-        ((self.bits << shift) as i64) >> shift
+    pub fn signed(self) -> i128 {
+        let shift = 128 - self.ty.bits();
+        ((self.bits << shift) as i128) >> shift
     }
 }
 
@@ -243,6 +255,9 @@ pub enum Intrinsic {
     TrailingZeros,
     /// `count_ones`, as `U32`.
     CountOnes,
+    /// The high half of the double-width product of two unsigned integers
+    /// of one type (`u32` or `u64`), such as `((a as u128 * b as u128) >> 64) as u64`.
+    MulHigh,
 }
 
 impl Intrinsic {
@@ -394,7 +409,7 @@ impl Kernel {
             Rvalue::Call(intrinsic, args) => {
                 let types: Vec<Ty> = args.iter().map(ty).collect();
                 let arity = match intrinsic {
-                    Intrinsic::Min | Intrinsic::Max | Intrinsic::RotateLeft | Intrinsic::RotateRight => 2,
+                    Intrinsic::Min | Intrinsic::Max | Intrinsic::RotateLeft | Intrinsic::RotateRight | Intrinsic::MulHigh => 2,
                     Intrinsic::MulAdd => 3,
                     _ => 1,
                 };
@@ -406,6 +421,7 @@ impl Kernel {
                     Intrinsic::RotateLeft | Intrinsic::RotateRight => {
                         first.is_int() && types[1] == Ty::U32
                     }
+                    Intrinsic::MulHigh => matches!(first, Ty::U32 | Ty::U64) && types[1] == first,
                     _ if intrinsic.counts_bits() => first.is_int(),
                     _ => first.is_float() && types.iter().all(|t| *t == first),
                 };

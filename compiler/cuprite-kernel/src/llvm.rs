@@ -15,6 +15,7 @@ use crate::{BinOp, Intrinsic, Kernel, Operand, Rvalue, Special, Statement, Termi
 
 fn lt(ty: Ty) -> &'static str {
     match ty {
+        Ty::I128 | Ty::U128 => "i128",
         Ty::Bool => "i1",
         Ty::I8 | Ty::U8 => "i8",
         Ty::I16 | Ty::U16 => "i16",
@@ -316,6 +317,15 @@ impl Emitter<'_> {
             Intrinsic::Ceil => call("ceil", &values),
             Intrinsic::Trunc => call("trunc", &values),
             Intrinsic::RoundTiesEven => call("roundeven", &values),
+            Intrinsic::MulHigh => {
+                let wide = format!("i{}", 2 * operand_ty.bits());
+                let (a, b) = (&values[0], &values[1]);
+                let wa = self.value(format!("zext {t} {a} to {wide}"));
+                let wb = self.value(format!("zext {t} {b} to {wide}"));
+                let product = self.value(format!("mul {wide} {wa}, {wb}"));
+                let high = self.value(format!("lshr {wide} {product}, {}", operand_ty.bits()));
+                self.value(format!("trunc {wide} {high} to {t}"))
+            }
             Intrinsic::Abs => self.sign_bit(operand_ty, "and", &values[0]),
             Intrinsic::Min => call("minnum", &values),
             Intrinsic::Max => call("maxnum", &values),
@@ -360,6 +370,8 @@ impl Emitter<'_> {
 /// If the kernel doesn't validate.
 pub fn emit(kernel: &Kernel) -> String {
     kernel.validate().unwrap_or_else(|invalid| panic!("{invalid}"));
+    let lowered = crate::wide::lower(kernel);
+    let kernel = &lowered;
     let mut emitter = Emitter {
         kernel,
         body: String::new(),

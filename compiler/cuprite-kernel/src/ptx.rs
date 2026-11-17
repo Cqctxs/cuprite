@@ -27,6 +27,7 @@ const CLASSES: [(Class, &str, &str); 6] = [
 
 fn class(ty: Ty) -> Class {
     match ty {
+        Ty::I128 | Ty::U128 => unreachable!("128-bit types are lowered first"),
         Ty::Bool => Class::Pred,
         Ty::I8 | Ty::U8 | Ty::I16 | Ty::U16 => Class::B16,
         Ty::I32 | Ty::U32 => Class::B32,
@@ -39,6 +40,7 @@ fn class(ty: Ty) -> Class {
 /// The type suffix for arithmetic and comparisons.
 fn arith(ty: Ty) -> &'static str {
     match ty {
+        Ty::I128 | Ty::U128 => unreachable!("128-bit types are lowered first"),
         Ty::I8 | Ty::I16 => "s16",
         Ty::U8 | Ty::U16 => "u16",
         Ty::I32 => "s32",
@@ -68,6 +70,7 @@ fn untyped(ty: Ty) -> &'static str {
 /// The type suffix in memory.
 fn memory(ty: Ty) -> &'static str {
     match ty {
+        Ty::I128 | Ty::U128 => unreachable!("128-bit types are lowered first"),
         Ty::I8 => "s8",
         Ty::U8 | Ty::Bool => "u8",
         Ty::I16 => "s16",
@@ -416,6 +419,7 @@ impl<'k> Emitter<'k> {
             Intrinsic::Ceil => self.line(format!("cvt.rpi.{f}.{f} {d}, {x}")),
             Intrinsic::Trunc => self.line(format!("cvt.rzi.{f}.{f} {d}, {x}")),
             Intrinsic::RoundTiesEven => self.line(format!("cvt.rni.{f}.{f} {d}, {x}")),
+            Intrinsic::MulHigh => self.line(format!("mul.hi.{f} {d}, {x}, {}", values[1])),
             Intrinsic::Abs => {
                 let (class, bits, mask) = if ty == Ty::F32 {
                     (Class::B32, "b32", "0x7FFFFFFF")
@@ -533,6 +537,8 @@ fn label(block: u32) -> String {
 /// If the kernel doesn't validate.
 pub fn emit(kernel: &Kernel) -> String {
     kernel.validate().unwrap_or_else(|invalid| panic!("{invalid}"));
+    let lowered = crate::wide::lower(kernel);
+    let kernel = &lowered;
     let mut emitter = Emitter::new(kernel);
     let name = &kernel.name;
 

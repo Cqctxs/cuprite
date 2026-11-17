@@ -111,6 +111,12 @@ const COMMON: &[(&str, &str)] = &[
     ("sse_mix", "candidate: map over `[u32]`"),
     ("pointer_views", "candidate: map over `[u64]`"),
     ("pointer_write", "rejected: calls `std::ptr::write_unaligned::<u64>`, which writes through a pointer to data of another type"),
+    // 128-bit integers.
+    ("wide_bits", "candidate: map over `[u64]`"),
+    ("wide_divide", "candidate: map over `[u64]` reading `divisor`"),
+    ("wide_float", "candidate: map over `[u64]`"),
+    ("wide_mul_hash", "candidate: map over `[u64]`"),
+    ("wide_signed", "candidate: map over `[i64]`"),
     ("normalize_range", "candidate: map over `[f32]` reading `low`, `high`"),
     ("normalized_y", "candidate: map over `[f32]`"),
     ("numbered", "rejected: carries a value from one element to the next"),
@@ -144,7 +150,6 @@ const COMMON: &[(&str, &str)] = &[
     ("soft_root", "candidate: map over `[f64]`"),
     ("square", "candidate: map over `[u32]`"),
     ("square_wide", "candidate: map over `[i64]`"),
-    ("sr_div_rem", "rejected: calls `strength_reduce::StrengthReducedU64::new`, which calls `strength_reduce::long_division::divide_128_max_by_64`, which calls `strength_reduce::long_division::divide_128_by_64_preshifted`, which casts to `u128`, a type the kernel doesn't have"),
     ("sr_divide", "candidate: map over `[u32]` reading `divisor`"),
     ("swap_halves", "candidate: map over `[u32]`"),
     ("transform", "candidate: map over `[u32]`"),
@@ -168,6 +173,7 @@ const COMMON: &[(&str, &str)] = &[
 /// rustc inlines differently in debug and release builds, which changes
 /// where some refusals are found.
 const DEBUG: &[(&str, &str)] = &[
+    ("sr_div_rem", "rejected: calls `strength_reduce::StrengthReducedU64::new`, which calls `strength_reduce::long_division::divide_128_max_by_64`, which calls `strength_reduce::long_division::divide_128_by_64_preshifted`, which calls `std::cmp::min::<u64>`, which calls `<u64 as std::cmp::Ord>::min`, which uses the intrinsic `integer_min`, which isn't translated yet (exact)"),
     ("noise_row", "rejected: calls `noise::Perlin::new`, which calls `noise::permutationtable::PermutationTable::new`, which calls `<rand_xorshift::XorShiftRng as rand_core::SeedableRng>::from_seed`, which calls `rand_core::le::read_u32_into`, which calls `core::slice::<impl [u32]>::iter_mut`, which calls `std::slice::IterMut::<'_, u32>::new`, which reinterprets bits as `std::ptr::NonNull<[u32]>` (a transmute)"),
     ("half_decode", "rejected: calls `<{closure} as std::ops::FnMut<((&mut f32, &u16),)>>::call_mut`, which calls `half::f16::to_f32`, which calls `half::binary16::arch::f16_to_f32`, which calls `half::binary16::arch::x86::f16_to_f32_x86_f16c`, which calls `std::arch::x86_64::_mm_cvtph_ps`, which uses `f16`, a number the kernel doesn't have"),
     ("half_encode", "candidate: map over `[u16]` zipped with `values` with the host's CPU features"),
@@ -178,11 +184,12 @@ const DEBUG: &[(&str, &str)] = &[
     ("libm_exp", "rejected: calls `<{closure} as std::ops::FnMut<(&mut f64,)>>::call_mut`, which calls `libm::exp`, which calls `std::ptr::read_volatile::<f32>`, which calls `std::ptr::read_volatile::precondition_check`, which calls `std::ptr::const_ptr::<impl *const ()>::is_aligned_to`, which reinterprets bits as `usize` (a transmute)"),
     ("libm_pow", "rejected: calls `libm::powf`, which calls `libm::scalbnf`, which calls `libm::math::generic::scalbn::scalbn::<f32>`, which calls `<i32 as std::cmp::Ord>::max`, which uses the intrinsic `integer_max`, which isn't translated yet (exact)"),
     ("libm_sin", "rejected: calls `libm::sinf`, which calls `libm::math::rem_pio2f::rem_pio2f`, which calls `libm::math::rem_pio2_large::rem_pio2_large`, which calls `libm::scalbn`, which calls `libm::math::generic::scalbn::scalbn::<f64>`, which calls `<i32 as std::cmp::Ord>::max`, which uses the intrinsic `integer_max`, which isn't translated yet (exact)"),
-    ("ni_sqrt", "rejected: calls `<u64 as num_integer::Roots>::sqrt`, which calls `<u64 as num_integer::Roots>::sqrt::go`, which casts to `u128`, a type the kernel doesn't have"),
+    ("ni_sqrt", "rejected: calls `<u64 as num_integer::Roots>::sqrt`, which calls `<u64 as num_integer::Roots>::sqrt::go`, which calls `num_integer::roots::karatsuba_sqrt`, which calls `<u64 as num_integer::Roots>::sqrt` recursively"),
     ("palette_linear", "rejected: calls `palette::rgb::Rgb::into_linear::<f32>`, which calls `<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear`, which calls `<bool as palette::bool_mask::LazySelect<f32>>::lazy_select::<{closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#0}}, {closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#1}}>`, which calls `<{closure@<palette::encoding::Srgb as palette::encoding::IntoLinear<f32, f32>>::into_linear::{closure#1}} as std::ops::FnOnce<()>>::call_once`, which calls `<f32 as palette::num::Powf>::powf`, which calls `std::f32::<impl f32>::powf`, which uses the intrinsic `powf32`, which isn't exact on the GPU: the CPU calls the platform's math library, whose results the GPU can't reproduce bit for bit"),
     ("palette_saturation", "rejected: calls `<palette::Hsv as palette::FromColor<palette::rgb::Rgb>>::from_color`, which calls `<palette::Hsv as palette::convert::FromColorUnclamped<palette::rgb::Rgb>>::from_color_unclamped`, which calls `std::any::TypeId::of::<bool>`, which uses a constant holding a reference"),
 ];
 const RELEASE: &[(&str, &str)] = &[
+    ("sr_div_rem", "rejected: calls `strength_reduce::StrengthReducedU64::new`, which calls `strength_reduce::long_division::divide_128_max_by_64`, which calls `strength_reduce::long_division::divide_128_by_64_preshifted`, which uses the intrinsic `integer_min`, which isn't translated yet (exact)"),
     ("noise_row", "rejected: calls `noise::Perlin::new`, which calls `noise::permutationtable::PermutationTable::new`, which calls `<rand_xorshift::XorShiftRng as rand_core::SeedableRng>::from_seed`, which calls `rand_core::le::read_u32_into`, which reinterprets bits as `std::ptr::NonNull<[u32]>` (a transmute)"),
     ("half_decode", "rejected: calls `<{closure} as std::ops::FnMut<((&mut f32, &u16),)>>::call_mut`, which calls `half::binary16::arch::x86::f16_to_f32_x86_f16c`, which uses `f16`, a number the kernel doesn't have"),
     ("half_encode", "candidate: map over `[u16]` zipped with `values` with the host's CPU features"),
@@ -278,7 +285,7 @@ fn checks(name: &'static str, release: bool) -> std::path::PathBuf {
 const FAILED_CHECK: &str = "-> cpu (a check failed on the GPU)";
 
 /// Runtime calls the checks program makes.
-const CHECK_CALLS: usize = 32;
+const CHECK_CALLS: usize = 35;
 
 /// Calls whose checks pass keep the GPU's results; calls where one fails
 /// fall back to the CPU, which panics with the same message and leaves the
@@ -287,14 +294,15 @@ const CHECK_CALLS: usize = 32;
 /// by a divisor and by zero, and GCDs) and `strength_reduce` (by a
 /// divisor, a power of two and zero), and a closure indexing a captured
 /// table, which may be empty, and an array indexed by a parameter, in
-/// bounds and out, and an `unwrap` that fails for a zero divisor.
+/// bounds and out, an `unwrap` that fails for a zero divisor, and a 128-bit
+/// division by a parameter, which may be zero.
 #[test]
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "needs an NVIDIA GPU; enable the gpu-tests feature"
 )]
 fn failed_checks_on_the_gpu_behave_like_the_cpu() {
-    for (name, release, failed) in [("checks-debug", false, 15), ("checks-release", true, 12)] {
+    for (name, release, failed) in [("checks-debug", false, 16), ("checks-release", true, 13)] {
         let trace = run(&checks(name, release), true, &[]);
         let calls = trace.lines().filter(|line| line.starts_with("cuprite: ")).count();
         assert_eq!(calls, CHECK_CALLS, "{name}:\n{trace}");
@@ -365,7 +373,8 @@ fn rewritten_candidates_match_the_cpu_on_the_gpu() {
     // arrays and bit reinterpretation, and `half`'s `bf16_round_trip`. Then 9
     // maps with enums. Then 9 with SIMD: `simd_roots`, 5 with SSE, 2 with
     // runtime feature detection, and `half`'s `half_encode`; and
-    // `pointer_views`, reading through pointer casts.
+    // `pointer_views`, reading through pointer casts. Then 4 with 128-bit
+    // integers.
     let with_work = LENGTHS - 3;
     let gpu_calls = 9 * non_empty + 3 * 2 * non_empty + non_empty + (7 + 5 + 8 + 3) * non_empty
         + 2 * 2 * non_empty
@@ -376,7 +385,8 @@ fn rewritten_candidates_match_the_cpu_on_the_gpu() {
         + with_work
         + (11 + 1) * non_empty
         + 9 * non_empty
-        + (9 + 1) * non_empty;
+        + (9 + 1) * non_empty
+        + 4 * non_empty;
     assert_eq!(trace.matches("-> gpu").count(), gpu_calls, "{trace}");
     for (passes, functions) in REGIONS {
         let calls = trace.matches(&format!("passes={passes} -> gpu")).count();

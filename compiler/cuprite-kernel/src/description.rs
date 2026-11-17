@@ -75,18 +75,20 @@ impl Description {
         let function = field("function")?.to_owned();
         let entry = field("entry")?.to_owned();
         let element = field("element")?;
-        let element = Ty::from_name(element).ok_or_else(|| format!("unknown element type `{element}`"))?;
+        let element = Ty::from_name(element)
+            .filter(|ty| (ty.is_int() || ty.is_float()) && ty.bits() <= 64)
+            .ok_or_else(|| format!("unknown element type `{element}`"))?;
         let inputs = field("inputs")?
             .split_whitespace()
             .map(|name| match Ty::from_name(name) {
-                Some(ty) if ty.is_int() || ty.is_float() => Ok(ty),
+                Some(ty) if (ty.is_int() || ty.is_float()) && ty.bits() <= 64 => Ok(ty),
                 _ => Err(format!("`{name}` is not an input element type")),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let tables = field("tables")?
             .split_whitespace()
             .map(|name| match Ty::from_name(name) {
-                Some(ty) if ty.is_int() || ty.is_float() => Ok(ty),
+                Some(ty) if (ty.is_int() || ty.is_float()) && ty.bits() <= 64 => Ok(ty),
                 _ => Err(format!("`{name}` is not a table element type")),
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -147,6 +149,8 @@ mod tests {
             ("cuprite kernel 3", "cuprite kernel 2"),
             ("element f32", "element f16"),
             ("inputs u8", "inputs bool"),
+            ("element f32", "element u128"),
+            ("inputs u8", "inputs i128"),
             ("tables u32", "tables ptr"),
             ("inputs u8 f64\n", "\n"),
             ("repeated yes", "repeated maybe"),

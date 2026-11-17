@@ -653,6 +653,36 @@ fn general_cases(state: &mut u64) -> usize {
     });
     // Refused: a write through a pointer to data of another type.
     checked += general("pointer_write", state, probes::pointer_write, |v: u64| (v >> 16) & 0xFFFF);
+    // 128-bit integers, computed on the GPU as pairs of halves; the
+    // references use the CPU's own 128-bit arithmetic, except the product,
+    // done by hand in 32-bit pieces.
+    checked += general("wide_mul_hash", state, probes::wide_mul_hash, |v: u64| {
+        let k = 0x9E37_79B9_7F4A_7C15u64;
+        let (a, b) = ([v & 0xFFFF_FFFF, v >> 32], [k & 0xFFFF_FFFF, k >> 32]);
+        let (ll, lh, hl, hh) = (a[0] * b[0], a[0] * b[1], a[1] * b[0], a[1] * b[1]);
+        let middle = (ll >> 32) + (lh & 0xFFFF_FFFF) + (hl & 0xFFFF_FFFF);
+        let low = (ll & 0xFFFF_FFFF) | middle << 32;
+        let high = hh + (lh >> 32) + (hl >> 32) + (middle >> 32);
+        high ^ low
+    });
+    checked += general("wide_signed", state, probes::wide_signed, |v: i64| {
+        let wide = i128::from(v) * -3 + i128::MAX / 7;
+        let mixed = (wide >> 70) ^ (wide << 5) ^ (wide / -1_000_003);
+        mixed as i64 ^ (mixed >> 64) as i64
+    });
+    checked += general("wide_float", state, probes::wide_float, |v: u64| {
+        let wide = u128::from(v) << 40 | u128::from(v >> 7);
+        let float = wide as f64 * 0.75;
+        let back = float as u128;
+        let signed = -(float * 1e10) as i128;
+        back as u64 ^ (back >> 64) as u64 ^ signed as u64 ^ ((signed >> 100) as u64).rotate_left(3)
+    });
+    checked += general("wide_bits", state, probes::wide_bits, |v: u64| {
+        let wide = u128::from(v) << 17 ^ u128::from(v).rotate_right(29);
+        let counts = wide.leading_zeros() + wide.trailing_zeros() * 7 + wide.count_ones() * 131;
+        let swapped = wide.swap_bytes() ^ (wide >> 3).swap_bytes().rotate_left(1);
+        u64::from(counts) ^ swapped as u64 ^ (swapped >> 64) as u64
+    });
     // Runtime CPU feature detection: the GPU follows the host's answer.
     let ssse3 = is_x86_feature_detected!("ssse3");
     let f16c = is_x86_feature_detected!("f16c");

@@ -130,13 +130,16 @@ pub(crate) fn kernel_ty(ty: Ty<'_>) -> Option<KTy> {
     })
 }
 
-/// The kernel type a number is held in inside a kernel: as `kernel_ty`, and
+/// The kernel type a number is held in inside a kernel: as `kernel_ty`,
+/// 128-bit integers (as pairs of halves, by `cuprite_kernel::wide`), and
 /// a `char` as its `u32` code, a pattern type (`NonZero`'s field) as the
 /// type it restricts. Only valid values ever reach these, so the kernel
 /// computes on them as the CPU does. Parameters and slices take only
 /// `kernel_ty`'s types.
 pub(crate) fn held_ty(ty: Ty<'_>) -> Option<KTy> {
     match ty.kind() {
+        ty::Int(IntTy::I128) => Some(KTy::I128),
+        ty::Uint(UintTy::U128) => Some(KTy::U128),
         ty::Char => Some(KTy::U32),
         ty::Pat(inner, _) => held_ty(*inner),
         _ => kernel_ty(ty),
@@ -154,7 +157,7 @@ pub(crate) fn constant<'tcx>(tcx: TyCtxt<'tcx>, constant: &ConstOperand<'tcx>) -
             _ => return None,
         },
     };
-    let bits = u64::try_from(scalar.to_bits(scalar.size())).ok()?;
+    let bits = scalar.to_bits(scalar.size());
     Some(Const { ty, bits })
 }
 
@@ -329,7 +332,6 @@ pub(crate) fn method(tcx: TyCtxt<'_>, def_id: DefId) -> Option<Method> {
     let name = tcx.item_name(def_id);
     let name = name.as_str();
     match self_ty.kind() {
-        ty::Int(IntTy::I128) | ty::Uint(UintTy::U128) => None,
         ty::Int(_) | ty::Uint(_) => Some(match name {
             "wrapping_add" => Method::Binary(KBinOp::Add),
             "wrapping_sub" => Method::Binary(KBinOp::Sub),
@@ -1179,7 +1181,7 @@ impl<'tcx> Translator<'tcx> {
                 for (case, target) in targets.iter() {
                     let target = self.target(frame, block, target)?;
                     let next = self.b.block();
-                    let case = Const { ty, bits: case as u64 };
+                    let case = Const { ty, bits: case };
                     let matches = if ty == KTy::Bool && case.bits == 0 {
                         self.b.unary(KUnOp::Not, value)
                     } else if ty == KTy::Bool {
@@ -2343,7 +2345,7 @@ impl<'tcx> Translator<'tcx> {
                 let divisor = self.b.select(unsafe_divisor, Const::int(ty, 1), b);
                 let quotient = self.b.binary(KBinOp::Div, result, divisor);
                 let general = self.b.binary(KBinOp::Ne, quotient, a);
-                let min = Const::int(ty, i128::from(i64::MIN));
+                let min = int_min(ty);
                 let a_min = self.b.binary(KBinOp::Eq, a, min);
                 let special = if signed { self.b.select(b_minus_one, a_min, Const::bool(false)) } else { self.b.copy(Const::bool(false)) };
                 let checked = self.b.select(unsafe_divisor, special, general);
@@ -2475,9 +2477,9 @@ impl<'tcx> Translator<'tcx> {
             Slot::Scalar(local) => {
                 let kernel = held_ty(ty).ok_or("uses a constant of an unexpected type")?;
                 let size = kernel.bytes() as usize;
-                let mut buffer = [0u8; 8];
+                let mut buffer = [0u8; 16];
                 buffer[..size].copy_from_slice(bytes.get(base..base + size).ok_or("reads past a constant")?);
-                let bits = u64::from_le_bytes(buffer);
+                let bits = u128::from_le_bytes(buffer);
                 self.b.set(*local, KRvalue::Use(Const { ty: kernel, bits }.into()));
                 Ok(())
             }
@@ -2594,6 +2596,15 @@ impl<'tcx> Translator<'tcx> {
                         let &(_, number) = numbers.iter().find(|&&(at, number)| at == offset + base && self.b.ty(number).bytes() == kernel.bytes()).expect("found above");
                         self.same_width(number.into(), kernel)
                     }
+                    // 128 bits: two halves of 64.
+                    _ if width == 16 => {
+                        let low = self.gather(src, src_ty, 0, base, 8)?;
+                        let high = self.gather(src, src_ty, 0, base + 8, 8)?;
+                        let (low, high) = (self.b.cast(low, KTy::U128), self.b.cast(high, KTy::U128));
+                        let high = self.b.binary(KBinOp::Shl, high, Const::int(KTy::U32, 64));
+                        let bits = self.b.binary(KBinOp::Or, low, high);
+                        self.same_width(bits.into(), kernel)
+                    }
                     _ => {
                         let bits = self.gather(src, src_ty, 0, base, width)?;
                         let narrow = self.b.cast(bits, unsigned_of(width));
@@ -2675,14 +2686,7 @@ impl<'tcx> Translator<'tcx> {
     fn gather(&mut self, src: &Slot, ty: Ty<'tcx>, base: u64, offset: u64, width: u64) -> Result<KOperand> {
         let zero = KOperand::from(Const::int(KTy::U64, 0));
         Ok(match src {
-            Slot::Scalar(number) => {
-                let size = u64::from(self.b.ty(*number).bytes());
-                if base >= offset + width || offset >= base + size {
-                    return Ok(zero);
-                }
-                let wide = self.unsigned_bits(*number);
-                self.place_bits(wide.into(), base, offset).into()
-            }
+            Slot::Scalar(number) => self.number_bits(*number, i128::from(base), offset, width).unwrap_or(zero),
             Slot::Fields(fields) => {
                 let layout = self.layout(ty)?;
                 let types = self.fields(ty)?;
@@ -2702,18 +2706,10 @@ impl<'tcx> Translator<'tcx> {
             Slot::Bytes { numbers, offset: start } => {
                 let mut bits = zero;
                 for &(at, number) in numbers {
-                    let size = i128::from(self.b.ty(number).bytes());
                     let position = i128::from(base) + i128::from(at) - i128::from(*start);
-                    if position >= i128::from(offset + width) || i128::from(offset) >= position + size {
-                        continue;
+                    if let Some(placed) = self.number_bits(number, position, offset, width) {
+                        bits = self.or(bits, placed);
                     }
-                    let wide = self.unsigned_bits(number);
-                    let placed = if position >= i128::from(offset) {
-                        self.b.binary(KBinOp::Shl, wide, Const::int(KTy::U32, 8 * (position - i128::from(offset))))
-                    } else {
-                        self.b.binary(KBinOp::Shr, wide, Const::int(KTy::U32, 8 * (i128::from(offset) - position)))
-                    };
-                    bits = self.or(bits, placed.into());
                 }
                 bits
             }
@@ -2742,7 +2738,7 @@ impl<'tcx> Translator<'tcx> {
                         let size = scalar.size(&self.tcx).bytes();
                         let at = base + layout.fields.offset(tag_field.as_usize()).bytes();
                         let stored = match tag_encoding {
-                            TagEncoding::Direct => Some(self.discriminant(ty, VariantIdx::from_usize(index))?.bits),
+                            TagEncoding::Direct => Some(self.discriminant(ty, VariantIdx::from_usize(index))?.bits as u64),
                             TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
                                 let (first, last) = (niche_variants.start.as_usize(), niche_variants.last.as_usize());
                                 (index != untagged_variant.as_usize() && (first..=last).contains(&index))
@@ -2764,6 +2760,43 @@ impl<'tcx> Translator<'tcx> {
             }
             _ => return Err(format!("reinterprets the bits of `{ty}`, which holds a reference")),
         })
+    }
+
+    /// The bits a number at `position` gives the bytes `offset..offset +
+    /// width` (at most 8), as a `u64`, if it overlaps them. A 128-bit number
+    /// gives its two halves.
+    fn number_bits(&mut self, number: KLocal, position: i128, offset: u64, width: u64) -> Option<KOperand> {
+        let ty = self.b.ty(number);
+        let size = i128::from(ty.bytes());
+        let (offset, end) = (i128::from(offset), i128::from(offset + width));
+        if position >= end || offset >= position + size {
+            return None;
+        }
+        let halves: Vec<(i128, KLocal)> = if size == 16 {
+            let unsigned = self.b.cast(number, KTy::U128);
+            let low = self.b.cast(unsigned, KTy::U64);
+            let shifted = self.b.binary(KBinOp::Shr, unsigned, Const::int(KTy::U32, 64));
+            let high = self.b.cast(shifted, KTy::U64);
+            vec![(position, low), (position + 8, high)]
+        } else {
+            vec![(position, self.unsigned_bits(number))]
+        };
+        let mut bits: Option<KOperand> = None;
+        for (at, half) in halves {
+            if at >= end || offset >= at + 8.min(size) {
+                continue;
+            }
+            let placed = if at >= offset {
+                self.b.binary(KBinOp::Shl, half, Const::int(KTy::U32, 8 * (at - offset)))
+            } else {
+                self.b.binary(KBinOp::Shr, half, Const::int(KTy::U32, 8 * (offset - at)))
+            };
+            bits = Some(match bits {
+                Some(previous) => self.b.binary(KBinOp::Or, previous, placed).into(),
+                None => placed.into(),
+            });
+        }
+        bits
     }
 
     /// `bits`, of a value at `at`, moved to where they fall in a range
@@ -3134,7 +3167,7 @@ impl<'tcx> Translator<'tcx> {
         let checked = if add { BinOp::AddWithOverflow } else { BinOp::SubWithOverflow };
         let (result, overflowed) = self.with_overflow(checked, a, b)?;
         let negative = self.b.binary(KBinOp::Lt, a, Const::int(ty, 0));
-        let limit = self.b.select(negative, Const::int(ty, i128::from(i64::MIN)), Const::int(ty, i128::from(i64::MAX)));
+        let limit = self.b.select(negative, int_min(ty), int_max(ty));
         Ok(self.b.select(overflowed, limit, result))
     }
 
@@ -3201,7 +3234,7 @@ impl<'tcx> Translator<'tcx> {
         let out_ty = out.first().map(|&lane| self.b.ty(lane)).ok_or_else(unexpected)?;
         let immediate = |this: &mut Self, index: usize| -> Result<u64> {
             let operand = args.get(index).map(|arg| &arg.node).ok_or_else(unexpected)?;
-            this.known(operand).map(|c| c.bits).ok_or_else(|| refused("takes an immediate known only at run time"))
+            this.known(operand).map(|c| c.bits as u64).ok_or_else(|| refused("takes an immediate known only at run time"))
         };
         let lanes: Vec<KOperand> = match family {
             // Comparisons: a lane of all ones where the predicate holds.
@@ -3767,7 +3800,8 @@ fn unsigned_of(bytes: u64) -> KTy {
         1 => KTy::U8,
         2 => KTy::U16,
         4 => KTy::U32,
-        _ => KTy::U64,
+        8 => KTy::U64,
+        _ => KTy::U128,
     }
 }
 
@@ -3777,7 +3811,8 @@ fn signed_of(bytes: u64) -> KTy {
         1 => KTy::I8,
         2 => KTy::I16,
         4 => KTy::I32,
-        _ => KTy::I64,
+        8 => KTy::I64,
+        _ => KTy::I128,
     }
 }
 
@@ -3792,4 +3827,14 @@ fn variant_offsets(layout: &rustc_middle::ty::layout::TyAndLayout<'_>, index: us
             Some(variants[VariantIdx::from_usize(index)].field_offsets.iter().map(|offset| offset.bytes()).collect())
         }
     }
+}
+
+/// The smallest value of a signed integer type.
+fn int_min(ty: KTy) -> Const {
+    Const { ty, bits: 1u128 << (ty.bits() - 1) }
+}
+
+/// The largest value of a signed integer type.
+fn int_max(ty: KTy) -> Const {
+    Const { ty, bits: (1u128 << (ty.bits() - 1)) - 1 }
 }

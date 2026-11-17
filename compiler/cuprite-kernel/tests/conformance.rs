@@ -36,7 +36,7 @@ macro_rules! scalars {
     };
 }
 scalars!(i8 => Ty::I8, i16 => Ty::I16, i32 => Ty::I32, i64 => Ty::I64, u8 => Ty::U8, u16 => Ty::U16,
-         u32 => Ty::U32, u64 => Ty::U64, f32 => Ty::F32, f64 => Ty::F64);
+         u32 => Ty::U32, u64 => Ty::U64, i128 => Ty::I128, u128 => Ty::U128, f32 => Ty::F32, f64 => Ty::F64);
 
 impl Scalar for bool {
     const TY: Ty = Ty::Bool;
@@ -154,7 +154,7 @@ fn pairs<T: Copy, U: Copy>(xs: &[T], ys: &[U]) -> Vec<(T, U)> {
 }
 
 /// Shift and rotation amounts: in range, at the width, and beyond it.
-const AMOUNTS: [u32; 13] = [0, 1, 7, 8, 15, 16, 31, 32, 63, 64, 65, 200, u32::MAX];
+const AMOUNTS: [u32; 16] = [0, 1, 7, 8, 15, 16, 31, 32, 63, 64, 65, 96, 127, 128, 200, u32::MAX];
 
 macro_rules! integer_suite {
     ($name:ident, $t:ty) => {
@@ -167,6 +167,9 @@ macro_rules! integer_suite {
                 <$t>::MAX / 3, zero.wrapping_sub(1), zero.wrapping_sub(7), 100u8 as $t,
                 // Only a high bit: the top of the trailing-zero counts.
                 <$t>::MAX ^ (<$t>::MAX >> 1), (<$t>::MAX ^ (<$t>::MAX >> 1)) >> 1,
+                // Across 64 bits, for 128-bit types (truncated for the others).
+                (u64::MAX as $t).wrapping_add(1), u64::MAX as $t, (0x1234_5678_9ABC_DEF0u64 as $t).wrapping_mul(3),
+                (0x8000_0000_0000_0001u64 as $t).wrapping_mul(0x8000_0000_0000_0001u64 as $t),
             ];
             let all = pairs(&values, &values);
             let wrapping: [(BinOp, fn($t, $t) -> $t); 6] = [
@@ -251,6 +254,8 @@ integer_suite!(u8_operations, u8);
 integer_suite!(u16_operations, u16);
 integer_suite!(u32_operations, u32);
 integer_suite!(u64_operations, u64);
+integer_suite!(i128_operations, i128);
+integer_suite!(u128_operations, u128);
 
 macro_rules! float_suite {
     ($name:ident, $t:ident) => {
@@ -335,7 +340,7 @@ fn casts_match_rust_as() {
                     unary(&name, &values, |b, x| b.cast(x, <$to as Scalar>::TY), |x: $from| x as $to, freedom);
                 }};
             }
-            to!(i8); to!(i16); to!(i32); to!(i64); to!(u8); to!(u16); to!(u32); to!(u64); to!(f32); to!(f64);
+            to!(i8); to!(i16); to!(i32); to!(i64); to!(u8); to!(u16); to!(u32); to!(u64); to!(i128); to!(u128); to!(f32); to!(f64);
         }};
     }
     from!(i8, [0, 1, -1, 127, -128, 100, -100]);
@@ -349,10 +354,21 @@ fn casts_match_rust_as() {
     let f32s = [0.0f32, -0.0, 0.5, -0.5, 1.5, -1.5, 255.9, 256.0, -129.0, 3e9, -3e9, 1e20, -1e20,
         16_777_217.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN, f32::MIN_POSITIVE];
     from!(f32, [f32s[0], f32s[1], f32s[2], f32s[3], f32s[4], f32s[5], f32s[6], f32s[7], f32s[8],
-        f32s[9], f32s[10], f32s[11], f32s[12], f32s[13], f32s[14], f32s[15], f32s[16], f32s[17]]);
+        f32s[9], f32s[10], f32s[11], f32s[12], f32s[13], f32s[14], f32s[15], f32s[16], f32s[17],
+        1e30, -1e30, 3.4e38, -3.4e38, 18_446_744_073_709_551_616.0, 1.7014118e38, -1.7014118e38]);
     from!(f64, [0.0f64, -0.0, 0.5, -1.5, 255.9, 65535.5, -32768.9, 4_294_967_295.9, 1e19, -1e19,
         1e300, 9_007_199_254_740_993.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, 3.4028235677973366e38,
-        1e-310, 0.1]);
+        1e-310, 0.1, 1.7014118346046923e38, -1.7014118346046923e38, 3.402823669209385e38, 1e38, -1e38,
+        18_446_744_073_709_551_616.0, 2.5e19, -2.5e19]);
+    // 128-bit values rounding to floats: ties to even, just above ties, and
+    // overflow to infinity in `f32`.
+    from!(u128, [0u128, 1u128, u64::MAX as u128, 1u128 << 64, (1u128 << 64) + 1, u128::MAX, 1u128 << 127,
+        (1u128 << 53) + 1, (1u128 << 100) + (1u128 << 47), (1u128 << 100) + (1u128 << 47) + 1,
+        (1u128 << 100) + (1u128 << 76), (1u128 << 100) + (3u128 << 76), u128::MAX - (1u128 << 103),
+        0x1234_5678_9ABC_DEF0_1122_3344_5566_7788u128]);
+    from!(i128, [0i128, -1i128, 1i128, i128::MIN, i128::MAX, -(1i128 << 64), (1i128 << 64) - 1,
+        -(1i128 << 100) - (1i128 << 47), 12345i128, -(1i128 << 53) - 1, i128::MIN + 1,
+        -0x1234_5678_9ABC_DEF0_1122_3344_5566_7788i128]);
 }
 
 /// Floats to integers of their width and back, keeping every bit: NaN
@@ -464,4 +480,22 @@ fn loops_and_branches_match() {
         })
         .collect();
     check(&kernel, &all_bytes(&starts), &all_bytes(&caps), starts.len(), &all_bytes(&expected), Freedom::None);
+}
+
+/// The high half of a double-width product.
+#[test]
+fn high_products_match() {
+    let u32s = [0u32, 1, 2, 0xFFFF, 0x1_0000, u32::MAX, u32::MAX - 1, 0x8000_0000, 0x1234_5678];
+    let pairs32 = pairs(&u32s, &u32s);
+    binary_call("u32_mul_high", &pairs32, Intrinsic::MulHigh, |x: u32, y: u32| ((u64::from(x) * u64::from(y)) >> 32) as u32);
+    let u64s = [0u64, 1, 2, u64::from(u32::MAX), 1 << 32, u64::MAX, u64::MAX - 1, 1 << 63, 0x1234_5678_9ABC_DEF0];
+    let pairs64 = pairs(&u64s, &u64s);
+    binary_call("u64_mul_high", &pairs64, Intrinsic::MulHigh, |x: u64, y: u64| ((u128::from(x) * u128::from(y)) >> 64) as u64);
+}
+
+fn binary_call<T: Scalar, O: Scalar>(name: &str, pairs: &[(T, T)], intrinsic: Intrinsic, f: impl Fn(T, T) -> O) {
+    let kernel = elementwise(name, T::TY, T::TY, |b, x, y| b.call(intrinsic, &[x.into(), y.into()]));
+    let (a, b): (Vec<T>, Vec<T>) = pairs.iter().copied().unzip();
+    let expected: Vec<O> = pairs.iter().map(|&(x, y)| f(x, y)).collect();
+    check(&kernel, &all_bytes(&a), &all_bytes(&b), pairs.len(), &all_bytes(&expected), Freedom::None);
 }

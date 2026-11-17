@@ -44,7 +44,7 @@ macro_rules! exact {
         })*
     };
 }
-exact!(u8, u32, i32, i64);
+exact!(u8, u32, u64, i32, i64);
 
 impl Same for f32 {
     fn same(&self, other: &Self) -> bool {
@@ -254,6 +254,18 @@ fn main() {
         count(check(name, &spread, |v| probes::enum_unwrap(v, divisor), |v| {
             for value in v {
                 *value = value.checked_div(divisor).unwrap();
+            }
+        }));
+    }
+
+    // 128-bit division by a parameter: in range, by the largest divisor,
+    // and by zero.
+    let longs: Vec<u64> = ints.iter().map(|&i| (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+    for (name, divisor) in [("wide_divide", 12_345u64), ("wide_divide, largest", u64::MAX), ("wide_divide, by zero", 0)] {
+        count(check(name, &longs, |v| probes::wide_divide(v, divisor), |v| {
+            for value in v {
+                let wide = u128::from(*value) << 64 | 0x1234_5678;
+                *value = ((wide / u128::from(divisor)) >> 32) as u64 ^ (wide % u128::from(divisor)) as u64;
             }
         }));
     }
