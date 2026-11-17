@@ -315,6 +315,7 @@ impl Emitter<'_> {
             Intrinsic::Floor => call("floor", &values),
             Intrinsic::Ceil => call("ceil", &values),
             Intrinsic::Trunc => call("trunc", &values),
+            Intrinsic::RoundTiesEven => call("roundeven", &values),
             Intrinsic::Abs => self.sign_bit(operand_ty, "and", &values[0]),
             Intrinsic::Min => call("minnum", &values),
             Intrinsic::Max => call("maxnum", &values),

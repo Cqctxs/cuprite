@@ -415,6 +415,7 @@ impl<'k> Emitter<'k> {
             Intrinsic::Floor => self.line(format!("cvt.rmi.{f}.{f} {d}, {x}")),
             Intrinsic::Ceil => self.line(format!("cvt.rpi.{f}.{f} {d}, {x}")),
             Intrinsic::Trunc => self.line(format!("cvt.rzi.{f}.{f} {d}, {x}")),
+            Intrinsic::RoundTiesEven => self.line(format!("cvt.rni.{f}.{f} {d}, {x}")),
             Intrinsic::Abs => {
                 let (class, bits, mask) = if ty == Ty::F32 {
                     (Class::B32, "b32", "0x7FFFFFFF")

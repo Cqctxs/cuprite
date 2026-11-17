@@ -237,8 +237,12 @@ fn describe_map(tcx: TyCtxt<'_>, def_id: LocalDefId, map: &Map) -> String {
     if !map.tables.is_empty() {
         text += &format!(" indexing {}", names(map.tables.iter().map(|&(local, _)| local).collect()));
     }
-    if !map.scalars.is_empty() {
-        text += &format!(" reading {}", names(map.scalars.iter().map(|leaf| leaf.param).collect()));
+    let read: Vec<Local> = map.scalars.iter().filter(|leaf| leaf.feature.is_none()).map(|leaf| leaf.param).collect();
+    if !read.is_empty() {
+        text += &format!(" reading {}", names(read));
+    }
+    if map.scalars.iter().any(|leaf| leaf.feature.is_some()) {
+        text += " with the host's CPU features";
     }
     text
 }
@@ -369,7 +373,7 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         let iteration = translate::Iteration::For { option: header.option, start: header.some, is_header: &is_header };
         let translated = self.translate_map(element, &params, &traced, iteration)?;
         self.check_rest(&calls, &translated.blocks, &traced.chain, &header)?;
-        self.finish_map(element, params, traced, translated)
+        self.finish_map(element, traced, translated)
     }
 
     /// `iterator.for_each(function)`: the iteration calls `function` with
@@ -409,7 +413,7 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
             }
         }
         self.check_exit(*after)?;
-        self.finish_map(element, params, traced, translated)
+        self.finish_map(element, traced, translated)
     }
 
     fn not_slice() -> String {
@@ -442,21 +446,37 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         traced: &Traced,
         iteration: translate::Iteration<'_, 'tcx>,
     ) -> Result<translate::Translated> {
-        let shape = translate::Loop {
-            iteration,
-            lane: &traced.lane,
-            inputs: &traced.inputs,
-            tables: &traced.tables,
-            leaves: &params.leaves,
-            opaque: &traced.opaque,
-            chain: &traced.chain,
-            plumbing: &traced.plumbing,
-        };
         let name = format!("{}::{}", self.tcx.crate_name(LOCAL_CRATE), self.tcx.def_path_str(self.def_id));
-        translate::translate(self.tcx, self.body, &name, element, &shape)
+        // The host's answers to CPU feature tests are leaves too: found by
+        // translating, then passed by translating again with them.
+        let mut leaves = params.leaves.clone();
+        for _ in 0..2 {
+            let shape = translate::Loop {
+                iteration,
+                lane: &traced.lane,
+                inputs: &traced.inputs,
+                tables: &traced.tables,
+                leaves: &leaves,
+                opaque: &traced.opaque,
+                chain: &traced.chain,
+                plumbing: &traced.plumbing,
+            };
+            let translated = translate::translate(self.tcx, self.body, &name, element, &shape)?;
+            let missing: Vec<translate::Feature> = translated
+                .features
+                .iter()
+                .copied()
+                .filter(|&feature| !leaves.iter().any(|leaf| leaf.feature == Some(feature)))
+                .collect();
+            if missing.is_empty() {
+                return Ok(translated);
+            }
+            leaves.extend(missing.into_iter().map(Leaf::feature));
+        }
+        Err("tests different CPU features each time it is translated".into())
     }
 
-    fn finish_map(&self, element: KTy, params: Params, traced: Traced, translated: translate::Translated) -> Result<Map> {
+    fn finish_map(&self, element: KTy, traced: Traced, translated: translate::Translated) -> Result<Map> {
         if !translated.stores {
             return Err("does not change the slice".into());
         }
@@ -465,7 +485,7 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
             function: translated.function,
             inputs: traced.inputs,
             tables: traced.tables,
-            scalars: params.leaves,
+            scalars: translated.leaves,
         })
     }
 

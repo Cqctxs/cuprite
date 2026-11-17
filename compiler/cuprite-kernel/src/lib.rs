@@ -225,6 +225,8 @@ pub enum Intrinsic {
     Ceil,
     /// Toward zero.
     Trunc,
+    /// To the nearest integer, ties to even, like `f32::round_ties_even`.
+    RoundTiesEven,
     /// Clears the sign bit, like `f32::abs`.
     Abs,
     /// `f32::min`: the other operand when one is NaN.

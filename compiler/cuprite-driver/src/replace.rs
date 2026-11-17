@@ -49,7 +49,7 @@ use rustc_span::{
 
 use crate::{
     analyze::{self, Verdict},
-    translate::{self, Leaf},
+    translate::{self, Feature, Leaf},
 };
 
 pub(crate) const VAR: &str = "CUPRITE_REPLACE";
@@ -333,6 +333,8 @@ struct Prologue<'a, 'tcx> {
     body: &'a mut Body<'tcx>,
     statements: Vec<Statement<'tcx>>,
     source_info: SourceInfo,
+    /// The locals holding the host's answers to feature tests.
+    features: &'a [(Feature, Local)],
 }
 
 impl<'tcx> Prologue<'_, 'tcx> {
@@ -356,6 +358,11 @@ impl<'tcx> Prologue<'_, 'tcx> {
     /// fields.
     fn leaf_bits(&mut self, leaf: &Leaf) -> Operand<'tcx> {
         let tcx = self.tcx;
+        if let Some(feature) = leaf.feature {
+            let &(_, answer) = self.features.iter().find(|(known, _)| *known == feature).expect("every feature has a local");
+            let bits = self.assign(tcx.types.u64, Rvalue::Cast(CastKind::IntToInt, Operand::Copy(Place::from(answer)), tcx.types.u64));
+            return Operand::Copy(Place::from(bits));
+        }
         let mut ty = self.body.local_decls[leaf.param].ty;
         let mut projection = Vec::new();
         if leaf.deref {
@@ -450,12 +457,21 @@ fn rewrite<'tcx>(
     let token = body.local_decls.push(LocalDecl::new(tcx.types.u64, span));
     let unit = body.local_decls.push(LocalDecl::new(tcx.types.unit, span));
 
+    // The host's answers to the kernel's CPU feature tests, from the same
+    // test the CPU code calls, made before the dispatch.
+    let features: Vec<(Feature, Local)> = job
+        .scalars
+        .iter()
+        .filter_map(|leaf| leaf.feature)
+        .map(|feature| (feature, body.local_decls.push(LocalDecl::new(tcx.types.bool, span))))
+        .collect();
     // The scalar arguments, as `&[u64]`.
     let mut prologue = Prologue {
         tcx,
         body: &mut body,
         statements: Vec::new(),
         source_info,
+        features: &features,
     };
     let mut bits = Vec::new();
     match job.passes {
@@ -549,7 +565,23 @@ fn rewrite<'tcx>(
     let entry_fn = Operand::function_handle(tcx, entry, &[element_ty.into()], span);
     let mut start = BasicBlockData::new(terminator(call(entry_fn, Box::new(args), token, check)), false);
     start.statements = statements;
-    blocks[START_BLOCK] = start;
+    if features.is_empty() {
+        blocks[START_BLOCK] = start;
+        return body;
+    }
+    // `answer = test(bit)` for each feature, in order, then the dispatch.
+    let mut next = blocks.push(start);
+    for (index, &(feature, answer)) in features.iter().enumerate().rev() {
+        let bit = Operand::const_from_scalar(tcx, tcx.types.u32, Scalar::from_u32(feature.bit), span);
+        let test = Operand::function_handle(tcx, feature.test, &[], span);
+        let data = BasicBlockData::new(terminator(call(test, Box::new([Spanned { node: bit, span }]), answer, next)), false);
+        next = if index == 0 {
+            blocks[START_BLOCK] = data;
+            START_BLOCK
+        } else {
+            blocks.push(data)
+        };
+    }
     body
 }
 

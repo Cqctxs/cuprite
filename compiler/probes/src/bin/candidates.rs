@@ -141,7 +141,7 @@ macro_rules! integer_elements {
         })*
     };
 }
-integer_elements!(u8, i16, i32, u32, i64, u64);
+integer_elements!(u8, u16, i16, i32, u32, i64, u64);
 
 impl Element for f32 {
     fn random(state: &mut u64) -> Self {
@@ -205,6 +205,99 @@ fn general_indexed<T: Element>(
         }
     }
     LENGTHS.len()
+}
+
+/// x86's float to `i32` conversion: rounded or truncated, and `i32::MIN`
+/// for NaN and out of range.
+fn x86_to_i32(x: f32, round: bool) -> i32 {
+    let r = if round { x.round_ties_even() } else { x.trunc() };
+    if (-2_147_483_648.0..2_147_483_648.0).contains(&r) { r as i32 } else { i32::MIN }
+}
+
+/// `sse_integers`, on 128-bit values held as `u128`, lane by lane.
+fn sse_integers_reference(v: u32) -> u32 {
+    let lanes16 = |x: u128| -> [i16; 8] { std::array::from_fn(|i| (x >> (16 * i)) as u16 as i16) };
+    let from16 = |l: [i16; 8]| -> u128 { l.iter().enumerate().map(|(i, &x)| u128::from(x as u16) << (16 * i)).sum() };
+    let lanes32 = |x: u128| -> [i32; 4] { std::array::from_fn(|i| (x >> (32 * i)) as u32 as i32) };
+    let from32 = |l: [i32; 4]| -> u128 { l.iter().enumerate().map(|(i, &x)| u128::from(x as u32) << (32 * i)).sum() };
+    let from8 = |l: [u8; 16]| -> u128 { l.iter().enumerate().map(|(i, &x)| u128::from(x) << (8 * i)).sum() };
+    let x = lanes16(from32([v as i32; 4]));
+    let y: [i16; 8] = [-12345, 12345, -300, 300, 7, -1, 32767, -32768];
+    let high: [i16; 8] = std::array::from_fn(|i| ((i32::from(x[i]) * i32::from(y[i])) >> 16) as i16);
+    let high_unsigned: [i16; 8] =
+        std::array::from_fn(|i| ((u32::from(x[i] as u16) * u32::from(y[i] as u16)) >> 16) as u16 as i16);
+    let summed: [i32; 4] = std::array::from_fn(|j| {
+        (i32::from(x[2 * j]) * i32::from(y[2 * j])).wrapping_add(i32::from(x[2 * j + 1]) * i32::from(y[2 * j + 1]))
+    });
+    let summed16 = lanes16(from32(summed));
+    let signed_byte = |h: i16| h.clamp(-128, 127) as i8 as u8;
+    let unsigned_byte = |h: i16| h.clamp(0, 255) as u8;
+    let packed: [u8; 16] =
+        std::array::from_fn(|k| if k < 8 { signed_byte(summed16[k]) } else { signed_byte(high[k - 8]) });
+    let packed_unsigned: [u8; 16] =
+        std::array::from_fn(|k| if k < 8 { unsigned_byte(high_unsigned[k]) } else { unsigned_byte(summed16[k - 8]) });
+    let group = |g: usize| -> u128 {
+        (8 * g..8 * g + 8).map(|k| u128::from(packed[k].abs_diff(packed_unsigned[k]))).sum()
+    };
+    let sad = group(0) | group(1) << 64;
+    let count = (v % 20).min(15);
+    let shifted = from16(high.map(|h| h >> count));
+    let (p, q) = (lanes32(from8(packed)), lanes32(from8(packed_unsigned)));
+    let added = from32(std::array::from_fn(|j| p[j].wrapping_add(q[j])));
+    let all = sad ^ shifted ^ added;
+    let folded = all ^ (all >> 64);
+    let folded = folded ^ (folded >> 32);
+    folded as u32
+}
+
+/// `sse_mix`, on 128-bit values held as `u128`, instruction by instruction.
+fn sse_mix_reference(v: u32) -> u32 {
+    let bytes = |x: u128| -> [u8; 16] { x.to_le_bytes() };
+    let from_bytes = u128::from_le_bytes;
+    let lanes16 = |x: u128| -> [i16; 8] { std::array::from_fn(|i| (x >> (16 * i)) as u16 as i16) };
+    let from16 = |l: [i16; 8]| -> u128 { l.iter().enumerate().map(|(i, &x)| u128::from(x as u16) << (16 * i)).sum() };
+    let lanes32 = |x: u128| -> [u32; 4] { std::array::from_fn(|i| (x >> (32 * i)) as u32) };
+    let from32 = |l: [u32; 4]| -> u128 { l.iter().enumerate().map(|(i, &x)| u128::from(x) << (32 * i)).sum() };
+    let lanes64 = |x: u128| -> [u64; 2] { [x as u64, (x >> 64) as u64] };
+    let from64 = |l: [u64; 2]| -> u128 { u128::from(l[0]) | u128::from(l[1]) << 64 };
+    let mask32 = |holds: bool| if holds { u32::MAX } else { 0 };
+    let to_i32 = |x: f64, round: bool| {
+        let r = if round { x.round_ties_even() } else { x.trunc() };
+        if (-2_147_483_648.0..2_147_483_648.0).contains(&r) { r as i32 } else { i32::MIN }
+    };
+    let x = from32([v; 4]);
+    let y = from32([i32::MIN as u32, 0x0102_0304, u32::MAX, 0x7F80_FF01]);
+    let (xb, yb) = (bytes(x), bytes(y));
+    let saturated: [u8; 16] = std::array::from_fn(|i| xb[i].saturating_add(yb[i]));
+    let (x16, y16) = (lanes16(x), lanes16(y));
+    let signed = from16(std::array::from_fn(|i| x16[i].saturating_sub(y16[i])));
+    let average: [u8; 16] = std::array::from_fn(|i| ((u16::from(xb[i]) + u16::from(yb[i]) + 1) >> 1) as u8);
+    let unpacked = from_bytes(std::array::from_fn(|i| if i % 2 == 0 { saturated[i / 2] } else { average[i / 2] }));
+    let mask = (0..16).filter(|&i| xb[i] & yb[i] == yb[i]).fold(0u32, |m, i| m | 1 << i);
+    let mixed = lanes32(unpacked ^ signed);
+    let shuffled = [mixed[3], mixed[2], mixed[1], mixed[0]];
+    let count = v % 40;
+    let shifted = from32(shuffled.map(|l| if count > 31 { 0 } else { l << count }));
+    let count = v % 70;
+    let right = from64(lanes64(shifted).map(|l| if count > 63 { 0 } else { l >> count }));
+    let floats: [f32; 4] = lanes32(right).map(|l| l as i32 as f32);
+    let doubles = [f64::from(v) * -0.75, f64::from(f32::from_bits(v))];
+    let narrowed = [to_i32(doubles[0], true) as u32, to_i32(doubles[1], true) as u32, 0, 0];
+    let c = f32::from_bits(v);
+    let compared = from32(floats.map(|f| mask32(f != c)));
+    let ordered = from64(doubles.map(|d| if d.is_nan() { 0 } else { u64::MAX }));
+    let scalar = [mask32(0.0 <= floats[0]), floats[1].to_bits(), floats[2].to_bits(), floats[3].to_bits()];
+    let added = from32(std::array::from_fn(|i| narrowed[i].wrapping_add(scalar[i])));
+    let all = compared ^ ordered ^ added;
+    let folded = all ^ (all >> 64);
+    let folded = folded ^ (folded >> 32);
+    let truncated = doubles[0].trunc();
+    let truncated = if (-9.223_372_036_854_776e18..9.223_372_036_854_776e18).contains(&truncated) {
+        truncated as i64
+    } else {
+        i64::MIN
+    };
+    folded as u32 ^ mask ^ (truncated as u32).rotate_left(13)
 }
 
 /// The general maps, each against an independent reference written with
@@ -529,6 +622,55 @@ fn general_cases(state: &mut u64) -> usize {
         };
         applied.rotate_left([1, 4, 2][((x >> 2) % 3) as usize])
     });
+    // SIMD.
+    checked += general("simd_roots", state, probes::simd_roots, f32::sqrt);
+    checked += general("sse_dot", state, probes::sse_dot, |x: f32| {
+        let s = |k: f32| x * k + 0.5;
+        (s(1.0) + s(3.0)) + (s(2.0) + s(4.0))
+    });
+    checked += general("sse_min_mask", state, probes::sse_min_mask, |v: u32| {
+        let x = f32::from_bits(v);
+        let limits = [-1.0f32, 1.0, -0.0, f32::NAN];
+        let low = |i: usize| if x < limits[i] { x } else { limits[i] };
+        let mut bits = 0u32;
+        for (i, &limit) in limits.iter().enumerate() {
+            bits |= u32::from(x < limit) << i | u32::from(x.is_nan() || limit.is_nan()) << (i + 4);
+        }
+        let picked = if x < limits[0] { low(0).to_bits() } else { 0 };
+        picked ^ bits ^ low(2).to_bits()
+    });
+    checked += general("sse_convert", state, probes::sse_convert, |v: u32| {
+        let x = f32::from_bits(v);
+        let lanes = [x, x * 2.0, -x, x + 0.5];
+        let mixed = lanes.map(|l| x86_to_i32(l, true) ^ x86_to_i32(l, false).wrapping_shl(1));
+        let sum = mixed.iter().fold(0i32, |a, &m| a.wrapping_add(m));
+        sum as u32 ^ (x86_to_i32(x, false) as u32).rotate_left(7)
+    });
+    checked += general("sse_integers", state, probes::sse_integers, sse_integers_reference);
+    checked += general("sse_mix", state, probes::sse_mix, sse_mix_reference);
+    checked += general("pointer_views", state, probes::pointer_views, |v: u64| {
+        v.rotate_left(8) ^ (((v >> 32) & 0xFFFF) ^ 0xFF)
+    });
+    // Refused: a write through a pointer to data of another type.
+    checked += general("pointer_write", state, probes::pointer_write, |v: u64| (v >> 16) & 0xFFFF);
+    // Runtime CPU feature detection: the GPU follows the host's answer.
+    let ssse3 = is_x86_feature_detected!("ssse3");
+    let f16c = is_x86_feature_detected!("f16c");
+    checked += general("detect_shuffle", state, probes::detect_shuffle, |v: u32| {
+        if ssse3 { v.swap_bytes() } else { v.swap_bytes() ^ 1 }
+    });
+    checked += general("detect_f16c", state, probes::detect_f16c, |v: u32| {
+        let bits = u32::from(half::f16::from_f32(f32::from_bits(v)).to_bits());
+        if f16c { bits } else { bits | 0x1_0000 }
+    });
+    // Held out before, now development code: `half`'s encoding, through
+    // F16C where the host has it.
+    checked += general_indexed(
+        "half_encode",
+        state,
+        |v: &mut [u16]| probes::half_encode(v, &xs[..v.len()]),
+        |i, _, _| half::f16::from_f32(xs[i]).to_bits(),
+    );
     checked += general("transmute_halves", state, probes::transmute_halves, |x: u32| x.rotate_left(16));
     checked += general("transmute_struct", state, probes::transmute_struct, |x: u64| {
         let c = u64::from(((x >> 16) as u16).rotate_left(4));

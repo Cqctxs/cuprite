@@ -99,6 +99,18 @@ const COMMON: &[(&str, &str)] = &[
     ("enum_partial_cmp", "candidate: map over `[f32]`"),
     ("enum_table", "candidate: map over `[u32]`"),
     ("enum_unwrap", "candidate: map over `[u32]` reading `divisor`"),
+    // SIMD.
+    ("detect_f16c", "candidate: map over `[u32]` with the host's CPU features"),
+    ("detect_shuffle", "candidate: map over `[u32]` with the host's CPU features"),
+    ("half_bits_f16c", "rejected: takes `f32`, not a `&mut` slice of numbers"),
+    ("reverse_ssse3", "rejected: takes `u32`, not a `&mut` slice of numbers"),
+    ("sse_convert", "candidate: map over `[u32]`"),
+    ("sse_dot", "candidate: map over `[f32]`"),
+    ("sse_integers", "candidate: map over `[u32]`"),
+    ("sse_min_mask", "candidate: map over `[u32]`"),
+    ("sse_mix", "candidate: map over `[u32]`"),
+    ("pointer_views", "candidate: map over `[u64]`"),
+    ("pointer_write", "rejected: calls `std::ptr::write_unaligned::<u64>`, which writes through a pointer to data of another type"),
     ("normalize_range", "candidate: map over `[f32]` reading `low`, `high`"),
     ("normalized_y", "candidate: map over `[f32]`"),
     ("numbered", "rejected: carries a value from one element to the next"),
@@ -127,7 +139,7 @@ const COMMON: &[(&str, &str)] = &[
     ("scale_offset", "candidate: map over `[f32]` reading `scale`, `offset`"),
     ("scaled", "candidate: map over `[f64]`"),
     ("scene_distances", "candidate: map over `[f32]`"),
-    ("simd_roots", "rejected: calls `std::arch::x86_64::_mm_set_ss`, which uses the SIMD vector `std::arch::x86_64::__m128`"),
+    ("simd_roots", "candidate: map over `[f32]`"),
     ("smooth", "rejected: takes `&[u32]`, not a `&mut` slice of numbers"),
     ("soft_root", "candidate: map over `[f64]`"),
     ("square", "candidate: map over `[u32]`"),
@@ -157,13 +169,13 @@ const COMMON: &[(&str, &str)] = &[
 /// where some refusals are found.
 const DEBUG: &[(&str, &str)] = &[
     ("noise_row", "rejected: calls `noise::Perlin::new`, which calls `noise::permutationtable::PermutationTable::new`, which calls `<rand_xorshift::XorShiftRng as rand_core::SeedableRng>::from_seed`, which calls `rand_core::le::read_u32_into`, which calls `core::slice::<impl [u32]>::iter_mut`, which calls `std::slice::IterMut::<'_, u32>::new`, which reinterprets bits as `std::ptr::NonNull<[u32]>` (a transmute)"),
-    ("half_decode", "rejected: calls `<{closure} as std::ops::FnMut<((&mut f32, &u16),)>>::call_mut`, which calls `half::f16::to_f32`, which calls `half::binary16::arch::f16_to_f32`, which calls `std_detect::detect::arch::x86::__is_feature_detected::f16c`, which calls `std_detect::detect::cache::test`, which reads a static that can change (`std_detect::detect::cache::CACHE`)"),
-    ("half_encode", "rejected: calls `half::f16::from_f32`, which calls `half::binary16::arch::f32_to_f16`, which calls `std_detect::detect::arch::x86::__is_feature_detected::f16c`, which calls `std_detect::detect::cache::test`, which reads a static that can change (`std_detect::detect::cache::CACHE`)"),
-    ("half_round_trip", "rejected: calls `half::f16::from_f32`, which calls `half::binary16::arch::f32_to_f16`, which calls `std_detect::detect::arch::x86::__is_feature_detected::f16c`, which calls `std_detect::detect::cache::test`, which reads a static that can change (`std_detect::detect::cache::CACHE`)"),
-    ("half_scale", "rejected: calls `half::f16::to_f32`, which calls `half::binary16::arch::f16_to_f32`, which calls `std_detect::detect::arch::x86::__is_feature_detected::f16c`, which calls `std_detect::detect::cache::test`, which reads a static that can change (`std_detect::detect::cache::CACHE`)"),
-    ("libm_atan2", "rejected: calls `libm::atan2f`, which calls `libm::atanf`, which calls `std::ptr::read_volatile::<f32>`, which converts a pointer to `*const ()`"),
+    ("half_decode", "rejected: calls `<{closure} as std::ops::FnMut<((&mut f32, &u16),)>>::call_mut`, which calls `half::f16::to_f32`, which calls `half::binary16::arch::f16_to_f32`, which calls `half::binary16::arch::x86::f16_to_f32_x86_f16c`, which calls `std::arch::x86_64::_mm_cvtph_ps`, which uses `f16`, a number the kernel doesn't have"),
+    ("half_encode", "candidate: map over `[u16]` zipped with `values` with the host's CPU features"),
+    ("half_round_trip", "rejected: calls `half::f16::to_f32`, which calls `half::binary16::arch::f16_to_f32`, which calls `half::binary16::arch::x86::f16_to_f32_x86_f16c`, which calls `std::arch::x86_64::_mm_cvtph_ps`, which uses `f16`, a number the kernel doesn't have"),
+    ("half_scale", "rejected: calls `half::f16::to_f32`, which calls `half::binary16::arch::f16_to_f32`, which calls `half::binary16::arch::x86::f16_to_f32_x86_f16c`, which calls `std::arch::x86_64::_mm_cvtph_ps`, which uses `f16`, a number the kernel doesn't have"),
+    ("libm_atan2", "rejected: calls `libm::atan2f`, which calls `libm::atanf`, which calls `std::ptr::read_volatile::<f32>`, which calls `std::ptr::read_volatile::precondition_check`, which calls `std::ptr::const_ptr::<impl *const ()>::is_aligned_to`, which reinterprets bits as `usize` (a transmute)"),
     ("libm_cbrt", "rejected: calls `libm::cbrt`, which calls `libm::math::cbrt::cbrt_round`, which calls `<f64 as libm::math::support::float_traits::Float>::fma`, which calls `libm::fma`, which calls `libm::math::arch::x86::fma::fma`, which reads a static that can change (`libm::math::arch::x86::fma::fma::FUNC`)"),
-    ("libm_exp", "rejected: calls `<{closure} as std::ops::FnMut<(&mut f64,)>>::call_mut`, which calls `libm::exp`, which calls `std::ptr::read_volatile::<f32>`, which converts a pointer to `*const ()`"),
+    ("libm_exp", "rejected: calls `<{closure} as std::ops::FnMut<(&mut f64,)>>::call_mut`, which calls `libm::exp`, which calls `std::ptr::read_volatile::<f32>`, which calls `std::ptr::read_volatile::precondition_check`, which calls `std::ptr::const_ptr::<impl *const ()>::is_aligned_to`, which reinterprets bits as `usize` (a transmute)"),
     ("libm_pow", "rejected: calls `libm::powf`, which calls `libm::scalbnf`, which calls `libm::math::generic::scalbn::scalbn::<f32>`, which calls `<i32 as std::cmp::Ord>::max`, which uses the intrinsic `integer_max`, which isn't translated yet (exact)"),
     ("libm_sin", "rejected: calls `libm::sinf`, which calls `libm::math::rem_pio2f::rem_pio2f`, which calls `libm::math::rem_pio2_large::rem_pio2_large`, which calls `libm::scalbn`, which calls `libm::math::generic::scalbn::scalbn::<f64>`, which calls `<i32 as std::cmp::Ord>::max`, which uses the intrinsic `integer_max`, which isn't translated yet (exact)"),
     ("ni_sqrt", "rejected: calls `<u64 as num_integer::Roots>::sqrt`, which calls `<u64 as num_integer::Roots>::sqrt::go`, which casts to `u128`, a type the kernel doesn't have"),
@@ -172,10 +184,10 @@ const DEBUG: &[(&str, &str)] = &[
 ];
 const RELEASE: &[(&str, &str)] = &[
     ("noise_row", "rejected: calls `noise::Perlin::new`, which calls `noise::permutationtable::PermutationTable::new`, which calls `<rand_xorshift::XorShiftRng as rand_core::SeedableRng>::from_seed`, which calls `rand_core::le::read_u32_into`, which reinterprets bits as `std::ptr::NonNull<[u32]>` (a transmute)"),
-    ("half_decode", "rejected: calls `<{closure} as std::ops::FnMut<((&mut f32, &u16),)>>::call_mut`, which calls `std_detect::detect::cache::test`, which reads a static that can change (`std_detect::detect::cache::CACHE`)"),
-    ("half_encode", "rejected: calls `half::f16::from_f32`, which calls `half::binary16::arch::f32_to_f16`, which calls `std_detect::detect::cache::test`, which reads a static that can change (`std_detect::detect::cache::CACHE`)"),
-    ("half_round_trip", "rejected: calls `half::f16::from_f32`, which calls `half::binary16::arch::f32_to_f16`, which calls `std_detect::detect::cache::test`, which reads a static that can change (`std_detect::detect::cache::CACHE`)"),
-    ("half_scale", "rejected: calls `half::f16::to_f32`, which calls `half::binary16::arch::f16_to_f32`, which calls `std_detect::detect::cache::test`, which reads a static that can change (`std_detect::detect::cache::CACHE`)"),
+    ("half_decode", "rejected: calls `<{closure} as std::ops::FnMut<((&mut f32, &u16),)>>::call_mut`, which calls `half::binary16::arch::x86::f16_to_f32_x86_f16c`, which uses `f16`, a number the kernel doesn't have"),
+    ("half_encode", "candidate: map over `[u16]` zipped with `values` with the host's CPU features"),
+    ("half_round_trip", "rejected: calls `half::f16::to_f32`, which calls `half::binary16::arch::f16_to_f32`, which calls `half::binary16::arch::x86::f16_to_f32_x86_f16c`, which uses `f16`, a number the kernel doesn't have"),
+    ("half_scale", "rejected: calls `half::f16::to_f32`, which calls `half::binary16::arch::f16_to_f32`, which calls `half::binary16::arch::x86::f16_to_f32_x86_f16c`, which uses `f16`, a number the kernel doesn't have"),
     ("libm_atan2", "rejected: calls `libm::atan2f`, which calls `libm::atanf`, which uses the intrinsic `volatile_load`, which accesses memory as volatile"),
     ("libm_cbrt", "rejected: calls `libm::cbrt`, which calls `libm::math::cbrt::cbrt_round`, which calls `<f64 as libm::math::support::float_traits::Float>::fma`, which calls `libm::fma`, which calls `libm::math::arch::x86::fma::fma`, which reads a static that can change (`libm::math::arch::x86::fma::fma::FUNC`)"),
     ("libm_exp", "rejected: calls `<{closure} as std::ops::FnMut<(&mut f64,)>>::call_mut`, which calls `libm::exp`, which uses the intrinsic `volatile_load`, which accesses memory as volatile"),
@@ -351,7 +363,9 @@ fn rewritten_candidates_match_the_cpu_on_the_gpu() {
     // `ni_sqrt` (accepted in release builds). Then 5 maps with `for_each`,
     // and `par_saxpy`, zipped with an input 3 shorter. Then 11 maps with
     // arrays and bit reinterpretation, and `half`'s `bf16_round_trip`. Then 9
-    // maps with enums.
+    // maps with enums. Then 9 with SIMD: `simd_roots`, 5 with SSE, 2 with
+    // runtime feature detection, and `half`'s `half_encode`; and
+    // `pointer_views`, reading through pointer casts.
     let with_work = LENGTHS - 3;
     let gpu_calls = 9 * non_empty + 3 * 2 * non_empty + non_empty + (7 + 5 + 8 + 3) * non_empty
         + 2 * 2 * non_empty
@@ -361,7 +375,8 @@ fn rewritten_candidates_match_the_cpu_on_the_gpu() {
         + 5 * non_empty
         + with_work
         + (11 + 1) * non_empty
-        + 9 * non_empty;
+        + 9 * non_empty
+        + (9 + 1) * non_empty;
     assert_eq!(trace.matches("-> gpu").count(), gpu_calls, "{trace}");
     for (passes, functions) in REGIONS {
         let calls = trace.matches(&format!("passes={passes} -> gpu")).count();

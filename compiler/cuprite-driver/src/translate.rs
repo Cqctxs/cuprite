@@ -59,8 +59,31 @@
 //! discriminant directly. A `char` is held as its `u32` code, and a pattern
 //! type (`NonZero`'s field) as the number it restricts.
 //!
+//! # SIMD
+//!
+//! A SIMD vector (`#[repr(simd)]`, a struct around an array) is held as its
+//! lanes. The portable `simd_*` intrinsics apply the scalar operation to
+//! each lane ([`Translator::simd`]). x86 instructions that `std::arch`
+//! reaches through LLVM intrinsics are translated from Intel's definitions
+//! ([`Translator::x86`]), in Rust's default floating-point environment;
+//! ones whose results differ between CPU models (`rcpps`) are refused.
+//!
+//! A runtime CPU feature test (`is_x86_feature_detected!`, which ends in
+//! `std_detect::detect::cache::test`) reads a kernel parameter: the
+//! rewritten function calls the same test on the host before dispatching
+//! and passes the answer, so the kernel takes the path the CPU would.
+//!
+//! # Pointer casts
+//!
+//! A cast from `*const T` to `*const U` is a view of the same bytes: where
+//! `U`'s numbers are `T`'s locals at the same offsets and types, the view
+//! aliases them. Otherwise it is [`Slot::Bytes`]: reading through it decodes
+//! the bytes as the type read, as `transmute` would, and writing through it
+//! is refused.
+//!
 //! Supported values: integers, floats, `bool` and `char`, structs, tuples,
-//! arrays and enums of them, closures, with references to any of those.
+//! arrays, enums and SIMD vectors of them, closures, with references to any
+//! of those.
 //! Slices other than read-only parameters and constants, unions, raw
 //! pointer arithmetic, coroutines and statics that can change are refused
 //! with a reason.
@@ -163,7 +186,7 @@ pub(crate) fn fields_of<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<Vec<Ty<
         // Captured by reference, a capture's type is the reference.
         ty::Closure(_, args) => Ok(args.as_closure().upvar_tys().to_vec()),
         ty::FnDef(..) => Ok(Vec::new()),
-        ty::Adt(adt, args) if adt.is_struct() && !adt.repr().simd() && !adt.is_box() => Ok(adt
+        ty::Adt(adt, args) if adt.is_struct() && !adt.is_box() => Ok(adt
             .non_enum_variant()
             .fields
             .iter()
@@ -174,8 +197,16 @@ pub(crate) fn fields_of<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<Vec<Ty<
     }
 }
 
-/// One number read from a parameter of plain data, passed to the kernel
-/// as an argument.
+/// A CPU feature test, `std_detect::detect::cache::test(bit)`, which
+/// `is_x86_feature_detected!` calls: the kernel takes the host's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Feature {
+    pub(crate) test: DefId,
+    pub(crate) bit: u32,
+}
+
+/// One number passed to the kernel as an argument: read from a parameter of
+/// plain data, or the host's answer to a CPU feature test.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Leaf {
     pub(crate) param: Local,
@@ -185,9 +216,17 @@ pub(crate) struct Leaf {
     /// number; empty for a number itself.
     pub(crate) fields: Vec<usize>,
     pub(crate) ty: KTy,
+    /// For a feature test's answer, the test; `param`, `deref` and `fields`
+    /// are then unused.
+    pub(crate) feature: Option<Feature>,
 }
 
 impl Leaf {
+    /// The answer to a feature test, as a `bool`.
+    pub(crate) fn feature(feature: Feature) -> Self {
+        Leaf { param: Local::from_u32(0), deref: false, fields: Vec::new(), ty: KTy::Bool, feature: Some(feature) }
+    }
+
     /// The type the kernel receives it as: narrow integers and `bool` are
     /// widened to what a launch can pass.
     pub(crate) fn passed(&self) -> KTy {
@@ -211,6 +250,10 @@ pub(crate) fn leaves<'tcx>(tcx: TyCtxt<'tcx>, param: Local, ty: Ty<'tcx>) -> Res
             out.push((path.clone(), kernel));
             return Ok(());
         }
+        // A vector's lanes can't be named by field projections on the CPU side.
+        if matches!(ty.kind(), ty::Adt(adt, _) if adt.repr().simd()) {
+            return Err(format!("is the SIMD vector `{ty}`"));
+        }
         for (index, field) in fields_of(tcx, ty)?.into_iter().enumerate() {
             path.push(index);
             walk(tcx, field, path, out)?;
@@ -228,7 +271,7 @@ pub(crate) fn leaves<'tcx>(tcx: TyCtxt<'tcx>, param: Local, ty: Ty<'tcx>) -> Res
     };
     let mut found = Vec::new();
     walk(tcx, ty, &mut Vec::new(), &mut found)?;
-    Ok(found.into_iter().map(|(fields, ty)| Leaf { param, deref, fields, ty }).collect())
+    Ok(found.into_iter().map(|(fields, ty)| Leaf { param, deref, fields, ty, feature: None }).collect())
 }
 
 /// What a `for` loop's iterator yields: the element, a value of a
@@ -324,7 +367,23 @@ pub(crate) enum IntrinsicOp {
     Nothing,
     /// `transmute`: the argument's bits as the result's type.
     Transmute,
+    /// A `simd_*` intrinsic, lane by lane (`Translator::simd`).
+    Simd,
+    /// `bswap`: an integer's bytes reversed.
+    ByteSwap,
 }
+
+/// The `simd_*` intrinsics translated lane by lane.
+const SIMD: [&str; 51] = [
+    "simd_insert", "simd_extract", "simd_insert_dyn", "simd_extract_dyn", "simd_splat", "simd_add", "simd_sub",
+    "simd_mul", "simd_div", "simd_rem", "simd_shl", "simd_shr", "simd_and", "simd_or", "simd_xor", "simd_cast",
+    "simd_as", "simd_neg", "simd_fabs", "simd_minimum_number_nsz", "simd_maximum_number_nsz", "simd_eq", "simd_ne",
+    "simd_lt", "simd_le", "simd_gt", "simd_ge", "simd_shuffle", "simd_saturating_add", "simd_saturating_sub",
+    "simd_reduce_add_ordered", "simd_reduce_mul_ordered", "simd_reduce_all", "simd_reduce_any", "simd_reduce_max",
+    "simd_reduce_min", "simd_reduce_and", "simd_reduce_or", "simd_reduce_xor", "simd_bitmask", "simd_select",
+    "simd_select_bitmask", "simd_bswap", "simd_ctlz", "simd_ctpop", "simd_cttz", "simd_ceil", "simd_floor",
+    "simd_trunc", "simd_fsqrt", "simd_fma",
+];
 
 /// The intrinsics library code reaches after inlining, by name: exactly
 /// those `coverage::INTRINSICS` lists as supported.
@@ -363,6 +422,8 @@ pub(crate) fn intrinsic(name: &str) -> Option<IntrinsicOp> {
         "unchecked_shr" => binary(KBinOp::Shr),
         "cold_path" | "assume" => Some(IntrinsicOp::Nothing),
         "transmute" => Some(IntrinsicOp::Transmute),
+        "bswap" => Some(IntrinsicOp::ByteSwap),
+        name if SIMD.contains(&name) => Some(IntrinsicOp::Simd),
         _ => None,
     }
 }
@@ -507,6 +568,7 @@ pub(crate) struct Loop<'a, 'tcx> {
 }
 
 /// How the function runs one iteration.
+#[derive(Clone, Copy)]
 pub(crate) enum Iteration<'a, 'tcx> {
     /// A `for` loop.
     For {
@@ -546,6 +608,11 @@ pub(crate) struct Translated {
     pub(crate) blocks: HashSet<BasicBlock>,
     /// Whether the body writes the element at all.
     pub(crate) stores: bool,
+    /// The kernel's scalar arguments: the loop's leaves.
+    pub(crate) leaves: Vec<Leaf>,
+    /// The CPU feature tests the code makes, in order; each must be among
+    /// the leaves for the kernel to read the host's answer.
+    pub(crate) features: Vec<Feature>,
 }
 
 /// Translates the code before the loop and the loop body. The element
@@ -590,6 +657,8 @@ pub(crate) fn translate<'tcx>(
         stores: false,
         stack: Vec::new(),
         written: HashSet::new(),
+        features: Vec::new(),
+        wanted: Vec::new(),
     };
 
     let mut slots = HashMap::new();
@@ -609,6 +678,10 @@ pub(crate) fn translate<'tcx>(
     let leaf_params = &kernel_params[1 + shape.inputs.len() + 2 * shape.tables.len()..];
     let mut by_param: Vec<(Local, Vec<(&Leaf, KLocal)>)> = Vec::new();
     for (leaf, &param) in shape.leaves.iter().zip(leaf_params) {
+        if let Some(feature) = leaf.feature {
+            translator.features.push((feature, param));
+            continue;
+        }
         match by_param.iter_mut().find(|(local, _)| *local == leaf.param) {
             Some((_, leaves)) => leaves.push((leaf, param)),
             None => by_param.push((leaf.param, vec![(leaf, param)])),
@@ -664,16 +737,13 @@ pub(crate) fn translate<'tcx>(
     frame.exit = translator.b.block();
     translator.run_frame(&mut frame, &ordered(body, &blocks), START_BLOCK)?;
     let stores = translator.stores;
+    let features = std::mem::take(&mut translator.wanted);
     let function = translator
         .b
         .finish_function(Some(value))
         .map_err(|invalid| format!("translated into an invalid kernel ({invalid})"))?;
     blocks.retain(|block| !shape.chain.contains(block));
-    Ok(Translated {
-        function,
-        blocks,
-        stores,
-    })
+    Ok(Translated { function, blocks, stores, leaves: shape.leaves.to_vec(), features })
 }
 
 /// Whether `ty` is element data: built from numbers, through structs,
@@ -715,7 +785,7 @@ pub(crate) fn element_data<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, depth: usize) 
 pub(crate) fn check_function<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, body: &Body<'tcx>) -> Result<()> {
     let (mut b, _) = Builder::new("coverage", &[]);
     let element = b.local(KTy::U32);
-    let mut translator = Translator { tcx, b, element, stores: false, stack: vec![def_id], written: HashSet::new() };
+    let mut translator = Translator { tcx, b, element, stores: false, stack: vec![def_id], written: HashSet::new(), features: Vec::new(), wanted: Vec::new() };
     let mut slots = HashMap::new();
     for param in (1..=body.arg_count).map(Local::from_usize) {
         let ty = body.local_decls[param].ty;
@@ -902,6 +972,12 @@ enum Slot {
     /// active variant's fields mean anything. As a value being stored, a
     /// `Unit` variant is one it doesn't write.
     Enum { tag: KLocal, variants: Vec<Slot> },
+    /// The bytes of other data seen as a value of another type, through a
+    /// pointer cast whose numbers don't line up (`read_unaligned`,
+    /// `bytemuck`): the data's numbers with their offsets, and where this
+    /// value starts among them. Reading it decodes the bytes as the type
+    /// read, as `transmute` would; writing through it is refused.
+    Bytes { numbers: Vec<(u64, KLocal)>, offset: u64 },
 }
 
 impl Slot {
@@ -913,6 +989,7 @@ impl Slot {
                 out.push(*tag);
                 variants.iter().for_each(|variant| variant.scalars(out));
             }
+            Slot::Bytes { numbers, .. } => out.extend(numbers.iter().map(|&(_, local)| local)),
             Slot::Choice { index, options } => {
                 out.push(*index);
                 options.iter().for_each(|option| option.scalars(out));
@@ -966,6 +1043,10 @@ struct Translator<'tcx> {
     stack: Vec<DefId>,
     /// Every local written, for `each`.
     written: HashSet<KLocal>,
+    /// The kernel parameters holding the host's answers to feature tests.
+    features: Vec<(Feature, KLocal)>,
+    /// The feature tests the code makes, in order.
+    wanted: Vec<Feature>,
 }
 
 /// How deep inlining may go.
@@ -973,6 +1054,14 @@ const MAX_DEPTH: usize = 24;
 
 fn is_ref(ty: Ty<'_>) -> bool {
     matches!(ty.kind(), ty::Ref(..) | ty::RawPtr(..))
+}
+
+/// `std_detect::detect::cache::test`, which every runtime CPU feature
+/// check reaches.
+pub(crate) fn is_feature_test(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    tcx.crate_name(def_id.krate).as_str() == "std_detect"
+        && tcx.item_name(def_id).as_str() == "test"
+        && tcx.opt_parent(def_id).is_some_and(|parent| tcx.opt_item_name(parent).is_some_and(|name| name.as_str() == "cache"))
 }
 
 fn points_to_array(ty: Ty<'_>) -> bool {
@@ -1182,6 +1271,32 @@ impl<'tcx> Translator<'tcx> {
         // closures through the `Fn` traits do.
         let rust_call = func_ty.fn_sig(tcx).abi() == ExternAbi::RustCall;
         let path = || tcx.def_path_str_with_args(def_id, generic_args);
+        // A CPU feature test: the host's answer, a kernel parameter. (While
+        // the parameters are being found, an unknown value, so that both
+        // paths are translated.)
+        if is_feature_test(tcx, def_id) {
+            let [bit] = args else { return Err("tests a CPU feature with unexpected arguments".into()) };
+            let KOperand::Const(bit) = self.scalar_operand(frame, &bit.node)? else {
+                return Err("tests a CPU feature chosen at run time".into());
+            };
+            let feature = Feature { test: def_id, bit: bit.bits as u32 };
+            if !self.wanted.contains(&feature) {
+                self.wanted.push(feature);
+            }
+            let answer = match self.features.iter().find(|(known, _)| *known == feature) {
+                Some(&(_, param)) => KRvalue::Binary(KBinOp::Ne, param.into(), Const::int(KTy::U32, 0).into()),
+                None => KRvalue::Use(self.b.local(KTy::Bool).into()),
+            };
+            let dest = self.place(frame, destination)?;
+            return self.write_number(dest, answer);
+        }
+        // An x86 instruction, declared as an LLVM intrinsic.
+        if tcx.is_foreign_item(def_id) {
+            let symbol = tcx.codegen_fn_attrs(def_id).symbol_name;
+            if let Some(symbol) = symbol.filter(|symbol| symbol.as_str().starts_with("llvm.x86.")) {
+                return self.x86(frame, symbol.as_str(), args, destination);
+            }
+        }
         if let Some(method) = method(tcx, def_id) {
             return self.operation(frame, IntrinsicOp::Method(method), args, destination);
         }
@@ -1194,6 +1309,9 @@ impl<'tcx> Translator<'tcx> {
                 let name = tcx.item_name(intrinsic_id);
                 let op = intrinsic(name.as_str())
                     .ok_or_else(|| format!("uses the intrinsic `{name}`{}", crate::coverage::reason(name.as_str())))?;
+                if op == IntrinsicOp::Simd {
+                    return self.simd(frame, name.as_str(), args, destination);
+                }
                 self.operation(frame, op, args, destination)
             }
             InstanceKind::Item(item) if tcx.is_mir_available(item) => {
@@ -1219,6 +1337,15 @@ impl<'tcx> Translator<'tcx> {
     ) -> Result<()> {
         if op == IntrinsicOp::Nothing {
             return Ok(());
+        }
+        if op == IntrinsicOp::ByteSwap {
+            let [arg] = args else {
+                return Err("calls a library function with unexpected arguments".into());
+            };
+            let value = self.scalar_operand(frame, &arg.node)?;
+            let swapped = self.byte_swap(value);
+            let dest = self.place(frame, destination)?;
+            return self.write_number(dest, KRvalue::Use(swapped.into()));
         }
         if op == IntrinsicOp::Transmute {
             let [arg] = args else {
@@ -1482,7 +1609,18 @@ impl<'tcx> Translator<'tcx> {
     /// The slot a place names.
     fn place(&mut self, frame: &mut Frame<'_, 'tcx>, place: &Place<'tcx>) -> Result<Slot> {
         let mut slot = self.local_slot(frame, place.local)?;
-        for element in place.projection.iter() {
+        for (depth, element) in place.projection.iter().enumerate() {
+            if let Slot::Bytes { numbers, offset } = &slot {
+                let ty = Place::ty_from(place.local, &place.projection[..depth], frame.body, self.tcx).ty;
+                let layout = self.layout(ty)?;
+                let at = match element {
+                    ProjectionElem::Field(field, _) => layout.fields.offset(field.as_usize()).bytes(),
+                    ProjectionElem::ConstantIndex { offset: index, from_end: false, .. } => layout.fields.offset(index as usize).bytes(),
+                    _ => return Err(format!("uses `{ty}` seen through a pointer to other data")),
+                };
+                slot = Slot::Bytes { numbers: numbers.clone(), offset: offset + at };
+                continue;
+            }
             if slot == Slot::Opaque {
                 return Err("uses a slice parameter other than through the loop's iterator".into());
             }
@@ -1504,6 +1642,19 @@ impl<'tcx> Translator<'tcx> {
             slot = self.step(slot, &step)?;
         }
         Ok(slot)
+    }
+
+    /// The value a place holds, as read: bytes seen through a pointer cast
+    /// are decoded as the place's type.
+    fn read_place(&mut self, frame: &mut Frame<'_, 'tcx>, place: &Place<'tcx>) -> Result<Slot> {
+        let slot = self.place(frame, place)?;
+        if !matches!(slot, Slot::Bytes { .. }) {
+            return Ok(slot);
+        }
+        let ty = place.ty(frame.body, self.tcx).ty;
+        let value = self.fresh(ty)?;
+        self.decode(&value, ty, 0, &slot, ty)?;
+        Ok(value)
     }
 
     /// The part of `slot` that `step` names.
@@ -1669,6 +1820,7 @@ impl<'tcx> Translator<'tcx> {
             (Slot::Unit, Slot::Unit) | (Slot::Unbound, Slot::Unbound) => {}
             (Slot::Unbound, Slot::Ref(_)) => return Ok(src.clone()),
             (Slot::Ref(d), Slot::Ref(s)) if d == s => {}
+            (Slot::Bytes { .. }, _) => return Err("writes through a pointer to data of another type".into()),
             (Slot::Ref(_), Slot::Ref(_)) => return Err("chooses between references at run time".into()),
             _ => return Err("copies between values of different shapes".into()),
         }
@@ -1802,7 +1954,7 @@ impl<'tcx> Translator<'tcx> {
             }
             Slot::Unbound => return Err("chooses between references at run time".into()),
             Slot::Slice { .. } | Slot::Memory { .. } => return Err("chooses between slices at run time".into()),
-            Slot::Unit | Slot::Some(_) | Slot::Opaque | Slot::Choice { .. } => return Err(shapes()),
+            Slot::Unit | Slot::Some(_) | Slot::Opaque | Slot::Choice { .. } | Slot::Bytes { .. } => return Err(shapes()),
         })
     }
 
@@ -1834,6 +1986,7 @@ impl<'tcx> Translator<'tcx> {
                 self.b.set(value, rvalue);
                 self.copy_fields(&dest, &Slot::Scalar(value))?;
             }
+            Slot::Bytes { .. } => return Err("writes through a pointer to data of another type".into()),
             Slot::Memory { .. } => return Err("writes to a read-only slice".into()),
             _ => return Err("writes a number into something else".into()),
         }
@@ -1901,7 +2054,7 @@ impl<'tcx> Translator<'tcx> {
                 self.store(frame, place, value)
             }
             Rvalue::CopyForDeref(source) => {
-                let value = self.place(frame, source)?;
+                let value = self.read_place(frame, source)?;
                 self.store(frame, place, value)
             }
             // `[x; N]`: every element a copy of `x`.
@@ -1959,15 +2112,89 @@ impl<'tcx> Translator<'tcx> {
             {
                 self.operand_slot(frame, operand)
             }
+            // A pointer to the same bytes as another type: a view sharing
+            // the numbers they hold.
+            Rvalue::Cast(
+                kind @ (CastKind::PtrToPtr | CastKind::PointerCoercion(PointerCoercion::MutToConstPointer, _)),
+                operand,
+                ty,
+            ) => {
+                let from = operand.ty(frame.body, self.tcx).builtin_deref(true);
+                let (Some(from), Some(to)) = (from, ty.builtin_deref(true)) else {
+                    return Err(cast_refusal(*kind, *ty));
+                };
+                let Slot::Ref(target) = self.operand_slot(frame, operand)? else {
+                    return Err(cast_refusal(*kind, *ty));
+                };
+                if from == to {
+                    return Ok(Slot::Ref(target));
+                }
+                if !from.is_sized(self.tcx, self.typing_env()) || !to.is_sized(self.tcx, self.typing_env()) {
+                    return Err(cast_refusal(*kind, *ty));
+                }
+                // Bytes stay bytes, whatever type they are seen as.
+                if let Slot::Bytes { .. } = *target {
+                    return Ok(Slot::Ref(target));
+                }
+                let mut numbers = Vec::new();
+                self.numbers_of(&target, from, 0, &mut numbers).map_err(|_| cast_refusal(*kind, *ty))?;
+                // Numbers that line up alias; others are read as bytes.
+                let view = self.view(to, 0, &numbers).unwrap_or(Slot::Bytes { numbers, offset: 0 });
+                Ok(Slot::Ref(Box::new(view)))
+            }
             Rvalue::Cast(kind, _, ty) => Err(cast_refusal(*kind, *ty)),
             _ => Err("uses a reference it can't follow".into()),
         }
     }
 
+    /// The numbers a value of type `ty` holds, with their offsets in its
+    /// layout from `base`.
+    fn numbers_of(&self, slot: &Slot, ty: Ty<'tcx>, base: u64, out: &mut Vec<(u64, KLocal)>) -> Result<()> {
+        match slot {
+            Slot::Scalar(local) => out.push((base, *local)),
+            Slot::Fields(fields) => {
+                let layout = self.layout(ty)?;
+                for (index, (field, field_ty)) in fields.iter().zip(self.fields(ty)?).enumerate() {
+                    self.numbers_of(field, field_ty, base + layout.fields.offset(index).bytes(), out)?;
+                }
+            }
+            Slot::Unit => {}
+            _ => return Err(format!("views `{ty}` as other data")),
+        }
+        Ok(())
+    }
+
+    /// A value of type `ty` at `base` made of the given numbers: each of its
+    /// numbers must be one of them, at its offset and of its type, so reading
+    /// and writing through it reads and writes them.
+    fn view(&self, ty: Ty<'tcx>, base: u64, numbers: &[(u64, KLocal)]) -> Result<Slot> {
+        if let Some(kernel) = held_ty(ty) {
+            return numbers
+                .iter()
+                .find(|&&(at, local)| at == base && self.b.ty(local) == kernel)
+                .map(|&(_, local)| Slot::Scalar(local))
+                .ok_or_else(|| format!("views data as `{ty}`, whose numbers lie elsewhere"));
+        }
+        if is_ref(ty) || self.enum_shape(ty)?.is_some() {
+            return Err(format!("views data as `{ty}`"));
+        }
+        let layout = self.layout(ty)?;
+        let fields = self.fields(ty)?;
+        if fields.is_empty() {
+            return Ok(Slot::Unit);
+        }
+        let parts = fields
+            .into_iter()
+            .enumerate()
+            .map(|(index, field)| self.view(field, base + layout.fields.offset(index).bytes(), numbers))
+            .collect::<Result<_>>()?;
+        Ok(Slot::Fields(parts))
+    }
+
     fn scalar_rvalue(&mut self, frame: &mut Frame<'_, 'tcx>, rvalue: &Rvalue<'tcx>) -> Result<KRvalue> {
         Ok(match rvalue {
             Rvalue::Use(operand, _) => KRvalue::Use(self.scalar_operand(frame, operand)?),
-            Rvalue::CopyForDeref(place) => match self.place(frame, place)? {
+            Rvalue::CopyForDeref(place) => match self.read_place(frame, place)? {
                 Slot::Memory { address, ty } => KRvalue::Load(address.into(), ty),
                 slot => KRvalue::Use(self.number(slot)?),
             },
@@ -2002,7 +2229,7 @@ impl<'tcx> Translator<'tcx> {
             }
             // An enum's discriminant.
             Rvalue::Discriminant(place) => {
-                let slot = self.place(frame, place)?;
+                let slot = self.read_place(frame, place)?;
                 match self.resolve(slot)? {
                     Slot::Enum { tag, .. } => KRvalue::Use(tag.into()),
                     _ => return Err(rvalue_refusal(rvalue)),
@@ -2051,7 +2278,7 @@ impl<'tcx> Translator<'tcx> {
                 .map(KOperand::Const)
                 .ok_or_else(|| format!("uses an unsupported constant of type `{}`", c.ty())),
             Operand::Copy(place) | Operand::Move(place) => {
-                let slot = self.place(frame, place)?;
+                let slot = self.read_place(frame, place)?;
                 self.number(slot)
             }
             Operand::RuntimeChecks(checks) => Ok(self.runtime_check(*checks).into()),
@@ -2130,7 +2357,7 @@ impl<'tcx> Translator<'tcx> {
     fn operand_slot(&mut self, frame: &mut Frame<'_, 'tcx>, operand: &Operand<'tcx>) -> Result<Slot> {
         match operand {
             Operand::Constant(c) => self.constant_slot(c),
-            Operand::Copy(place) | Operand::Move(place) => match self.place(frame, place)? {
+            Operand::Copy(place) | Operand::Move(place) => match self.read_place(frame, place)? {
                 Slot::Memory { address, ty } => Ok(Slot::Scalar(self.b.load(address, ty))),
                 slot => self.resolve(slot),
             },
@@ -2151,6 +2378,14 @@ impl<'tcx> Translator<'tcx> {
         if slot == Slot::Unit {
             return Ok(slot);
         }
+        let bytes = self.constant_bytes(c)?;
+        self.fill(&slot, ty, &bytes, 0)?;
+        Ok(slot)
+    }
+
+    /// A constant's bytes, laid out as rustc lays out its type.
+    fn constant_bytes(&self, c: &ConstOperand<'tcx>) -> Result<Vec<u8>> {
+        let ty = c.ty();
         let tcx = self.tcx;
         let value = c
             .const_
@@ -2173,8 +2408,7 @@ impl<'tcx> Translator<'tcx> {
             },
             _ => return Err(format!("uses a constant of type `{ty}` that isn't plain data")),
         };
-        self.fill(&slot, ty, &bytes, 0)?;
-        Ok(slot)
+        Ok(bytes)
     }
 
     /// A reference to constant data, such as a table (`&[f32; 5]`, `&[u8]`)
@@ -2356,6 +2590,10 @@ impl<'tcx> Translator<'tcx> {
                     Slot::Scalar(number) if base == 0 && self.b.ty(*number).bytes() == kernel.bytes() => {
                         self.same_width((*number).into(), kernel)
                     }
+                    Slot::Bytes { numbers, offset } if numbers.iter().any(|&(at, number)| at == offset + base && self.b.ty(number).bytes() == kernel.bytes()) => {
+                        let &(_, number) = numbers.iter().find(|&&(at, number)| at == offset + base && self.b.ty(number).bytes() == kernel.bytes()).expect("found above");
+                        self.same_width(number.into(), kernel)
+                    }
                     _ => {
                         let bits = self.gather(src, src_ty, 0, base, width)?;
                         let narrow = self.b.cast(bits, unsigned_of(width));
@@ -2459,6 +2697,26 @@ impl<'tcx> Translator<'tcx> {
                 }
                 bits
             }
+            // Bytes seen through a pointer: the data's numbers, placed where
+            // they fall in the value read.
+            Slot::Bytes { numbers, offset: start } => {
+                let mut bits = zero;
+                for &(at, number) in numbers {
+                    let size = i128::from(self.b.ty(number).bytes());
+                    let position = i128::from(base) + i128::from(at) - i128::from(*start);
+                    if position >= i128::from(offset + width) || i128::from(offset) >= position + size {
+                        continue;
+                    }
+                    let wide = self.unsigned_bits(number);
+                    let placed = if position >= i128::from(offset) {
+                        self.b.binary(KBinOp::Shl, wide, Const::int(KTy::U32, 8 * (position - i128::from(offset))))
+                    } else {
+                        self.b.binary(KBinOp::Shr, wide, Const::int(KTy::U32, 8 * (i128::from(offset) - position)))
+                    };
+                    bits = self.or(bits, placed.into());
+                }
+                bits
+            }
             Slot::Unit => zero,
             // Each variant's bytes, with its tag, chosen by the discriminant.
             Slot::Enum { tag, variants } => {
@@ -2543,6 +2801,778 @@ impl<'tcx> Translator<'tcx> {
         } else {
             KRvalue::Reinterpret(value, to)
         }
+    }
+
+    /// An operand's value if it is a constant number.
+    fn known(&self, operand: &Operand<'tcx>) -> Option<Const> {
+        match operand {
+            Operand::Constant(c) => constant(self.tcx, c),
+            _ => None,
+        }
+    }
+
+    /// The lanes of a SIMD vector: a `#[repr(simd)]` struct around an array,
+    /// held as its elements.
+    fn lanes(&self, slot: &Slot) -> Result<Vec<Slot>> {
+        match slot {
+            Slot::Fields(fields) if fields.len() == 1 => match &fields[0] {
+                Slot::Fields(lanes) => Ok(lanes.clone()),
+                _ => Err("uses a SIMD vector whose lanes aren't an array".into()),
+            },
+            _ => Err("uses a SIMD vector whose lanes aren't an array".into()),
+        }
+    }
+
+    /// The numbers in a vector's lanes.
+    fn lane_numbers(&mut self, slot: &Slot) -> Result<Vec<KOperand>> {
+        let lanes = self.lanes(slot)?;
+        lanes.into_iter().map(|lane| self.number(lane)).collect()
+    }
+
+    /// A `simd_*` intrinsic: the scalar operation on each lane, as the
+    /// intrinsic's documentation defines it, into a new vector.
+    fn simd(
+        &mut self,
+        frame: &mut Frame<'_, 'tcx>,
+        name: &str,
+        args: &[rustc_span::Spanned<Operand<'tcx>>],
+        destination: &Place<'tcx>,
+    ) -> Result<()> {
+        let tcx = self.tcx;
+        let values = args.iter().map(|arg| self.operand_slot(frame, &arg.node)).collect::<Result<Vec<_>>>()?;
+        let unexpected = || format!("uses the intrinsic `{name}` with unexpected arguments");
+        let arg = |index: usize| values.get(index).cloned().ok_or_else(unexpected);
+        let dest_ty = destination.ty(frame.body, tcx).ty;
+        // Intrinsics giving one number.
+        let scalar: Option<KRvalue> = match name {
+            "simd_extract" | "simd_extract_dyn" => {
+                let lanes = self.lanes(&arg(0)?)?;
+                let index = match self.known(&args[1].node) { Some(c) => c.into(), None => self.number(arg(1)?)? };
+                let lane = match index {
+                    KOperand::Const(c) => lanes.get(c.bits as usize).cloned().ok_or("extracts a lane that doesn't exist")?,
+                    KOperand::Local(local) => Slot::Choice { index: self.b.copy(local), options: lanes },
+                };
+                Some(KRvalue::Use(self.number(lane)?))
+            }
+            "simd_reduce_add_ordered" | "simd_reduce_mul_ordered" => {
+                let op = if name == "simd_reduce_add_ordered" { KBinOp::Add } else { KBinOp::Mul };
+                let mut acc = self.number(arg(1)?)?;
+                for lane in self.lane_numbers(&arg(0)?)? {
+                    acc = self.b.binary(op, acc, lane).into();
+                }
+                Some(KRvalue::Use(acc))
+            }
+            "simd_reduce_and" | "simd_reduce_or" | "simd_reduce_xor" | "simd_reduce_max" | "simd_reduce_min" => {
+                let lanes = self.lane_numbers(&arg(0)?)?;
+                let (&first, rest) = lanes.split_first().ok_or_else(unexpected)?;
+                if matches!(name, "simd_reduce_max" | "simd_reduce_min") && self.b.ty(first).is_float() {
+                    return Err(format!("uses the intrinsic `{name}` on floats, whose NaN handling isn't settled"));
+                }
+                let mut acc = first;
+                for &lane in rest {
+                    acc = match name {
+                        "simd_reduce_and" => self.b.binary(KBinOp::And, acc, lane).into(),
+                        "simd_reduce_or" => self.b.binary(KBinOp::Or, acc, lane).into(),
+                        "simd_reduce_xor" => self.b.binary(KBinOp::Xor, acc, lane).into(),
+                        _ => {
+                            let op = if name == "simd_reduce_max" { KBinOp::Gt } else { KBinOp::Lt };
+                            let better = self.b.binary(op, lane, acc);
+                            self.b.select(better, lane, acc).into()
+                        }
+                    };
+                }
+                Some(KRvalue::Use(acc))
+            }
+            "simd_reduce_all" | "simd_reduce_any" => {
+                let op = if name == "simd_reduce_all" { KBinOp::And } else { KBinOp::Or };
+                let mut acc: KOperand = Const::bool(name == "simd_reduce_all").into();
+                for lane in self.lane_numbers(&arg(0)?)? {
+                    let ty = self.b.ty(lane);
+                    let set = self.b.binary(KBinOp::Ne, lane, Const::int(ty, 0));
+                    acc = self.b.binary(op, acc, set).into();
+                }
+                Some(KRvalue::Use(acc))
+            }
+            // Bit `i` is lane `i`'s most significant bit.
+            "simd_bitmask" => {
+                let out = held_ty(dest_ty).filter(|ty| ty.is_int()).ok_or_else(|| {
+                    format!("uses the intrinsic `simd_bitmask` giving `{dest_ty}`, which isn't an integer")
+                })?;
+                let mut bits: KOperand = Const::int(out, 0).into();
+                for (index, lane) in self.lane_numbers(&arg(0)?)?.into_iter().enumerate() {
+                    let ty = self.b.ty(lane);
+                    let unsigned = self.b.cast(lane, unsigned_of(u64::from(ty.bytes())));
+                    let top = self.b.binary(KBinOp::Shr, unsigned, Const::int(KTy::U32, i128::from(ty.bits() - 1)));
+                    let bit = self.b.cast(top, out);
+                    let placed = self.b.binary(KBinOp::Shl, bit, Const::int(KTy::U32, index as i128));
+                    bits = self.b.binary(KBinOp::Or, bits, placed).into();
+                }
+                Some(KRvalue::Use(bits))
+            }
+            _ => None,
+        };
+        if let Some(rvalue) = scalar {
+            let dest = self.place(frame, destination)?;
+            return self.write_number(dest, rvalue);
+        }
+        // Intrinsics giving a vector, lane by lane.
+        let result = self.fresh(dest_ty)?;
+        let out: Vec<KLocal> = self
+            .lanes(&result)?
+            .into_iter()
+            .map(|lane| match lane {
+                Slot::Scalar(local) => Ok(local),
+                _ => Err("uses a SIMD vector whose lanes aren't numbers".to_string()),
+            })
+            .collect::<Result<_>>()?;
+        let binary = match name {
+            "simd_add" => Some(KBinOp::Add),
+            "simd_sub" => Some(KBinOp::Sub),
+            "simd_mul" => Some(KBinOp::Mul),
+            "simd_div" => Some(KBinOp::Div),
+            "simd_rem" => Some(KBinOp::Rem),
+            "simd_shl" => Some(KBinOp::Shl),
+            "simd_shr" => Some(KBinOp::Shr),
+            "simd_and" => Some(KBinOp::And),
+            "simd_or" => Some(KBinOp::Or),
+            "simd_xor" => Some(KBinOp::Xor),
+            _ => None,
+        };
+        let compare = match name {
+            "simd_eq" => Some(KBinOp::Eq),
+            "simd_ne" => Some(KBinOp::Ne),
+            "simd_lt" => Some(KBinOp::Lt),
+            "simd_le" => Some(KBinOp::Le),
+            "simd_gt" => Some(KBinOp::Gt),
+            "simd_ge" => Some(KBinOp::Ge),
+            _ => None,
+        };
+        let call = match name {
+            "simd_fabs" => Some(Intrinsic::Abs),
+            "simd_fsqrt" => Some(Intrinsic::Sqrt),
+            "simd_floor" => Some(Intrinsic::Floor),
+            "simd_ceil" => Some(Intrinsic::Ceil),
+            "simd_trunc" => Some(Intrinsic::Trunc),
+            "simd_minimum_number_nsz" => Some(Intrinsic::Min),
+            "simd_maximum_number_nsz" => Some(Intrinsic::Max),
+            "simd_fma" => Some(Intrinsic::MulAdd),
+            "simd_ctpop" => Some(Intrinsic::CountOnes),
+            "simd_ctlz" => Some(Intrinsic::LeadingZeros),
+            "simd_cttz" => Some(Intrinsic::TrailingZeros),
+            _ => None,
+        };
+        let rvalues: Vec<KRvalue> = if let Some(op) = binary {
+            let (a, b) = (self.lane_numbers(&arg(0)?)?, self.lane_numbers(&arg(1)?)?);
+            if op == KBinOp::Rem && a.first().is_some_and(|&lane| self.b.ty(lane).is_float()) {
+                return Err("uses `%` on float lanes, which has no exact GPU version yet".into());
+            }
+            a.into_iter().zip(b).map(|(a, b)| KRvalue::Binary(op, a, b)).collect()
+        } else if let Some(op) = compare {
+            // A lane of all ones where the comparison holds.
+            let (a, b) = (self.lane_numbers(&arg(0)?)?, self.lane_numbers(&arg(1)?)?);
+            let mut rvalues = Vec::new();
+            for ((a, b), &lane) in a.into_iter().zip(b).zip(&out) {
+                let ty = self.b.ty(lane);
+                let holds = self.b.binary(op, a, b);
+                rvalues.push(KRvalue::Select(holds.into(), Const::int(ty, -1).into(), Const::int(ty, 0).into()));
+            }
+            rvalues
+        } else if let Some(intrinsic) = call {
+            let operands = args.len();
+            let columns = (0..operands).map(|index| self.lane_numbers(&arg(index)?)).collect::<Result<Vec<_>>>()?;
+            let mut rvalues = Vec::new();
+            for (index, &lane) in out.iter().enumerate() {
+                let lane_args: Vec<KOperand> = columns.iter().map(|column| column[index]).collect();
+                if intrinsic.counts_bits() {
+                    let count = self.b.call(intrinsic, &lane_args);
+                    rvalues.push(KRvalue::Cast(count.into(), self.b.ty(lane)));
+                } else {
+                    rvalues.push(KRvalue::Call(intrinsic, lane_args));
+                }
+            }
+            rvalues
+        } else {
+            match name {
+                "simd_neg" => self.lane_numbers(&arg(0)?)?.into_iter().map(|a| KRvalue::Unary(KUnOp::Neg, a)).collect(),
+                // `as` on each lane; `simd_cast` is undefined where `as`
+                // would saturate a float, so `as` is right for it too.
+                "simd_cast" | "simd_as" => {
+                    let a = self.lane_numbers(&arg(0)?)?;
+                    a.into_iter().zip(&out).map(|(a, &lane)| KRvalue::Cast(a, self.b.ty(lane))).collect()
+                }
+                "simd_splat" => {
+                    let value = self.number(arg(0)?)?;
+                    out.iter().map(|_| KRvalue::Use(value)).collect()
+                }
+                "simd_select" => {
+                    let (mask, a, b) =
+                        (self.lane_numbers(&arg(0)?)?, self.lane_numbers(&arg(1)?)?, self.lane_numbers(&arg(2)?)?);
+                    let mut rvalues = Vec::new();
+                    for ((mask, a), b) in mask.into_iter().zip(a).zip(b) {
+                        let ty = self.b.ty(mask);
+                        let set = self.b.binary(KBinOp::Ne, mask, Const::int(ty, 0));
+                        rvalues.push(KRvalue::Select(set.into(), a, b));
+                    }
+                    rvalues
+                }
+                "simd_select_bitmask" => {
+                    let mask = self.number(arg(0)?)?;
+                    let (a, b) = (self.lane_numbers(&arg(1)?)?, self.lane_numbers(&arg(2)?)?);
+                    let ty = self.b.ty(mask);
+                    let mut rvalues = Vec::new();
+                    for (index, (a, b)) in a.into_iter().zip(b).enumerate() {
+                        let shifted = self.b.binary(KBinOp::Shr, mask, Const::int(KTy::U32, index as i128));
+                        let bit = self.b.binary(KBinOp::And, shifted, Const::int(ty, 1));
+                        let set = self.b.binary(KBinOp::Ne, bit, Const::int(ty, 0));
+                        rvalues.push(KRvalue::Select(set.into(), a, b));
+                    }
+                    rvalues
+                }
+                "simd_insert" | "simd_insert_dyn" => {
+                    let lanes = self.lane_numbers(&arg(0)?)?;
+                    let index = match self.known(&args[1].node) { Some(c) => c.into(), None => self.number(arg(1)?)? };
+                    let value = self.number(arg(2)?)?;
+                    let mut rvalues = Vec::new();
+                    for (at, lane) in lanes.into_iter().enumerate() {
+                        rvalues.push(match index {
+                            KOperand::Const(c) => KRvalue::Use(if c.bits as usize == at { value } else { lane }),
+                            KOperand::Local(local) => {
+                                let here = self.chosen(local, at);
+                                KRvalue::Select(here.into(), value, lane)
+                            }
+                        });
+                    }
+                    rvalues
+                }
+                // Lanes of both vectors, numbered on, picked by constant
+                // indices.
+                "simd_shuffle" => {
+                    let mut all = self.lane_numbers(&arg(0)?)?;
+                    all.extend(self.lane_numbers(&arg(1)?)?);
+                    let Some(Operand::Constant(indices)) = args.get(2).map(|arg| &arg.node) else {
+                        return Err("uses the intrinsic `simd_shuffle` with indices known only at run time".into());
+                    };
+                    let bytes = self.constant_bytes(indices)?;
+                    let indices: Vec<usize> = bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|chunk| u32::from_le_bytes(*chunk) as usize)
+                        .collect();
+                    if indices.len() != out.len() {
+                        return Err(unexpected());
+                    }
+                    indices
+                        .into_iter()
+                        .map(|index| all.get(index).map(|&lane| KRvalue::Use(lane)).ok_or_else(unexpected))
+                        .collect::<Result<_>>()?
+                }
+                "simd_saturating_add" | "simd_saturating_sub" => {
+                    let (a, b) = (self.lane_numbers(&arg(0)?)?, self.lane_numbers(&arg(1)?)?);
+                    let mut rvalues = Vec::new();
+                    for (a, b) in a.into_iter().zip(b) {
+                        let saturated = self.saturating(name == "simd_saturating_add", a, b)?;
+                        rvalues.push(KRvalue::Use(saturated.into()));
+                    }
+                    rvalues
+                }
+                "simd_bswap" => {
+                    let mut rvalues = Vec::new();
+                    for lane in self.lane_numbers(&arg(0)?)? {
+                        let swapped = self.byte_swap(lane);
+                        rvalues.push(KRvalue::Use(swapped.into()));
+                    }
+                    rvalues
+                }
+                _ => return Err(format!("uses the intrinsic `{name}`{}", crate::coverage::reason(name))),
+            }
+        };
+        if rvalues.len() != out.len() {
+            return Err(unexpected());
+        }
+        for (lane, rvalue) in out.into_iter().zip(rvalues) {
+            self.set(lane, rvalue);
+        }
+        self.store(frame, destination, result)
+    }
+
+    /// `a + b` or `a - b` of integers, clamped to the type's range.
+    fn saturating(&mut self, add: bool, a: KOperand, b: KOperand) -> Result<KLocal> {
+        let ty = self.b.ty(a);
+        if !ty.is_int() {
+            return Err("saturates something other than integers".into());
+        }
+        let op = if add { KBinOp::Add } else { KBinOp::Sub };
+        let bits = ty.bits();
+        if bits < 64 {
+            // Exact in 64 bits, then clamped.
+            let (wa, wb) = (self.b.cast(a, KTy::I64), self.b.cast(b, KTy::I64));
+            let wide = self.b.binary(op, wa, wb);
+            let (min, max) = if ty.is_signed() {
+                (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+            } else {
+                (0, (1i128 << bits) - 1)
+            };
+            let (min, max) = (Const::int(KTy::I64, min), Const::int(KTy::I64, max));
+            let below = self.b.binary(KBinOp::Lt, wide, min);
+            let above = self.b.binary(KBinOp::Gt, wide, max);
+            let upper = self.b.select(above, max, wide);
+            let clamped = self.b.select(below, min, upper);
+            return Ok(self.b.cast(clamped, ty));
+        }
+        if !ty.is_signed() {
+            let result = self.b.binary(op, a, b);
+            return Ok(if add {
+                let wrapped = self.b.binary(KBinOp::Lt, result, a);
+                self.b.select(wrapped, Const::int(ty, -1), result)
+            } else {
+                let wrapped = self.b.binary(KBinOp::Lt, a, b);
+                self.b.select(wrapped, Const::int(ty, 0), result)
+            });
+        }
+        // Signed 64 bits: on overflow, the result saturates toward `a`'s sign.
+        let checked = if add { BinOp::AddWithOverflow } else { BinOp::SubWithOverflow };
+        let (result, overflowed) = self.with_overflow(checked, a, b)?;
+        let negative = self.b.binary(KBinOp::Lt, a, Const::int(ty, 0));
+        let limit = self.b.select(negative, Const::int(ty, i128::from(i64::MIN)), Const::int(ty, i128::from(i64::MAX)));
+        Ok(self.b.select(overflowed, limit, result))
+    }
+
+    /// An integer with its bytes in reverse order.
+    fn byte_swap(&mut self, value: KOperand) -> KLocal {
+        let ty = self.b.ty(value);
+        let bytes = u64::from(ty.bytes());
+        if bytes == 1 {
+            return self.b.copy(value);
+        }
+        let unsigned = unsigned_of(bytes);
+        let bits = self.b.cast(value, unsigned);
+        let mut swapped: KOperand = Const::int(unsigned, 0).into();
+        for index in 0..bytes {
+            let shifted = self.b.binary(KBinOp::Shr, bits, Const::int(KTy::U32, (8 * index).into()));
+            let byte = self.b.binary(KBinOp::And, shifted, Const::int(unsigned, 0xFF));
+            let placed = self.b.binary(KBinOp::Shl, byte, Const::int(KTy::U32, (8 * (bytes - 1 - index)).into()));
+            swapped = self.b.binary(KBinOp::Or, swapped, placed).into();
+        }
+        self.b.cast(swapped, ty)
+    }
+
+    /// An x86 SIMD instruction, called through its LLVM intrinsic: what the
+    /// instruction computes, from Intel's definitions, lane by lane. The
+    /// floating-point environment is Rust's default (round to nearest even,
+    /// exceptions masked). Instructions whose results differ between CPU
+    /// models (`rcpps`, `rsqrtps`) are refused.
+    fn x86(
+        &mut self,
+        frame: &mut Frame<'_, 'tcx>,
+        symbol: &str,
+        args: &[rustc_span::Spanned<Operand<'tcx>>],
+        destination: &Place<'tcx>,
+    ) -> Result<()> {
+        let values = args.iter().map(|arg| self.operand_slot(frame, &arg.node)).collect::<Result<Vec<_>>>()?;
+        let refused = |why: &str| format!("calls the x86 instruction `{symbol}`, which {why}");
+        let unexpected = || refused("has unexpected arguments");
+        let arg = |index: usize| values.get(index).cloned().ok_or_else(unexpected);
+        let dest_ty = destination.ty(frame.body, self.tcx).ty;
+        let name = symbol.strip_prefix("llvm.x86.").unwrap_or(symbol);
+        let family = if name.starts_with("vcvt") { name } else { name.split_once('.').map_or(name, |(_, rest)| rest) };
+
+        // Scalar conversions of lane 0.
+        if let Some(kind) = ["cvtss2si", "cvttss2si", "cvtsd2si", "cvttsd2si"]
+            .into_iter()
+            .find(|kind| family == *kind || family == format!("{kind}64"))
+        {
+            let out = held_ty(dest_ty).ok_or_else(unexpected)?;
+            let lane = *self.lane_numbers(&arg(0)?)?.first().ok_or_else(unexpected)?;
+            let value = self.float_to_int_indefinite(lane, out, !kind.starts_with("cvtt"));
+            let dest = self.place(frame, destination)?;
+            return self.write_number(dest, KRvalue::Use(value.into()));
+        }
+
+        let result = self.fresh(dest_ty)?;
+        let out: Vec<KLocal> = self
+            .lanes(&result)?
+            .into_iter()
+            .map(|lane| match lane {
+                Slot::Scalar(local) => Ok(local),
+                _ => Err(unexpected()),
+            })
+            .collect::<Result<_>>()?;
+        let out_ty = out.first().map(|&lane| self.b.ty(lane)).ok_or_else(unexpected)?;
+        let immediate = |this: &mut Self, index: usize| -> Result<u64> {
+            let operand = args.get(index).map(|arg| &arg.node).ok_or_else(unexpected)?;
+            this.known(operand).map(|c| c.bits).ok_or_else(|| refused("takes an immediate known only at run time"))
+        };
+        let lanes: Vec<KOperand> = match family {
+            // Comparisons: a lane of all ones where the predicate holds.
+            "cmp.ps" | "cmp.pd" | "cmp.ps.256" | "cmp.pd.256" | "cmp.ss" | "cmp.sd" => {
+                let predicate = immediate(self, 2)?;
+                let (a, b) = (self.lane_numbers(&arg(0)?)?, self.lane_numbers(&arg(1)?)?);
+                let scalar = family.ends_with(".ss") || family.ends_with(".sd");
+                let mut lanes = Vec::new();
+                for (index, (&x, &y)) in a.iter().zip(&b).enumerate() {
+                    if scalar && index > 0 {
+                        lanes.push(x);
+                        continue;
+                    }
+                    let holds = self.x86_compare(predicate, x, y);
+                    lanes.push(self.mask(holds, out_ty).into());
+                }
+                lanes
+            }
+            // `a < b ? a : b`: the second operand when either is NaN or both
+            // are zeros, unlike `f32::min`.
+            "min.ps" | "min.pd" | "min.ps.256" | "min.pd.256" | "min.ss" | "min.sd" | "max.ps" | "max.pd"
+            | "max.ps.256" | "max.pd.256" | "max.ss" | "max.sd" => {
+                let op = if family.starts_with("min") { KBinOp::Lt } else { KBinOp::Gt };
+                let scalar = family.ends_with(".ss") || family.ends_with(".sd");
+                let (a, b) = (self.lane_numbers(&arg(0)?)?, self.lane_numbers(&arg(1)?)?);
+                let mut lanes = Vec::new();
+                for (index, (&x, &y)) in a.iter().zip(&b).enumerate() {
+                    if scalar && index > 0 {
+                        lanes.push(x);
+                        continue;
+                    }
+                    let first = self.b.binary(op, x, y);
+                    lanes.push(self.b.select(first, x, y).into());
+                }
+                lanes
+            }
+            // Float to `i32` lanes; out of range or NaN gives `i32::MIN`.
+            "cvtps2dq" | "cvttps2dq" | "cvt.ps2dq.256" | "cvtt.ps2dq.256" | "cvtpd2dq" | "cvttpd2dq" => {
+                let round = !family.starts_with("cvtt");
+                let a = self.lane_numbers(&arg(0)?)?;
+                let mut lanes = Vec::new();
+                for index in 0..out.len() {
+                    lanes.push(match a.get(index) {
+                        Some(&x) => self.float_to_int_indefinite(x, out_ty, round).into(),
+                        None => Const::int(out_ty, 0).into(),
+                    });
+                }
+                lanes
+            }
+            // The high half of each 32-bit product.
+            "pmulh.w" | "pmulhu.w" => {
+                let wide = if family == "pmulh.w" { KTy::I32 } else { KTy::U32 };
+                let (a, b) = (self.lane_numbers(&arg(0)?)?, self.lane_numbers(&arg(1)?)?);
+                let mut lanes = Vec::new();
+                for (x, y) in a.into_iter().zip(b) {
+                    let (wx, wy) = (self.b.cast(x, wide), self.b.cast(y, wide));
+                    let product = self.b.binary(KBinOp::Mul, wx, wy);
+                    let high = self.b.binary(KBinOp::Shr, product, Const::int(KTy::U32, 16));
+                    lanes.push(self.b.cast(high, out_ty).into());
+                }
+                lanes
+            }
+            // `(a + b + 1) >> 1`, without overflow.
+            "pavg.b" | "pavg.w" => {
+                let (a, b) = (self.lane_numbers(&arg(0)?)?, self.lane_numbers(&arg(1)?)?);
+                let mut lanes = Vec::new();
+                for (x, y) in a.into_iter().zip(b) {
+                    let unsigned = unsigned_of(u64::from(out_ty.bytes()));
+                    let (ux, uy) = (self.b.cast(x, unsigned), self.b.cast(y, unsigned));
+                    let (wx, wy) = (self.b.cast(ux, KTy::U32), self.b.cast(uy, KTy::U32));
+                    let sum = self.b.binary(KBinOp::Add, wx, wy);
+                    let rounded = self.b.binary(KBinOp::Add, sum, Const::int(KTy::U32, 1));
+                    let halved = self.b.binary(KBinOp::Shr, rounded, Const::int(KTy::U32, 1));
+                    lanes.push(self.b.cast(halved, out_ty).into());
+                }
+                lanes
+            }
+            // Bits 16..1 of `(a * b >> 14) + 1`.
+            "pmul.hr.sw.128" | "pmul.hr.sw" => {
+                let (a, b) = (self.lane_numbers(&arg(0)?)?, self.lane_numbers(&arg(1)?)?);
+                let mut lanes = Vec::new();
+                for (x, y) in a.into_iter().zip(b) {
+                    let (wx, wy) = (self.b.cast(x, KTy::I32), self.b.cast(y, KTy::I32));
+                    let product = self.b.binary(KBinOp::Mul, wx, wy);
+                    let shifted = self.b.binary(KBinOp::Shr, product, Const::int(KTy::U32, 14));
+                    let rounded = self.b.binary(KBinOp::Add, shifted, Const::int(KTy::I32, 1));
+                    let halved = self.b.binary(KBinOp::Shr, rounded, Const::int(KTy::U32, 1));
+                    lanes.push(self.b.cast(halved, out_ty).into());
+                }
+                lanes
+            }
+            // Adjacent `i16` products, summed into `i32` (wrapping only for
+            // `-32768 * -32768` twice, as the instruction does).
+            "pmadd.wd" => {
+                let (a, b) = (self.lane_numbers(&arg(0)?)?, self.lane_numbers(&arg(1)?)?);
+                let mut lanes = Vec::new();
+                for pair in 0..out.len() {
+                    let mut sum: KOperand = Const::int(KTy::I32, 0).into();
+                    for index in [2 * pair, 2 * pair + 1] {
+                        let (x, y) = (*a.get(index).ok_or_else(unexpected)?, *b.get(index).ok_or_else(unexpected)?);
+                        let (wx, wy) = (self.b.cast(x, KTy::I32), self.b.cast(y, KTy::I32));
+                        let product = self.b.binary(KBinOp::Mul, wx, wy);
+                        sum = self.b.binary(KBinOp::Add, sum, product).into();
+                    }
+                    lanes.push(sum);
+                }
+                lanes
+            }
+            // Narrowed with saturation: `a`'s lanes then `b`'s, per 128 bits.
+            "packsswb.128" | "packssdw.128" | "packuswb.128" | "packusdw" | "packsswb" | "packssdw" | "packuswb" => {
+                let (a, b) = (self.lane_numbers(&arg(0)?)?, self.lane_numbers(&arg(1)?)?);
+                let per_block = a.len().min(128 / a.first().map_or(128, |&x| self.b.ty(x).bits() as usize));
+                let (min, max) = if out_ty.is_signed() {
+                    (-(1i128 << (out_ty.bits() - 1)), (1i128 << (out_ty.bits() - 1)) - 1)
+                } else {
+                    (0, (1i128 << out_ty.bits()) - 1)
+                };
+                let mut lanes = Vec::new();
+                for block in 0..a.len() / per_block.max(1) {
+                    for source in [&a, &b] {
+                        for &x in &source[block * per_block..(block + 1) * per_block] {
+                            let wide = self.b.cast(x, KTy::I64);
+                            let below = self.b.binary(KBinOp::Lt, wide, Const::int(KTy::I64, min));
+                            let above = self.b.binary(KBinOp::Gt, wide, Const::int(KTy::I64, max));
+                            let upper = self.b.select(above, Const::int(KTy::I64, max), wide);
+                            let clamped = self.b.select(below, Const::int(KTy::I64, min), upper);
+                            lanes.push(self.b.cast(clamped, out_ty).into());
+                        }
+                    }
+                }
+                lanes
+            }
+            // Bytes of `a` chosen by `b`, within each 128 bits; zero where
+            // `b`'s byte has its top bit set.
+            "pshuf.b.128" | "pshuf.b" => {
+                let a = self.lanes(&arg(0)?)?;
+                let b = self.lane_numbers(&arg(1)?)?;
+                let mut lanes = Vec::new();
+                for (index, &selector) in b.iter().enumerate() {
+                    let block = index / 16 * 16;
+                    let options = a.get(block..block + 16).ok_or_else(unexpected)?.to_vec();
+                    let ty = self.b.ty(selector);
+                    let low = self.b.binary(KBinOp::And, selector, Const::int(ty, 15));
+                    let at = self.b.cast(low, KTy::U64);
+                    let Slot::Scalar(picked) = self.select_among(at, &options)? else { return Err(unexpected()) };
+                    let top = self.b.binary(KBinOp::And, selector, Const::int(ty, 0x80));
+                    let cleared = self.b.binary(KBinOp::Ne, top, Const::int(ty, 0));
+                    lanes.push(self.b.select(cleared, Const::int(out_ty, 0), picked).into());
+                }
+                lanes
+            }
+            // Sums of absolute byte differences, per 8 bytes, into `u64`s.
+            "psad.bw" => {
+                let (a, b) = (self.lane_numbers(&arg(0)?)?, self.lane_numbers(&arg(1)?)?);
+                let mut lanes = Vec::new();
+                for group in 0..out.len() {
+                    let mut sum: KOperand = Const::int(KTy::U64, 0).into();
+                    for index in group * 8..group * 8 + 8 {
+                        let (x, y) = (*a.get(index).ok_or_else(unexpected)?, *b.get(index).ok_or_else(unexpected)?);
+                        let (wx, wy) = (self.b.cast(x, KTy::U64), self.b.cast(y, KTy::U64));
+                        let larger = self.b.binary(KBinOp::Gt, wx, wy);
+                        let (up, down) = (self.b.binary(KBinOp::Sub, wx, wy), self.b.binary(KBinOp::Sub, wy, wx));
+                        let difference = self.b.select(larger, up, down);
+                        sum = self.b.binary(KBinOp::Add, sum, difference).into();
+                    }
+                    lanes.push(self.b.cast(sum, out_ty).into());
+                }
+                lanes
+            }
+            // Shifts by the low 64 bits of a vector: past the width, logical
+            // shifts give zero and arithmetic ones the sign.
+            "psll.w" | "psll.d" | "psll.q" | "psrl.w" | "psrl.d" | "psrl.q" | "psra.w" | "psra.d" => {
+                let a = self.lane_numbers(&arg(0)?)?;
+                let counts = self.lane_numbers(&arg(1)?)?;
+                let count_bits = counts.first().map_or(64, |&c| self.b.ty(c).bits());
+                let mut count: KOperand = Const::int(KTy::U64, 0).into();
+                for (index, &part) in counts.iter().take((64 / count_bits) as usize).enumerate() {
+                    let unsigned = self.b.cast(part, unsigned_of(u64::from(count_bits / 8)));
+                    let wide = self.b.cast(unsigned, KTy::U64);
+                    let placed = self.b.binary(KBinOp::Shl, wide, Const::int(KTy::U32, (index as u32 * count_bits).into()));
+                    count = self.b.binary(KBinOp::Or, count, placed).into();
+                }
+                let bits = u64::from(out_ty.bits());
+                let past = self.b.binary(KBinOp::Ge, count, Const::int(KTy::U64, bits.into()));
+                let arithmetic = family.starts_with("psra");
+                let limited = self.b.select(past, Const::int(KTy::U64, (bits - 1).into()), count);
+                let source: KOperand = if arithmetic { limited.into() } else { count };
+                let amount = self.b.cast(source, KTy::U32);
+                let mut lanes = Vec::new();
+                for x in a {
+                    let x = if arithmetic { x } else { self.b.cast(x, unsigned_of(bits / 8)).into() };
+                    let op = if family.starts_with("psll") { KBinOp::Shl } else { KBinOp::Shr };
+                    let shifted = self.b.binary(op, x, amount);
+                    let shifted_ty = self.b.ty(shifted);
+                    let value = if arithmetic { shifted } else { self.b.select(past, Const::int(shifted_ty, 0), shifted) };
+                    lanes.push(self.b.cast(value, out_ty).into());
+                }
+                lanes
+            }
+            // `f32` to `f16` bits, rounding to nearest even (immediate 0, or 4
+            // for the default floating-point environment).
+            "vcvtps2ph.128" | "vcvtps2ph.256" => {
+                let rounding = immediate(self, 1)?;
+                if rounding != 0 && rounding != 4 {
+                    return Err(refused("rounds other than to nearest even here"));
+                }
+                let a = self.lane_numbers(&arg(0)?)?;
+                let mut lanes = Vec::new();
+                for index in 0..out.len() {
+                    lanes.push(match a.get(index) {
+                        Some(&x) => {
+                            let half = self.f32_to_f16_bits(x);
+                            self.b.cast(half, out_ty).into()
+                        }
+                        None => Const::int(out_ty, 0).into(),
+                    });
+                }
+                lanes
+            }
+            "rcp.ps" | "rsqrt.ps" | "rcp.ss" | "rsqrt.ss" | "rcp.ps.256" | "rsqrt.ps.256" => {
+                return Err(refused("approximates, differently on each CPU model"));
+            }
+            _ => return Err(refused("has no exact GPU version yet")),
+        };
+        if lanes.len() != out.len() {
+            return Err(unexpected());
+        }
+        for (lane, value) in out.into_iter().zip(lanes) {
+            self.set(lane, KRvalue::Use(value));
+        }
+        self.store(frame, destination, result)
+    }
+
+    /// An x86 comparison predicate (`_CMP_*`, 0 to 31; 16 on repeat 0 to 15
+    /// but signal on quiet NaNs, which changes no result).
+    fn x86_compare(&mut self, predicate: u64, a: KOperand, b: KOperand) -> KOperand {
+        let unordered = |this: &mut Self| {
+            let (x, y) = (this.b.binary(KBinOp::Ne, a, a), this.b.binary(KBinOp::Ne, b, b));
+            this.b.binary(KBinOp::Or, x, y)
+        };
+        let not = |this: &mut Self, value: KLocal| -> KOperand { this.b.unary(KUnOp::Not, value).into() };
+        match predicate & 15 {
+            0 => self.b.binary(KBinOp::Eq, a, b).into(),
+            1 => self.b.binary(KBinOp::Lt, a, b).into(),
+            2 => self.b.binary(KBinOp::Le, a, b).into(),
+            3 => unordered(self).into(),
+            4 => self.b.binary(KBinOp::Ne, a, b).into(),
+            5 => {
+                let lt = self.b.binary(KBinOp::Lt, a, b);
+                not(self, lt)
+            }
+            6 => {
+                let le = self.b.binary(KBinOp::Le, a, b);
+                not(self, le)
+            }
+            7 => {
+                let unordered = unordered(self);
+                not(self, unordered)
+            }
+            8 => {
+                let (eq, unordered) = (self.b.binary(KBinOp::Eq, a, b), unordered(self));
+                self.b.binary(KBinOp::Or, eq, unordered).into()
+            }
+            9 => {
+                let ge = self.b.binary(KBinOp::Ge, a, b);
+                not(self, ge)
+            }
+            10 => {
+                let gt = self.b.binary(KBinOp::Gt, a, b);
+                not(self, gt)
+            }
+            11 => Const::bool(false).into(),
+            12 => {
+                let (ne, unordered) = (self.b.binary(KBinOp::Ne, a, b), unordered(self));
+                let ordered = not(self, unordered);
+                self.b.binary(KBinOp::And, ne, ordered).into()
+            }
+            13 => self.b.binary(KBinOp::Ge, a, b).into(),
+            14 => self.b.binary(KBinOp::Gt, a, b).into(),
+            _ => Const::bool(true).into(),
+        }
+    }
+
+    /// All ones where `holds`, else zeros, as a lane of type `ty`.
+    fn mask(&mut self, holds: KOperand, ty: KTy) -> KLocal {
+        let int = if ty.is_float() { unsigned_of(u64::from(ty.bytes())) } else { ty };
+        let bits = self.b.select(holds, Const::int(int, -1), Const::int(int, 0));
+        if ty.is_float() { self.b.reinterpret(bits, ty) } else { bits }
+    }
+
+    /// A float to an integer as x86's conversions do: rounded to nearest
+    /// even (or truncated), and the integer's minimum, the "integer
+    /// indefinite", for NaN and values out of range.
+    fn float_to_int_indefinite(&mut self, value: KOperand, out: KTy, round: bool) -> KLocal {
+        let ty = self.b.ty(value);
+        let rounded = self.b.call(if round { Intrinsic::RoundTiesEven } else { Intrinsic::Trunc }, &[value]);
+        let limit = 2f64.powi(out.bits() as i32 - 1);
+        let (low, high) = if ty == KTy::F32 {
+            (Const::f32(-limit as f32), Const::f32(limit as f32))
+        } else {
+            (Const::f64(-limit), Const::f64(limit))
+        };
+        let above_low = self.b.binary(KBinOp::Ge, rounded, low);
+        let below_high = self.b.binary(KBinOp::Lt, rounded, high);
+        let valid = self.b.binary(KBinOp::And, above_low, below_high);
+        let converted = self.b.cast(rounded, out);
+        let indefinite = Const::int(out, -(1i128 << (out.bits() - 1)));
+        self.b.select(valid, converted, indefinite)
+    }
+
+    /// An `f32`'s nearest `f16`, ties to even, as `u16` bits, as F16C's
+    /// `vcvtps2ph` gives it: overflow to infinity, subnormal results, and
+    /// a NaN quieted with its payload's top bits.
+    fn f32_to_f16_bits(&mut self, value: KOperand) -> KLocal {
+        let u32c = |v: i128| Const::int(KTy::U32, v);
+        let i32c = |v: i128| Const::int(KTy::I32, v);
+        let bits = self.b.reinterpret(value, KTy::U32);
+        let shifted_sign = self.b.binary(KBinOp::Shr, bits, u32c(16));
+        let sign = self.b.binary(KBinOp::And, shifted_sign, u32c(0x8000));
+        let shifted_exponent = self.b.binary(KBinOp::Shr, bits, u32c(23));
+        let exponent = self.b.binary(KBinOp::And, shifted_exponent, u32c(0xFF));
+        let mantissa = self.b.binary(KBinOp::And, bits, u32c(0x7F_FFFF));
+        // Infinity, or NaN with the quiet bit set.
+        let payload = self.b.binary(KBinOp::Shr, mantissa, u32c(13));
+        let quiet = self.b.binary(KBinOp::Or, payload, u32c(0x7E00));
+        let has_payload = self.b.binary(KBinOp::Ne, mantissa, u32c(0));
+        let special = self.b.select(has_payload, quiet, u32c(0x7C00));
+        // The exponent rebased for `f16`.
+        let signed_exponent = self.b.cast(exponent, KTy::I32);
+        let rebased = self.b.binary(KBinOp::Sub, signed_exponent, i32c(127 - 15));
+        // Normal results: round the mantissa's low 13 bits to nearest even;
+        // a carry moves into the exponent, up to infinity.
+        let high = self.b.cast(rebased, KTy::U32);
+        let exponent_bits = self.b.binary(KBinOp::Shl, high, u32c(10));
+        let normal_bits = self.b.binary(KBinOp::Or, exponent_bits, payload);
+        let low = self.b.binary(KBinOp::And, mantissa, u32c(0x1FFF));
+        let normal = self.round_even(normal_bits, low, u32c(0x1000));
+        // Subnormal results: the full significand shifted down, rounded.
+        let significand = self.b.binary(KBinOp::Or, mantissa, u32c(0x80_0000));
+        let shift = self.b.binary(KBinOp::Sub, i32c(14), rebased);
+        let capped = self.b.binary(KBinOp::Lt, shift, i32c(25));
+        let shift = self.b.select(capped, shift, i32c(25));
+        let shift = self.b.cast(shift, KTy::U32);
+        let kept = self.b.binary(KBinOp::Shr, significand, shift);
+        let one = self.b.binary(KBinOp::Shl, u32c(1), shift);
+        let below = self.b.binary(KBinOp::Sub, one, u32c(1));
+        let dropped = self.b.binary(KBinOp::And, significand, below);
+        let half = self.b.binary(KBinOp::Shr, one, u32c(1));
+        let subnormal = self.round_even(kept, dropped, half);
+        let is_special = self.b.binary(KBinOp::Eq, exponent, u32c(0xFF));
+        let overflows = self.b.binary(KBinOp::Ge, rebased, i32c(31));
+        let is_small = self.b.binary(KBinOp::Le, rebased, i32c(0));
+        let finite = self.b.select(is_small, subnormal, normal);
+        let bounded = self.b.select(overflows, u32c(0x7C00), finite);
+        let magnitude = self.b.select(is_special, special, bounded);
+        let combined = self.b.binary(KBinOp::Or, sign, magnitude);
+        self.b.cast(combined, KTy::U16)
+    }
+
+    /// `kept`, plus one where the `dropped` bits are above `half`, or equal
+    /// to it with `kept` odd: rounding to nearest, ties to even.
+    fn round_even(&mut self, kept: KLocal, dropped: KLocal, half: impl Into<KOperand>) -> KLocal {
+        let half = half.into();
+        let above = self.b.binary(KBinOp::Gt, dropped, half);
+        let tie = self.b.binary(KBinOp::Eq, dropped, half);
+        let odd_bit = self.b.binary(KBinOp::And, kept, Const::int(KTy::U32, 1));
+        let odd = self.b.binary(KBinOp::Ne, odd_bit, Const::int(KTy::U32, 0));
+        let tie_up = self.b.binary(KBinOp::And, tie, odd);
+        let up = self.b.binary(KBinOp::Or, above, tie_up);
+        let increment = self.b.cast(up, KTy::U32);
+        self.b.binary(KBinOp::Add, kept, increment)
     }
 
     /// A number's bits, zero-extended to a `u64`.

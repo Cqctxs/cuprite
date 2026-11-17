@@ -283,13 +283,14 @@ macro_rules! float_suite {
             for (op, f) in compare {
                 binary(&format!("{n}_{op:?}"), &all, op, f, Freedom::None);
             }
-            let exact: [(&str, fn(&mut Builder, Local) -> Local, fn($t) -> $t); 6] = [
+            let exact: [(&str, fn(&mut Builder, Local) -> Local, fn($t) -> $t); 7] = [
                 ("neg", |b, x| b.unary(UnOp::Neg, x), |x| -x),
                 ("abs", |b, x| b.call(Intrinsic::Abs, &[x.into()]), |x| x.abs()),
                 ("sqrt", |b, x| b.call(Intrinsic::Sqrt, &[x.into()]), |x| x.sqrt()),
                 ("floor", |b, x| b.call(Intrinsic::Floor, &[x.into()]), |x| x.floor()),
                 ("ceil", |b, x| b.call(Intrinsic::Ceil, &[x.into()]), |x| x.ceil()),
                 ("trunc", |b, x| b.call(Intrinsic::Trunc, &[x.into()]), |x| x.trunc()),
+                ("round_ties_even", |b, x| b.call(Intrinsic::RoundTiesEven, &[x.into()]), |x| x.round_ties_even()),
             ];
             for (name, build, f) in exact {
                 // `-` and `abs` change only the sign bit, NaNs included.

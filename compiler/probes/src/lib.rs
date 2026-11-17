@@ -618,7 +618,7 @@ pub fn lookup(values: &mut [u8], table: &[u8]) {
     }
 }
 
-/// Explicit SIMD can't be expressed in the kernel.
+/// SSE's square root of lane 0, which the kernel now translates.
 #[cfg(target_arch = "x86_64")]
 pub fn simd_roots(values: &mut [f32]) {
     use std::arch::x86_64::{_mm_cvtss_f32, _mm_set_ss, _mm_sqrt_ss};
@@ -1260,6 +1260,187 @@ pub fn enum_table(values: &mut [u32]) {
 pub fn enum_unwrap(values: &mut [u32], divisor: u32) {
     for value in values {
         *value = value.checked_div(divisor).unwrap();
+    }
+}
+
+// SIMD (code generation): `std::arch` vectors and intrinsics, portable lane
+// operations, x86 instructions with exact definitions, and runtime CPU
+// feature detection, which follows the host's answer.
+
+use std::arch::x86_64::*;
+
+/// SSE arithmetic, shuffles and a horizontal sum.
+pub fn sse_dot(values: &mut [f32]) {
+    for value in values {
+        // SAFETY: SSE and SSE2 are part of x86_64.
+        unsafe {
+            let x = _mm_set1_ps(*value);
+            let scaled = _mm_add_ps(_mm_mul_ps(x, _mm_set_ps(4.0, 3.0, 2.0, 1.0)), _mm_set1_ps(0.5));
+            let high = _mm_movehl_ps(scaled, scaled);
+            let pairs = _mm_add_ps(scaled, high);
+            let odd = _mm_shuffle_ps::<0b01>(pairs, pairs);
+            *value = _mm_cvtss_f32(_mm_add_ss(pairs, odd));
+        }
+    }
+}
+
+/// x86's `min` (the second operand for NaN or two zeros), a comparison
+/// mask, and the mask's sign bits.
+pub fn sse_min_mask(values: &mut [u32]) {
+    for value in values {
+        // SAFETY: SSE is part of x86_64.
+        unsafe {
+            let x = _mm_set1_ps(f32::from_bits(*value));
+            let limits = _mm_set_ps(f32::NAN, -0.0, 1.0, -1.0);
+            let low = _mm_min_ps(x, limits);
+            let below = _mm_cmplt_ps(x, limits);
+            let unordered = _mm_cmpunord_ps(x, limits);
+            let picked = _mm_and_ps(low, below);
+            let bits = _mm_movemask_ps(below) | (_mm_movemask_ps(unordered) << 4);
+            *value = _mm_cvtss_f32(picked).to_bits() ^ (bits as u32) ^ _mm_cvtss_f32(_mm_movehl_ps(low, low)).to_bits();
+        }
+    }
+}
+
+/// Float to integer conversions: rounded to nearest even and truncated,
+/// with `i32::MIN` for NaN and out of range.
+pub fn sse_convert(values: &mut [u32]) {
+    for value in values {
+        // SAFETY: SSE2 is part of x86_64.
+        unsafe {
+            let x = f32::from_bits(*value);
+            let lanes = _mm_set_ps(x + 0.5, -x, x * 2.0, x);
+            let rounded = _mm_cvtps_epi32(lanes);
+            let truncated = _mm_cvttps_epi32(lanes);
+            let mixed = _mm_xor_si128(rounded, _mm_slli_epi32::<1>(truncated));
+            let folded = _mm_add_epi32(mixed, _mm_srli_si128::<8>(mixed));
+            let folded = _mm_add_epi32(folded, _mm_srli_si128::<4>(folded));
+            *value = _mm_cvtsi128_si32(folded) as u32 ^ (_mm_cvttss_si32(lanes) as u32).rotate_left(7);
+        }
+    }
+}
+
+/// Integer lanes: high multiplies, multiply-add, saturating packs and sums
+/// of absolute differences.
+pub fn sse_integers(values: &mut [u32]) {
+    for value in values {
+        // SAFETY: SSE2 is part of x86_64.
+        unsafe {
+            let x = _mm_set1_epi32(*value as i32);
+            let y = _mm_set_epi16(-32768, 32767, -1, 7, 300, -300, 12345, -12345);
+            let high = _mm_mulhi_epi16(x, y);
+            let high_unsigned = _mm_mulhi_epu16(x, y);
+            let summed = _mm_madd_epi16(x, y);
+            let packed = _mm_packs_epi16(summed, high);
+            let packed_unsigned = _mm_packus_epi16(high_unsigned, summed);
+            let sad = _mm_sad_epu8(packed, packed_unsigned);
+            let shifted = _mm_sra_epi16(high, _mm_set_epi64x(0, i64::from(*value % 20)));
+            let all = _mm_xor_si128(_mm_xor_si128(sad, shifted), _mm_add_epi32(packed, packed_unsigned));
+            let folded = _mm_xor_si128(all, _mm_srli_si128::<8>(all));
+            let folded = _mm_xor_si128(folded, _mm_srli_si128::<4>(folded));
+            *value = _mm_cvtsi128_si32(folded) as u32;
+        }
+    }
+}
+
+/// A mix of common SSE2 instructions: saturating adds, averages, unpacks,
+/// byte compares and their mask, shuffles, conversions, shifts by a
+/// register, and scalar compares.
+pub fn sse_mix(values: &mut [u32]) {
+    for value in values {
+        // SAFETY: SSE and SSE2 are part of x86_64.
+        unsafe {
+            let v = *value;
+            let x = _mm_set1_epi32(v as i32);
+            let y = _mm_set_epi32(0x7F80_FF01, -1, 0x0102_0304, i32::MIN);
+            let saturated = _mm_adds_epu8(x, y);
+            let signed = _mm_subs_epi16(x, y);
+            let average = _mm_avg_epu8(x, y);
+            let unpacked = _mm_unpacklo_epi8(saturated, average);
+            let equal = _mm_cmpeq_epi8(_mm_and_si128(x, y), y);
+            let mask = _mm_movemask_epi8(equal) as u32;
+            let shuffled = _mm_shuffle_epi32::<0b00_01_10_11>(_mm_xor_si128(unpacked, signed));
+            let shifted = _mm_sll_epi32(shuffled, _mm_cvtsi32_si128((v % 40) as i32));
+            let right = _mm_srl_epi64(shifted, _mm_cvtsi32_si128((v % 70) as i32));
+            let floats = _mm_cvtepi32_ps(right);
+            let doubles = _mm_set_pd(f64::from(f32::from_bits(v)), f64::from(v) * -0.75);
+            let narrowed = _mm_cvtpd_epi32(doubles);
+            let compared = _mm_cmpneq_ps(floats, _mm_set1_ps(f32::from_bits(v)));
+            let ordered = _mm_cmpord_pd(doubles, doubles);
+            let scalar = _mm_cmpge_ss(floats, _mm_set_ss(0.0));
+            let all = _mm_xor_si128(_mm_castps_si128(compared), _mm_castpd_si128(ordered));
+            let all = _mm_xor_si128(all, _mm_add_epi32(narrowed, _mm_castps_si128(scalar)));
+            let folded = _mm_xor_si128(all, _mm_srli_si128::<8>(all));
+            let folded = _mm_xor_si128(folded, _mm_srli_si128::<4>(folded));
+            let truncated = _mm_cvttsd_si64(doubles) as u32;
+            *value = _mm_cvtsi128_si32(folded) as u32 ^ mask ^ truncated.rotate_left(13);
+        }
+    }
+}
+
+#[target_feature(enable = "ssse3")]
+fn reverse_ssse3(x: u32) -> u32 {
+    let bytes = _mm_set1_epi32(x as i32);
+    let order = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3);
+    _mm_cvtsi128_si32(_mm_shuffle_epi8(bytes, order)) as u32
+}
+
+/// Runtime detection: SSSE3's byte shuffle where the host has it, and a
+/// different result where it doesn't, so the GPU must follow the host.
+pub fn detect_shuffle(values: &mut [u32]) {
+    for value in values {
+        *value = if is_x86_feature_detected!("ssse3") {
+            // SAFETY: the host has SSSE3.
+            unsafe { reverse_ssse3(*value) }
+        } else {
+            value.swap_bytes() ^ 1
+        };
+    }
+}
+
+#[target_feature(enable = "f16c")]
+fn half_bits_f16c(x: f32) -> u32 {
+    let converted = _mm_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(_mm_set_ss(x));
+    _mm_cvtsi128_si32(converted) as u32 & 0xFFFF
+}
+
+/// F16C's float-to-half conversion where the host has it, rounding to
+/// nearest even and quieting NaNs.
+pub fn detect_f16c(values: &mut [u32]) {
+    for value in values {
+        let x = f32::from_bits(*value);
+        *value = if is_x86_feature_detected!("f16c") {
+            // SAFETY: the host has F16C.
+            unsafe { half_bits_f16c(x) }
+        } else {
+            u32::from(half::f16::from_f32(x).to_bits()) | 0x1_0000
+        };
+    }
+}
+
+/// Pointer casts: a view whose numbers line up (an array as an array of
+/// pairs), and a read that reassembles bytes (four `u16`s as a `u64`).
+pub fn pointer_views(values: &mut [u64]) {
+    for value in values {
+        let mut halves = [*value as u16, (*value >> 16) as u16, (*value >> 32) as u16, (*value >> 48) as u16];
+        // SAFETY: both are 8 bytes of plain integers; `read_unaligned`
+        // needs no alignment.
+        let whole = unsafe { core::ptr::read_unaligned(&halves as *const [u16; 4] as *const u64) };
+        // SAFETY: `[[u16; 2]; 2]` has the layout of `[u16; 4]`.
+        let pairs = unsafe { &mut *(&mut halves as *mut [u16; 4] as *mut [[u16; 2]; 2]) };
+        pairs[1][0] ^= 0xFF;
+        *value = whole.rotate_left(8) ^ u64::from(halves[2]);
+    }
+}
+
+/// A write through a pointer to data of another type, which the kernel
+/// refuses.
+pub fn pointer_write(values: &mut [u64]) {
+    for value in values {
+        let mut halves = [0u16; 4];
+        // SAFETY: both are 8 bytes of plain integers.
+        unsafe { core::ptr::write_unaligned(&mut halves as *mut [u16; 4] as *mut u64, *value) };
+        *value = u64::from(halves[1]);
     }
 }
 
