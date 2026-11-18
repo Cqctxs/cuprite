@@ -37,7 +37,7 @@ use std::{
 };
 
 use cuprite_kernel::{description::Description, Ty};
-use cuprite_memory::{Arg, Element, GpuMemory, Grid, MapStep, MemoryConfig};
+use cuprite_memory::{Arg, GpuMemory, Grid, MapStep, MemoryConfig};
 
 use policy::{Choice, HostKey, Policy, Profile};
 
@@ -195,13 +195,20 @@ fn described(text: &'static str) -> Read {
 
 /// Runs the kernel `description` describes over `values`, in place, with
 /// `args`: the bits of its scalar arguments, zero- or sign-extended, in the
-/// order of the description's `scalars`. A repeated kernel's first argument
-/// is its pass count.
+/// order of the description's `scalars`, then the address and length of
+/// each other slice it names: the other outputs, the inputs and the tables.
+/// A repeated kernel's first argument is its pass count.
 ///
 /// Returns [`DONE`] if the GPU did the work. Anything else means the caller
-/// must run its CPU body, then pass the value to [`finished`]. `values` is
-/// unchanged unless this returns `DONE`.
-pub fn map_slice<T: Element>(values: &mut [T], description: &'static str, args: &[u64]) -> u64 {
+/// must run its CPU body, then pass the value to [`finished`]. No slice is
+/// changed unless this returns `DONE`.
+///
+/// # Safety
+/// `T` must have no padding and accept any bits, as the description's
+/// first output layout says. Each address and length in `args` must be a
+/// slice of the element its layout or table type describes, borrowed for
+/// the whole call, mutably for the outputs, which must not overlap.
+pub unsafe fn map_slice<T>(values: &mut [T], description: &'static str, args: &[u64]) -> u64 {
     let described = described(description);
     let (function, passes) = match &*described {
         Ok(d) if d.description.repeated => {
@@ -211,7 +218,8 @@ pub fn map_slice<T: Element>(values: &mut [T], description: &'static str, args: 
         Err(_) => ("(unreadable kernel)", 0),
     };
     let outcome = match &*described {
-        Ok(d) => dispatch(values, d, args, passes),
+        // SAFETY: passed on from the caller.
+        Ok(d) => unsafe { dispatch(values, d, args, passes) },
         Err(reason) => Err(Decline::Failed(format!("kernel description: {reason}"))),
     };
     let counter = if outcome.is_ok() {
@@ -286,7 +294,10 @@ pub fn finished(token: u64) {
 /// Runs the call on the GPU if the mode and policy say so: `Ok` with the
 /// policy's choice (`None` when the GPU is forced), or `Err` with why the
 /// CPU must run it.
-fn dispatch<T: Element>(
+///
+/// # Safety
+/// As for [`map_slice`].
+unsafe fn dispatch<T>(
     values: &mut [T],
     described: &Described,
     args: &[u64],
@@ -301,35 +312,33 @@ fn dispatch<T: Element>(
     }
     let description = &described.description;
     let scalar_count = description.scalars.len();
-    let slices = description.inputs.len() + description.tables.len();
-    if description.element.bytes() as usize != size_of::<T>() || args.len() != scalar_count + 2 * slices {
+    let others = description.outputs.len() - 1;
+    let slices = others + description.inputs.len() + description.tables.len();
+    if description.outputs[0].size as usize != size_of::<T>() || args.len() != scalar_count + 2 * slices {
         return Err(Decline::Failed("the call doesn't match its kernel".into()));
     }
     let (scalars, slice_parts) = args.split_at(scalar_count);
     let slice_parts = slice_parts.as_chunks::<2>().0;
+    let (output_parts, slice_parts) = slice_parts.split_at(others);
     let (input_parts, table_parts) = slice_parts.split_at(description.inputs.len());
-    let bytes = |parts: &[[u64; 2]], types: &[Ty]| -> Vec<&[u8]> {
-        parts
-            .iter()
-            .zip(types)
-            .map(|(parts, ty)| {
-                // SAFETY: the rewritten function passes the address and
-                // length of a `&[_]` parameter of this element type, which
-                // it borrows for the whole call.
-                unsafe {
-                    std::slice::from_raw_parts(
-                        std::ptr::with_exposed_provenance::<u8>(parts[0] as usize),
-                        parts[1] as usize * ty.bytes() as usize,
-                    )
-                }
-            })
-            .collect()
-    };
-    let inputs = bytes(input_parts, &description.inputs);
-    let tables: Vec<(&[u8], u64)> =
-        bytes(table_parts, &description.tables).into_iter().zip(table_parts.iter().map(|parts| parts[1])).collect();
     // Like `zip`, the shortest slice decides how many elements change.
-    let len = input_parts.iter().map(|parts| parts[1] as usize).fold(values.len(), usize::min);
+    let len = output_parts.iter().chain(input_parts).map(|parts| parts[1] as usize).fold(values.len(), usize::min);
+    let address = |parts: &[u64; 2]| std::ptr::with_exposed_provenance_mut::<u8>(parts[0] as usize);
+    // SAFETY (for each view below): the caller passes `values` and the
+    // address and length of each other slice of the element its layout or
+    // table type describes, borrowed for the whole call, mutably and
+    // without overlap for the outputs. Elements have no padding, so every
+    // byte is initialized, and accept any bytes written back.
+    let read = |parts: &[u64; 2], size: usize| unsafe { std::slice::from_raw_parts(address(parts), parts[1] as usize * size) };
+    let mut outputs: Vec<&mut [u8]> =
+        vec![unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), size_of_val(values)) }];
+    for (parts, layout) in output_parts.iter().zip(&description.outputs[1..]) {
+        outputs.push(unsafe { std::slice::from_raw_parts_mut(address(parts), parts[1] as usize * layout.size as usize) });
+    }
+    let inputs: Vec<&[u8]> =
+        input_parts.iter().zip(&description.inputs).map(|(parts, layout)| read(parts, layout.size as usize)).collect();
+    let tables: Vec<(&[u8], u64)> =
+        table_parts.iter().zip(&description.tables).map(|(parts, ty)| (read(parts, ty.bytes() as usize), parts[1])).collect();
     if len == 0 || passes == 0 {
         return Err(Decline::NoWork);
     }
@@ -373,7 +382,7 @@ fn dispatch<T: Element>(
         Device::Untried => unreachable!("opened above"),
     };
     let start = Instant::now();
-    let committed = run_kernel(memory, values, description, scalars, &inputs, &tables, len).map_err(Decline::Failed)?;
+    let committed = run_kernel(memory, outputs, description, scalars, &inputs, &tables, len).map_err(Decline::Failed)?;
     // The first region after opening also allocates for the first time,
     // which the profile already counts as startup.
     if let (Some(profile), false) = (profile, opening) {
@@ -392,12 +401,12 @@ fn dispatch<T: Element>(
     Ok(choice)
 }
 
-/// One launch of a described in-place map over the first `len` elements,
-/// committed only if it all works and no check failed. Returns whether it
-/// committed.
-fn run_kernel<T: Element>(
+/// One launch of a described in-place map over the first `len` elements of
+/// each slice, committed only if it all works and no check failed. Returns
+/// whether it committed.
+fn run_kernel(
     memory: &mut GpuMemory,
-    values: &mut [T],
+    outputs: Vec<&mut [u8]>,
     description: &Description,
     scalars: &[u64],
     inputs: &[&[u8]],
@@ -421,9 +430,13 @@ fn run_kernel<T: Element>(
     }
     let mut flag = [0u32];
     let mut job = memory.job().map_err(|e| e.to_string())?;
-    let data = job.in_out(values).map_err(|e| e.to_string())?;
+    let mut buffers = Vec::new();
+    for output in outputs {
+        buffers.push(job.in_out(output).map_err(|e| e.to_string())?);
+    }
     let flag_buffer = job.in_out(&mut flag).map_err(|e| e.to_string())?;
-    let mut launch_args = vec![Arg::Buffer(data), Arg::U64(len as u64), Arg::Buffer(flag_buffer)];
+    let mut launch_args = vec![Arg::Buffer(buffers[0]), Arg::U64(len as u64), Arg::Buffer(flag_buffer)];
+    launch_args.extend(buffers[1..].iter().map(|&buffer| Arg::Buffer(buffer)));
     for input in inputs {
         launch_args.push(Arg::Buffer(job.input(input).map_err(|e| e.to_string())?));
     }
@@ -493,13 +506,14 @@ mod tests {
     // The mode and profile are read once per process, and test binaries set
     // neither, so this exercises the policy without a profile. The driver's
     // integration tests cover the GPU paths in real rewritten programs.
-    const REPEATED: &str = "cuprite kernel 3\nfunction a::repeat\nentry a__repeat\nelement u32\ninputs\ntables\n\
+    const REPEATED: &str = "cuprite kernel 4\nfunction a::repeat\nentry a__repeat\noutputs u32\ninputs\ntables\n\
                             repeated yes\nscalars u32\nptx\n(not reached)";
 
     #[test]
     fn without_a_profile_values_are_left_for_the_cpu() {
         let mut values = vec![1u32, 2, 3];
-        assert_eq!(map_slice(&mut values, REPEATED, &[2]), UNTIMED);
+        // SAFETY: `u32` accepts any bits, and the kernel names no other slice.
+        assert_eq!(unsafe { map_slice(&mut values, REPEATED, &[2]) }, UNTIMED);
         assert_eq!(values, [1, 2, 3]);
         assert!(counts().1 >= 1);
         finished(UNTIMED);
@@ -508,7 +522,8 @@ mod tests {
     #[test]
     fn unreadable_descriptions_leave_values_for_the_cpu() {
         let mut values = vec![1u32, 2, 3];
-        assert_eq!(map_slice(&mut values, "cuprite kernel 99\n", &[]), UNTIMED);
+        // SAFETY: as above; the description isn't even read.
+        assert_eq!(unsafe { map_slice(&mut values, "cuprite kernel 99\n", &[]) }, UNTIMED);
         assert_eq!(values, [1, 2, 3]);
         let described = described(REPEATED);
         assert_eq!(described.as_ref().as_ref().unwrap().description.function, "a::repeat");

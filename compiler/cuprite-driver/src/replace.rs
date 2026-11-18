@@ -27,8 +27,8 @@
 use std::sync::OnceLock;
 
 use cuprite_kernel::{
-    builder::Builder, description::Description, llvm::Llvm, ptx, shapes, BinOp as KBinOp, Const, Function,
-    Kernel, Ty as KTy,
+    builder::Builder, description::Description, layout::Layout, llvm::Llvm, ptx, shapes, BinOp as KBinOp, Const,
+    Function, Kernel, Ty as KTy,
 };
 use rustc_abi::FieldIdx;
 use rustc_hir::def::DefKind;
@@ -49,7 +49,7 @@ use rustc_span::{
 
 use crate::{
     analyze::{self, Verdict},
-    translate::{self, Feature, Leaf},
+    translate::{self, Feature, Leaf, Slice},
 };
 
 pub(crate) const VAR: &str = "CUPRITE_REPLACE";
@@ -102,14 +102,14 @@ pub(crate) fn parse(spec: &str) -> Result<Vec<Replacement>, String> {
 
 /// What a rewritten function runs on the GPU.
 struct Job {
-    element: KTy,
+    /// The slices written, the first parameter first.
+    outputs: Vec<Slice>,
     /// Applied to each element in order.
     stages: Vec<Function>,
     /// For a repeated map, how many times.
     passes: Option<Passes>,
-    /// Read-only slice parameters zipped with the slice, and their element
-    /// types.
-    inputs: Vec<(Local, KTy)>,
+    /// Read-only slice parameters zipped with the slice.
+    inputs: Vec<Slice>,
     /// Read-only slice parameters the code indexes, and their element types.
     tables: Vec<(Local, KTy)>,
     /// Numbers read from the other parameters, passed as the stages'
@@ -145,7 +145,7 @@ pub(crate) fn optimized_mir<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tc
     let manual = settings.replacements.iter().find(|r| r.path == path).map(|replacement| {
         check_signature(tcx, def_id, replacement);
         Job {
-            element: KTy::U32,
+            outputs: vec![Slice { param: Local::from_usize(1), layout: Layout::number(KTy::U32), paths: vec![Vec::new()] }],
             stages: vec![multiply_add(&path, replacement.mul, replacement.add)],
             passes: Some(replacement.passes),
             inputs: Vec::new(),
@@ -159,7 +159,7 @@ pub(crate) fn optimized_mir<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tc
         }
         Some(match analyze::verdict(tcx, def_id)? {
             Verdict::Candidate(map) => Job {
-                element: map.element,
+                outputs: map.outputs,
                 stages: vec![map.function],
                 passes: None,
                 inputs: map.inputs,
@@ -167,7 +167,7 @@ pub(crate) fn optimized_mir<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tc
                 scalars: map.scalars,
             },
             Verdict::Repeated(maps, passes) => Job {
-                element: maps[0].element,
+                outputs: maps[0].outputs.clone(),
                 stages: maps.into_iter().map(|map| map.function).collect(),
                 passes: Some(passes),
                 inputs: Vec::new(),
@@ -197,8 +197,9 @@ pub(crate) fn optimized_mir<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tc
 fn describe(tcx: TyCtxt<'_>, path: &str, job: &Job) -> String {
     let entry = shapes::entry_name(path);
     let stages: Vec<&Function> = job.stages.iter().collect();
-    let inputs: Vec<KTy> = job.inputs.iter().map(|&(_, ty)| ty).collect();
-    let kernel = shapes::in_place_map(&entry, job.element, &inputs, &stages, job.passes.is_some())
+    let outputs: Vec<Layout> = job.outputs.iter().map(|slice| slice.layout.clone()).collect();
+    let inputs: Vec<Layout> = job.inputs.iter().map(|slice| slice.layout.clone()).collect();
+    let kernel = shapes::in_place_map(&entry, &outputs, &inputs, &stages, job.passes.is_some())
         .unwrap_or_else(|invalid| tcx.dcx().fatal(format!("cuprite: building the kernel for `{path}`: {invalid}")));
     let mut scalars = Vec::new();
     if job.passes.is_some() {
@@ -208,7 +209,7 @@ fn describe(tcx: TyCtxt<'_>, path: &str, job: &Job) -> String {
     Description {
         function: path.to_owned(),
         entry,
-        element: job.element,
+        outputs,
         inputs,
         tables: job.tables.iter().map(|&(_, ty)| ty).collect(),
         repeated: job.passes.is_some(),
@@ -384,7 +385,8 @@ impl<'tcx> Prologue<'_, 'tcx> {
         self.place_bits(place, ty)
     }
 
-    /// An input slice's address and length, each as a `u64`.
+    /// A slice's address, exposed for the runtime (writable for a `&mut`
+    /// slice), and length, each as a `u64`.
     fn slice_parts(&mut self, param: Local) -> [Operand<'tcx>; 2] {
         let tcx = self.tcx;
         let ty = self.body.local_decls[param].ty;
@@ -392,8 +394,16 @@ impl<'tcx> Prologue<'_, 'tcx> {
         let ty::Slice(element) = slice.kind() else { unreachable!("an input is a slice reference") };
         let (u64_ty, usize_ty) = (tcx.types.u64, tcx.types.usize);
         let place = Place::from(param).project_deeper(&[ProjectionElem::Deref], tcx);
-        let raw = self.assign(Ty::new_imm_ptr(tcx, *slice), Rvalue::RawPtr(RawPtrKind::Const, place));
-        let element_ptr_ty = Ty::new_imm_ptr(tcx, *element);
+        let (raw, element_ptr_ty) = match ty.ref_mutability() {
+            Some(ty::Mutability::Mut) => (
+                self.assign(Ty::new_mut_ptr(tcx, *slice), Rvalue::RawPtr(RawPtrKind::Mut, place)),
+                Ty::new_mut_ptr(tcx, *element),
+            ),
+            _ => (
+                self.assign(Ty::new_imm_ptr(tcx, *slice), Rvalue::RawPtr(RawPtrKind::Const, place)),
+                Ty::new_imm_ptr(tcx, *element),
+            ),
+        };
         let thin = self.assign(element_ptr_ty, Rvalue::Cast(CastKind::PtrToPtr, Operand::Copy(Place::from(raw)), element_ptr_ty));
         let address = self.assign(
             usize_ty,
@@ -484,7 +494,8 @@ fn rewrite<'tcx>(
     for leaf in &job.scalars {
         bits.push(prologue.leaf_bits(leaf));
     }
-    for &(param, _) in job.inputs.iter().chain(&job.tables) {
+    let slices = job.outputs[1..].iter().chain(&job.inputs).map(|slice| slice.param);
+    for param in slices.chain(job.tables.iter().map(|&(param, _)| param)) {
         bits.extend(prologue.slice_parts(param));
     }
     let u64_ty = tcx.types.u64;

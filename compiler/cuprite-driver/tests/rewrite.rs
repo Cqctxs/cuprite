@@ -27,7 +27,7 @@ fn only_the_named_function_is_rewritten_and_the_cpu_body_still_runs() {
     let repeat = probes.mir("repeat", "optimized");
     // The kernel's description is embedded (MIR prints its newlines as
     // `\n`), and the pass count passed.
-    let call = r#"cuprite_runtime::map_slice::<u32>(copy _1, const "cuprite kernel 3\nfunction cuprite_probes::repeat\n"#;
+    let call = r#"cuprite_runtime::map_slice::<u32>(copy _1, const "cuprite kernel 4\nfunction cuprite_probes::repeat\n"#;
     assert!(repeat.contains(call), "{repeat}");
     assert!(repeat.contains("= copy _2 as u64 (IntToInt);"), "{repeat}");
     // The CPU body reports when it finishes, and nothing else returns

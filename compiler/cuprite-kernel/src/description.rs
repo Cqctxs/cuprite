@@ -3,10 +3,10 @@
 //! entry point and signature, and holds its PTX.
 //!
 //! ```text
-//! cuprite kernel 3
+//! cuprite kernel 4
 //! function cuprite_probes::scale
 //! entry cuprite_probes__scale
-//! element f32
+//! outputs f32 16=0:f64,8:f64
 //! inputs u8
 //! tables u32
 //! repeated no
@@ -15,28 +15,32 @@
 //! <PTX until the end>
 //! ```
 //!
-//! The kernel is [`crate::shapes::in_place_map`]. The call passes the
-//! bits of each scalar in `scalars`, then the address and length of each
-//! input slice, whose element types `inputs` lists. The runtime passes the
-//! data, the shortest length, a zeroed `u32` failure flag, the input
-//! pointers, then the stages' scalars: a pointer and length for each
-//! table (a read-only slice the code indexes, whose element types `tables`
-//! lists, passed like an input after them), then `scalars`. It discards the
-//! results if the flag is set. With
+//! The kernel is [`crate::shapes::in_place_map`]. `outputs` and `inputs`
+//! are the [`Layout`]s of the slices it writes and reads, element by
+//! element. The call passes the first output slice itself, then the bits
+//! of each scalar in `scalars`, then the address and length of each other
+//! output slice and each input slice. The runtime passes the first output,
+//! the shortest length, a zeroed `u32` failure flag, the other outputs'
+//! and the inputs' pointers, then the stages' scalars: a pointer and
+//! length for each table (a read-only slice the code indexes, whose
+//! element types `tables` lists, passed like an input after them), then
+//! `scalars`. It discards the results if the flag is set. With
 //! `repeated yes`, the first scalar is the pass count, a `u32`.
 
-use crate::Ty;
+use crate::{layout::Layout, Ty};
 
-const HEADER: &str = "cuprite kernel 3";
+const HEADER: &str = "cuprite kernel 4";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Description {
     /// The Rust function, for traces and reports.
     pub function: String,
     pub entry: String,
-    pub element: Ty,
-    /// The element types of the read-only slices zipped with the data.
-    pub inputs: Vec<Ty>,
+    /// The slices the kernel writes, element by element, the first being
+    /// the one the call passes.
+    pub outputs: Vec<Layout>,
+    /// The read-only slices zipped with the outputs.
+    pub inputs: Vec<Layout>,
     /// The element types of the read-only slices the code indexes.
     pub tables: Vec<Ty>,
     pub repeated: bool,
@@ -47,12 +51,13 @@ pub struct Description {
 
 impl Description {
     pub fn encode(&self) -> String {
+        let layouts = |layouts: &[Layout]| layouts.iter().map(Layout::encode).collect::<Vec<_>>().join(" ");
         format!(
-            "{HEADER}\nfunction {}\nentry {}\nelement {}\ninputs {}\ntables {}\nrepeated {}\nscalars {}\nptx\n{}",
+            "{HEADER}\nfunction {}\nentry {}\noutputs {}\ninputs {}\ntables {}\nrepeated {}\nscalars {}\nptx\n{}",
             self.function,
             self.entry,
-            self.element.name(),
-            names(&self.inputs),
+            layouts(&self.outputs),
+            layouts(&self.inputs),
             names(&self.tables),
             if self.repeated { "yes" } else { "no" },
             names(&self.scalars),
@@ -74,17 +79,12 @@ impl Description {
         field(HEADER)?;
         let function = field("function")?.to_owned();
         let entry = field("entry")?.to_owned();
-        let element = field("element")?;
-        let element = Ty::from_name(element)
-            .filter(|ty| (ty.is_int() || ty.is_float()) && ty.bits() <= 64)
-            .ok_or_else(|| format!("unknown element type `{element}`"))?;
-        let inputs = field("inputs")?
-            .split_whitespace()
-            .map(|name| match Ty::from_name(name) {
-                Some(ty) if (ty.is_int() || ty.is_float()) && ty.bits() <= 64 => Ok(ty),
-                _ => Err(format!("`{name}` is not an input element type")),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let layouts = |line: &str| line.split_whitespace().map(Layout::decode).collect::<Result<Vec<_>, _>>();
+        let outputs = layouts(field("outputs")?)?;
+        if outputs.is_empty() {
+            return Err("a kernel writes at least one slice".into());
+        }
+        let inputs = layouts(field("inputs")?)?;
         let tables = field("tables")?
             .split_whitespace()
             .map(|name| match Ty::from_name(name) {
@@ -109,7 +109,7 @@ impl Description {
         }
         field("ptx")?;
         let ptx = lines.next().unwrap_or_default().to_owned();
-        Ok(Description { function, entry, element, inputs, tables, repeated, scalars, ptx })
+        Ok(Description { function, entry, outputs, inputs, tables, repeated, scalars, ptx })
     }
 }
 
@@ -125,8 +125,8 @@ mod tests {
         Description {
             function: "a::scale".into(),
             entry: "a__scale".into(),
-            element: Ty::F32,
-            inputs: vec![Ty::U8, Ty::F64],
+            outputs: vec![Layout::number(Ty::F32), Layout { size: 16, leaves: vec![(0, Ty::F64), (8, Ty::F64)] }],
+            inputs: vec![Layout::number(Ty::U8), Layout::number(Ty::F64)],
             tables: vec![Ty::U32],
             repeated: true,
             scalars: vec![Ty::U32, Ty::F32, Ty::I64],
@@ -137,8 +137,16 @@ mod tests {
     #[test]
     fn descriptions_survive_encoding() {
         let description = sample();
+        assert!(description.encode().contains("\noutputs f32 16=0:f64,8:f64\n"));
         assert_eq!(Description::decode(&description.encode()).unwrap(), description);
-        let plain = Description { repeated: false, inputs: Vec::new(), tables: Vec::new(), scalars: Vec::new(), ..sample() };
+        let plain = Description {
+            outputs: vec![Layout::number(Ty::I16)],
+            repeated: false,
+            inputs: Vec::new(),
+            tables: Vec::new(),
+            scalars: Vec::new(),
+            ..sample()
+        };
         assert_eq!(Description::decode(&plain.encode()).unwrap(), plain);
     }
 
@@ -146,10 +154,12 @@ mod tests {
     fn malformed_descriptions_are_refused() {
         let text = sample().encode();
         for (from, to) in [
-            ("cuprite kernel 3", "cuprite kernel 2"),
-            ("element f32", "element f16"),
+            ("cuprite kernel 4", "cuprite kernel 3"),
+            ("outputs f32", "outputs f16"),
+            ("outputs f32 16=0:f64,8:f64", "outputs"),
+            ("16=0:f64,8:f64", "16=0:f64"),
             ("inputs u8", "inputs bool"),
-            ("element f32", "element u128"),
+            ("outputs f32", "outputs u128"),
             ("inputs u8", "inputs i128"),
             ("tables u32", "tables ptr"),
             ("inputs u8 f64\n", "\n"),

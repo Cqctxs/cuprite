@@ -9,11 +9,46 @@ use support::{run, text, Probes, NO_PROFILE};
 
 /// Verdicts that do not depend on the build profile.
 const COMMON: &[(&str, &str)] = &[
+    ("struct_checked", "candidate: map over `[(u32, u32)]` also writing `counts`"),
+    ("<Flagged as std::clone::Clone>::clone", "rejected: takes `&Flagged`, not a `&mut` slice"),
+    ("<Flagged as std::cmp::PartialEq>::eq", "rejected: takes `&Flagged`, not a `&mut` slice"),
+    ("<Flagged as std::fmt::Debug>::fmt", "rejected: takes `&Flagged`, not a `&mut` slice"),
+    ("<Padded as std::clone::Clone>::clone", "rejected: takes `&Padded`, not a `&mut` slice"),
+    ("<Padded as std::cmp::PartialEq>::eq", "rejected: takes `&Padded`, not a `&mut` slice"),
+    ("<Padded as std::fmt::Debug>::fmt", "rejected: takes `&Padded`, not a `&mut` slice"),
+    ("<Particle as std::clone::Clone>::clone", "rejected: takes `&Particle`, not a `&mut` slice"),
+    ("<Particle as std::cmp::PartialEq>::eq", "rejected: takes `&Particle`, not a `&mut` slice"),
+    ("<Particle as std::fmt::Debug>::fmt", "rejected: takes `&Particle`, not a `&mut` slice"),
+    ("<Vec3 as std::clone::Clone>::clone", "rejected: takes `&Vec3`, not a `&mut` slice"),
+    ("<Vec3 as std::cmp::PartialEq>::eq", "rejected: takes `&Vec3`, not a `&mut` slice"),
+    ("<Vec3 as std::fmt::Debug>::fmt", "rejected: takes `&Vec3`, not a `&mut` slice"),
+    ("<Widths as std::clone::Clone>::clone", "rejected: takes `&Widths`, not a `&mut` slice"),
+    ("<Widths as std::cmp::PartialEq>::eq", "rejected: takes `&Widths`, not a `&mut` slice"),
+    ("<Widths as std::fmt::Debug>::fmt", "rejected: takes `&Widths`, not a `&mut` slice"),
+    ("struct_array_loop", "rejected: calls `<&mut [f32; 3] as std::iter::IntoIterator>::into_iter`, which reinterprets bits as `std::ptr::NonNull<[f32]>` (a transmute)"),
+    ("struct_each", "candidate: map over `[Vec3]` reading `scale`"),
+    ("struct_flagged", "rejected: iterates over `[Flagged]`, whose element holds `bool`"),
+    ("struct_lengths", "candidate: map over `[f32]` zipped with `vectors`"),
+    ("struct_mixed", "candidate: map over `[Widths]`"),
+    ("struct_one_field", "candidate: map over `[Particle]`"),
+    ("struct_padded", "rejected: iterates over `[Padded]`, whose element has padding"),
+    ("struct_par", "candidate: map over `[Vec3]` also writing `norms`"),
+    ("struct_particles", "candidate: map over `[Particle]` reading `dt`"),
+    ("struct_pixels", "candidate: map over `[[u8; 4]]` reading `amount`"),
+    ("struct_read_second", "candidate: map over `[f64]` also writing `other`"),
+    ("struct_replace", "candidate: map over `[Vec3]`"),
+    ("struct_simulate", "candidate: `struct_step` over `[Particle]`, repeated `steps` times"),
+    ("struct_split", "candidate: map over `[f32]` also writing `ys` zipped with `vectors`"),
+    ("struct_step", "candidate: map over `[Particle]`"),
+    ("struct_table", "rejected: takes `table`, a slice of `Vec3`, without zipping it; only slices of numbers can be indexed"),
+    ("struct_three", "candidate: map over `[u32]` also writing `b`, `c`"),
+    ("struct_tuples", "candidate: map over `[(u32, f32)]`"),
+    ("struct_unused_output", "rejected: takes `other` as a `&mut` slice without iterating it alongside the first"),
     ("noise_fbm", "rejected: takes `&noise::Fbm<noise::Perlin>` as `fbm`, which a kernel can't take"),
     ("noise_grid", "rejected: iterates over something other than the slice parameter"),
     ("noise_grid_rayon", "rejected: iterates over something other than the slice parameter"),
     ("bf16_round_trip", "candidate: map over `[f32]`"),
-    ("clamp_unit", "rejected: takes `&mut f32`, not a `&mut` slice of numbers"),
+    ("clamp_unit", "rejected: takes `&mut f32`, not a `&mut` slice"),
     ("each_affine", "candidate: map over `[u32]`"),
     ("each_counter", "rejected: passes `for_each` a closure that changes what it captures, which carries a value from one element to the next"),
     ("each_function", "candidate: map over `[f32]`"),
@@ -23,7 +58,7 @@ const COMMON: &[(&str, &str)] = &[
     ("par_saxpy", "candidate: map over `[f32]` zipped with `x` reading `a`"),
     ("apply_once", "rejected: is generic"),
     ("apply_twice", "rejected: is generic"),
-    ("halve", "rejected: takes `f32`, not a `&mut` slice of numbers"),
+    ("halve", "rejected: takes `f32`, not a `&mut` slice"),
     ("closure_affine", "candidate: map over `[f32]` reading `scale`, `offset`"),
     ("closure_counter", "candidate: map over `[u32]`"),
     ("closure_generic", "candidate: map over `[f32]` reading `add`"),
@@ -33,8 +68,8 @@ const COMMON: &[(&str, &str)] = &[
     ("closure_pair", "candidate: map over `[u32]` reading `other`"),
     ("closure_table", "candidate: map over `[u32]` indexing `table`"),
     ("function_item", "candidate: map over `[f32]`"),
-    ("<Adjust as std::clone::Clone>::clone", "rejected: takes `&Adjust`, not a `&mut` slice of numbers"),
-    ("Scale::apply", "rejected: takes `&Scale`, not a `&mut` slice of numbers"),
+    ("<Adjust as std::clone::Clone>::clone", "rejected: takes `&Adjust`, not a `&mut` slice"),
+    ("Scale::apply", "rejected: takes `&Scale`, not a `&mut` slice"),
     ("add_bytes", "candidate: map over `[u8]` reading `amount`"),
     ("add_into", "candidate: map over `[u32]` zipped with `a`, `b`"),
     ("add_pairs", "candidate: map over `[u32]` zipped with `a`, `b`"),
@@ -43,7 +78,7 @@ const COMMON: &[(&str, &str)] = &[
     ("affine_chain", "candidate: map over `[u32]`"),
     ("apply", "rejected: takes `fn(u32) -> u32` as `f`, which a kernel can't take"),
     ("asserted_halves", "candidate: map over `[u32]`"),
-    ("bump", "rejected: takes `&mut f32`, not a `&mut` slice of numbers"),
+    ("bump", "rejected: takes `&mut f32`, not a `&mut` slice"),
     ("bump_twice", "candidate: map over `[f32]`"),
     ("checked_increment", "candidate: map over `[u32]`"),
     ("clamp", "candidate: map over `[u32]`"),
@@ -52,7 +87,7 @@ const COMMON: &[(&str, &str)] = &[
     ("conditional_scale", "candidate: map over `[f32]` reading `double`"),
     ("count_halvings", "rejected: calls `halvings`, which calls `halvings` recursively"),
     ("counted", "rejected: reads a static that can change (`CALLS`)"),
-    ("counted_calls", "rejected: takes no parameters; the first must be a `&mut` slice of numbers"),
+    ("counted_calls", "rejected: takes no parameters; the first must be a `&mut` slice"),
     ("cross_dot", "candidate: map over `[f32]`"),
     ("damp", "candidate: map over `[f32]`"),
     ("div_mod", "candidate: map over `[i32]` reading `divisor`"),
@@ -61,14 +96,14 @@ const COMMON: &[(&str, &str)] = &[
     ("fill", "candidate: map over `[u32]`"),
     ("float_rem", "rejected: uses `%` on floats, which has no exact GPU version yet"),
     ("generic_twice", "candidate: map over `[f32]`"),
-    ("halves", "rejected: takes `u32`, not a `&mut` slice of numbers"),
-    ("halvings", "rejected: takes `u32`, not a `&mut` slice of numbers"),
+    ("halves", "rejected: takes `u32`, not a `&mut` slice"),
+    ("halvings", "rejected: takes `u32`, not a `&mut` slice"),
     ("hash_bytes", "candidate: map over `[u8]` reading `seed`"),
-    ("invert", "rejected: takes `&mut [bool]`, not a `&mut` slice of numbers"),
+    ("invert", "rejected: iterates over `[bool]`, whose element holds `bool`"),
     ("levels", "candidate: map over `[u8]`"),
     ("lookup", "candidate: map over `[u8]` indexing `table`"),
     ("lookup_wrapped", "candidate: map over `[f32]` indexing `table`"),
-    ("minimum", "rejected: takes `&[u32]`, not a `&mut` slice of numbers"),
+    ("minimum", "rejected: takes `&[u32]`, not a `&mut` slice"),
     ("mix_wide", "candidate: map over `[i64]` reading `shift`, `bias`"),
     ("ni_div_floor", "candidate: map over `[i32]` reading `divisor`"),
     ("ni_gcd", "candidate: map over `[u32]` reading `other`"),
@@ -86,9 +121,9 @@ const COMMON: &[(&str, &str)] = &[
     ("transmute_halves", "candidate: map over `[u32]`"),
     ("transmute_struct", "candidate: map over `[u64]`"),
     // Enums.
-    ("<Op as std::clone::Clone>::clone", "rejected: takes `&Op`, not a `&mut` slice of numbers"),
-    ("area", "rejected: takes `Shape`, not a `&mut` slice of numbers"),
-    ("checked_half", "rejected: takes `u32`, not a `&mut` slice of numbers"),
+    ("<Op as std::clone::Clone>::clone", "rejected: takes `&Op`, not a `&mut` slice"),
+    ("area", "rejected: takes `Shape`, not a `&mut` slice"),
+    ("checked_half", "rejected: takes `u32`, not a `&mut` slice"),
     ("enum_char", "candidate: map over `[u32]`"),
     ("enum_inner_for", "candidate: map over `[u32]`"),
     ("enum_iter_sum", "candidate: map over `[u32]`"),
@@ -102,8 +137,8 @@ const COMMON: &[(&str, &str)] = &[
     // SIMD.
     ("detect_f16c", "candidate: map over `[u32]` with the host's CPU features"),
     ("detect_shuffle", "candidate: map over `[u32]` with the host's CPU features"),
-    ("half_bits_f16c", "rejected: takes `f32`, not a `&mut` slice of numbers"),
-    ("reverse_ssse3", "rejected: takes `u32`, not a `&mut` slice of numbers"),
+    ("half_bits_f16c", "rejected: takes `f32`, not a `&mut` slice"),
+    ("reverse_ssse3", "rejected: takes `u32`, not a `&mut` slice"),
     ("sse_convert", "candidate: map over `[u32]`"),
     ("sse_dot", "candidate: map over `[f32]`"),
     ("sse_integers", "candidate: map over `[u32]`"),
@@ -161,7 +196,7 @@ const COMMON: &[(&str, &str)] = &[
     ("scaled", "candidate: map over `[f64]`"),
     ("scene_distances", "candidate: map over `[f32]`"),
     ("simd_roots", "candidate: map over `[f32]`"),
-    ("smooth", "rejected: takes `&[u32]`, not a `&mut` slice of numbers"),
+    ("smooth", "rejected: takes `&[u32]`, not a `&mut` slice"),
     ("soft_root", "candidate: map over `[f64]`"),
     ("square", "candidate: map over `[u32]`"),
     ("square_wide", "candidate: map over `[i64]`"),
@@ -171,7 +206,7 @@ const COMMON: &[(&str, &str)] = &[
     ("transform_indexed", "rejected: calls `core::slice::<impl [u32]>::len`, which has no GPU summary"),
     ("transform_iter_mut", "candidate: map over `[u32]`"),
     ("transform_rayon", "candidate: map over `[u32]`"),
-    ("triple", "rejected: takes `u32`, not a `&mut` slice of numbers"),
+    ("triple", "rejected: takes `u32`, not a `&mut` slice"),
     ("twice", "rejected: is generic"),
     ("two_loops", "rejected: contains more than one loop"),
     ("two_stores", "candidate: map over `[u32]`"),
@@ -182,13 +217,31 @@ const COMMON: &[(&str, &str)] = &[
     ("vector_lengths", "candidate: map over `[f32]`"),
     ("weighted", "candidate: map over `[f64]` zipped with `weights`"),
     ("with_helper", "candidate: map over `[u32]`"),
-    ("wrapping_sum", "rejected: takes `&[u32]`, not a `&mut` slice of numbers"),
+    ("wrapping_sum", "rejected: takes `&[u32]`, not a `&mut` slice"),
+    // Held out after the five census steps.
+    ("kurbo_affine_points", "candidate: map over `[kurbo::Point]`"),
+    ("kurbo_lerp_points", "candidate: map over `[kurbo::Point]`"),
+    ("dasp_gain", "candidate: map over `[i16]` reading `gain`"),
+    ("dasp_to_float", "candidate: map over `[f32]` zipped with `samples`"),
+    ("dasp_to_i16", "candidate: map over `[i16]` zipped with `samples`"),
+    ("dasp_u8_to_i16", "candidate: map over `[i16]` zipped with `samples`"),
+    ("kurbo_affine", "candidate: map over `[f64]` also writing `ys`"),
+    ("kurbo_cubic", "candidate: map over `[f64]` also writing `ys`"),
+    ("kurbo_inside", "candidate: map over `[u8]` zipped with `xs`, `ys`"),
+    ("kurbo_length", "candidate: map over `[f64]` zipped with `ys`"),
+    ("oorandom_64", "candidate: map over `[u64]`"),
+    ("oorandom_draws", "candidate: map over `[u32]`"),
+    ("oorandom_float", "candidate: map over `[f32]` zipped with `seeds`"),
+    ("oorandom_range", "candidate: map over `[u32]`"),
+    ("xxh3_keys", "rejected: calls `xxhash_rust::xxh3::xxh3_64`, which makes a function pointer (`for<'a, 'b> fn(&'a [u8], u64, &'b [u8]) -> u64`)"),
 ];
 
 /// rustc inlines differently in debug and release builds, which changes
 /// where some refusals are found.
 const DEBUG: &[(&str, &str)] = &[
     ("sr_div_rem", "candidate: map over `[u64]` reading `divisor`"),
+    ("xxh32_keys", "rejected: calls `xxhash_rust::xxh32::xxh32`, which calls `xxhash_rust::utils::get_unaligned_chunk::<u32>`, which calls `core::slice::<impl [u8]>::as_ptr`, which converts a pointer to `*const u8`"),
+    ("xxh64_keys", "rejected: calls `xxhash_rust::xxh64::xxh64`, which calls `xxhash_rust::utils::get_unaligned_chunk::<u64>`, which calls `core::slice::<impl [u8]>::as_ptr`, which converts a pointer to `*const u8`"),
     ("noise_row", "rejected: calls `noise::Perlin::new`, which calls `noise::permutationtable::PermutationTable::new`, which calls `<rand_xorshift::XorShiftRng as rand_core::SeedableRng>::from_seed`, which calls `rand_core::le::read_u32_into`, which calls `core::slice::<impl [u32]>::iter_mut`, which calls `std::slice::IterMut::<'_, u32>::new`, which reinterprets bits as `std::ptr::NonNull<[u32]>` (a transmute)"),
     ("half_decode", "rejected: calls `<{closure} as std::ops::FnMut<((&mut f32, &u16),)>>::call_mut`, which calls `half::f16::to_f32`, which calls `half::binary16::arch::f16_to_f32`, which calls `half::binary16::arch::x86::f16_to_f32_x86_f16c`, which calls `std::arch::x86_64::_mm_cvtph_ps`, which uses `f16`, a number the kernel doesn't have"),
     ("half_encode", "candidate: map over `[u16]` zipped with `values` with the host's CPU features"),
@@ -205,6 +258,8 @@ const DEBUG: &[(&str, &str)] = &[
 ];
 const RELEASE: &[(&str, &str)] = &[
     ("sr_div_rem", "candidate: map over `[u64]` reading `divisor`"),
+    ("xxh32_keys", "rejected: calls `xxhash_rust::xxh32::xxh32`, which converts a pointer to `*const std::ptr::Unaligned<u32>`"),
+    ("xxh64_keys", "rejected: calls `xxhash_rust::xxh64::xxh64`, which converts a pointer to `*const std::ptr::Unaligned<u64>`"),
     ("noise_row", "rejected: calls `noise::Perlin::new`, which calls `noise::permutationtable::PermutationTable::new`, which calls `<rand_xorshift::XorShiftRng as rand_core::SeedableRng>::from_seed`, which calls `rand_core::le::read_u32_into`, which reinterprets bits as `std::ptr::NonNull<[u32]>` (a transmute)"),
     ("half_decode", "rejected: calls `<{closure} as std::ops::FnMut<((&mut f32, &u16),)>>::call_mut`, which calls `half::binary16::arch::x86::f16_to_f32_x86_f16c`, which uses `f16`, a number the kernel doesn't have"),
     ("half_encode", "candidate: map over `[u16]` zipped with `values` with the host's CPU features"),
@@ -300,7 +355,7 @@ fn checks(name: &'static str, release: bool) -> std::path::PathBuf {
 const FAILED_CHECK: &str = "-> cpu (a check failed on the GPU)";
 
 /// Runtime calls the checks program makes.
-const CHECK_CALLS: usize = 35;
+const CHECK_CALLS: usize = 37;
 
 /// Calls whose checks pass keep the GPU's results; calls where one fails
 /// fall back to the CPU, which panics with the same message and leaves the
@@ -317,7 +372,7 @@ const CHECK_CALLS: usize = 35;
     ignore = "needs an NVIDIA GPU; enable the gpu-tests feature"
 )]
 fn failed_checks_on_the_gpu_behave_like_the_cpu() {
-    for (name, release, failed) in [("checks-debug", false, 16), ("checks-release", true, 13)] {
+    for (name, release, failed) in [("checks-debug", false, 17), ("checks-release", true, 14)] {
         let trace = run(&checks(name, release), true, &[]);
         let calls = trace.lines().filter(|line| line.starts_with("cuprite: ")).count();
         assert_eq!(calls, CHECK_CALLS, "{name}:\n{trace}");
@@ -343,10 +398,10 @@ fn differential(name: &'static str) -> std::path::PathBuf {
 }
 
 /// Runtime calls the differential program makes with `passes` passes, for
-/// each of its 10 lengths (`probes/src/bin/candidates.rs`): 5 repeated maps
-/// with 13 passes (3 multiply-adds, `repeat_helper` and `repeat_damp`),
-/// and `repeat_fixed` with 4.
-const REGIONS: [(u32, usize); 2] = [(13, 5), (4, 1)];
+/// each of its 10 lengths (`probes/src/bin/candidates.rs`): 6 repeated maps
+/// with 13 passes (3 multiply-adds, `repeat_helper`, `repeat_damp` and
+/// `struct_simulate`), and `repeat_fixed` with 4.
+const REGIONS: [(u32, usize); 2] = [(13, 6), (4, 1)];
 const LENGTHS: usize = 10;
 
 #[test]
@@ -390,7 +445,12 @@ fn rewritten_candidates_match_the_cpu_on_the_gpu() {
     // runtime feature detection, and `half`'s `half_encode`; and
     // `pointer_views`, reading through pointer casts. Then 4 with 128-bit
     // integers, and 14 with the exact intrinsics, and the held-out
-    // `sr_div_rem` with 4 divisors.
+    // `sr_div_rem` with 4 divisors. Then the held-out round after the census
+    // steps: 4 maps with `dasp_sample`, 2 with `kurbo` and 4 with `oorandom`.
+    // Then `kurbo`'s maps over two slices (one zipped with a slice 3
+    // shorter) and over slices of `Point`. Then 14 maps over slices of
+    // structs, tuples and arrays, and over several `&mut` slices, one of
+    // them `struct_simulate` with 13 passes.
     let with_work = LENGTHS - 3;
     let gpu_calls = 9 * non_empty + 3 * 2 * non_empty + non_empty + (7 + 5 + 8 + 3) * non_empty
         + 2 * 2 * non_empty
@@ -404,7 +464,11 @@ fn rewritten_candidates_match_the_cpu_on_the_gpu() {
         + (9 + 1) * non_empty
         + 4 * non_empty
         + 14 * non_empty
-        + 4 * non_empty;
+        + 4 * non_empty
+        + 10 * non_empty
+        + 3 * non_empty
+        + with_work
+        + 14 * non_empty;
     assert_eq!(trace.matches("-> gpu").count(), gpu_calls, "{trace}");
     for (passes, functions) in REGIONS {
         let calls = trace.matches(&format!("passes={passes} -> gpu")).count();

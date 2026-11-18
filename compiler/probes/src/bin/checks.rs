@@ -46,6 +46,12 @@ macro_rules! exact {
 }
 exact!(u8, u32, u64, i32, i64);
 
+impl Same for (u32, u32) {
+    fn same(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
 impl Same for f32 {
     fn same(&self, other: &Self) -> bool {
         self.to_bits() == other.to_bits() || self.is_nan() && other.is_nan()
@@ -279,6 +285,29 @@ fn main() {
             *value = base.mix(target, *value).green;
         }
     }));
+
+    // Struct elements and a second output, with a zero count failing one
+    // element's division after its first field is written: on the GPU,
+    // neither slice may change, so the CPU's run leaves what it always did.
+    let pairs: Vec<(u32, u32)> = words.iter().map(|&w| (w.wrapping_mul(2_654_435_761), w ^ 0xABCD)).collect();
+    for (name, zero_at) in [("struct_checked", None), ("struct_checked, a zero count", Some(70_000))] {
+        let mut counts: Vec<u32> = (0..LEN as u32).map(|i| i % 13 + 1).collect();
+        if let Some(at) = zero_at {
+            counts[at] = 0;
+        }
+        let (mut got_counts, mut want_counts) = (counts.clone(), counts);
+        count(check(name, &pairs, |v| probes::struct_checked(v, &mut got_counts), |v| {
+            for (pair, count) in v.iter_mut().zip(want_counts.iter_mut()) {
+                pair.0 = pair.0.wrapping_add(1);
+                pair.1 /= *count;
+                *count += 1;
+            }
+        }));
+        if let Some(index) = got_counts.iter().zip(&want_counts).position(|(a, b)| a != b) {
+            eprintln!("{name}: count {index} is {} but should be {}", got_counts[index], want_counts[index]);
+            std::process::exit(1);
+        }
+    }
 
     println!("{} outcomes match ({passed} returned, {panicked} panicked)", passed + panicked);
 }

@@ -81,6 +81,33 @@
 //! the bytes as the type read, as `transmute` would, and writing through it
 //! is refused.
 //!
+//! # Exact intrinsics
+//!
+//! Intrinsics with one exact result are built from kernel operations in
+//! [`Translator::exact`]: `round` (ties away from zero) from `trunc`,
+//! `copysign` on the bits, IEEE `minimum`/`maximum` (NaN wins, `-0 < +0`),
+//! `bitreverse` by mask swaps and a byte swap, funnel shifts, carry-less
+//! products by unrolled shifts and xors, `carrying_mul_add` at double width,
+//! and `float_to_int_unchecked` as a saturating cast (its inputs are in
+//! range, so the result is the same). Hints are answered without effect:
+//! `is_val_statically_known` is `false`, `black_box` is a copy, prefetches
+//! do nothing. Whole values are moved slot by slot (`select_unpredictable`,
+//! `typed_swap_nonoverlapping`) or compared in 8-byte chunks (`raw_eq`).
+//! The `assert_*_valid` checks are asked of the compiler: a type that
+//! passes emits nothing, and one that fails always panics, so it is refused.
+//!
+//! # Slices of structs, and several outputs
+//!
+//! A map's slices may hold numbers, or structs, tuples and arrays of them
+//! with no padding ([`slice`]). Each slice's element is a [`Layout`]: its
+//! numbers' offsets, in the order [`Translator::fresh`] nests them. The
+//! element function takes every number of each written slice's element,
+//! then of each read slice's, rebuilds the elements as values of their
+//! types, runs the loop body on them, and returns the written slices'
+//! numbers. The kernel loads and stores them at their offsets
+//! (`shapes::in_place_map`). Other `&mut` slices zipped with the first are
+//! written the same way; the runtime commits all of them or none.
+//!
 //! Supported values: integers, floats, `bool` and `char`, structs, tuples,
 //! arrays, enums and SIMD vectors of them, closures, with references to any
 //! of those.
@@ -95,7 +122,7 @@
 use std::collections::{HashMap, HashSet};
 
 use cuprite_kernel::{
-    builder::Builder, BinOp as KBinOp, BlockId, Const, Function, Intrinsic, Local as KLocal, Operand as KOperand,
+    builder::Builder, layout::Layout, BinOp as KBinOp, BlockId, Const, Function, Intrinsic, Local as KLocal, Operand as KOperand,
     Rvalue as KRvalue, Ty as KTy, UnOp as KUnOp,
 };
 use rustc_middle::{
@@ -277,12 +304,96 @@ pub(crate) fn leaves<'tcx>(tcx: TyCtxt<'tcx>, param: Local, ty: Ty<'tcx>) -> Res
     Ok(found.into_iter().map(|(fields, ty)| Leaf { param, deref, fields, ty, feature: None }).collect())
 }
 
-/// What a `for` loop's iterator yields: the element, a value of a
-/// read-only input slice, or a pair of those, from `zip`.
+/// A slice parameter a map iterates, and where the numbers of its element
+/// sit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Slice {
+    pub(crate) param: Local,
+    pub(crate) layout: Layout,
+    /// For each of the layout's numbers, the field indices from the element
+    /// to it, as `Translator::fresh` nests its slots.
+    pub(crate) paths: Vec<Vec<usize>>,
+}
+
+/// The element type of a slice reference.
+pub(crate) fn slice_element(ty: Ty<'_>) -> Option<Ty<'_>> {
+    match ty.kind() {
+        ty::Ref(_, inner, _) => match inner.kind() {
+            ty::Slice(element) => Some(*element),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A slice parameter's element layout: a number, or a struct, tuple or
+/// array of numbers with no padding, whose bytes can move between the CPU
+/// and the GPU as they are. The numbers are in the order `fresh` nests
+/// them.
+pub(crate) fn slice<'tcx>(tcx: TyCtxt<'tcx>, param: Local, element: Ty<'tcx>) -> Result<Slice> {
+    fn walk<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        ty: Ty<'tcx>,
+        offset: u64,
+        path: &mut Vec<usize>,
+        out: &mut Vec<(u64, KTy, Vec<usize>)>,
+    ) -> Result<()> {
+        if let Some(kernel) = kernel_ty(ty).filter(|kernel| *kernel != KTy::Bool) {
+            out.push((offset, kernel, path.clone()));
+            return Ok(());
+        }
+        let aggregate = match ty.kind() {
+            ty::Tuple(_) | ty::Array(..) => true,
+            ty::Adt(adt, _) => adt.is_struct() && !adt.is_box() && !adt.repr().simd(),
+            _ => false,
+        };
+        if !aggregate {
+            return Err(format!("holds `{ty}`"));
+        }
+        let layout = tcx
+            .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
+            .map_err(|_| format!("holds `{ty}`, which has no layout"))?;
+        for (index, field) in fields_of(tcx, ty)?.into_iter().enumerate() {
+            path.push(index);
+            walk(tcx, field, offset + layout.fields.offset(index).bytes(), path, out)?;
+            path.pop();
+            if out.len() > MAX_LEAVES {
+                return Err(format!("holds more than {MAX_LEAVES} numbers"));
+            }
+        }
+        Ok(())
+    }
+    let refusal = |reason: String| format!("iterates over `[{element}]`, whose element {reason}");
+    let mut found = Vec::new();
+    walk(tcx, element, 0, &mut Vec::new(), &mut found).map_err(refusal)?;
+    let size = tcx
+        .layout_of(TypingEnv::fully_monomorphized().as_query_input(element))
+        .map_err(|_| refusal("has no layout".into()))?
+        .size
+        .bytes();
+    let to_u32 = |value: u64| u32::try_from(value).map_err(|_| refusal("is too large".into()));
+    let mut leaves = Vec::new();
+    let mut paths = Vec::new();
+    for (offset, ty, path) in found {
+        leaves.push((to_u32(offset)?, ty));
+        paths.push(path);
+    }
+    let layout = Layout { size: to_u32(size)?, leaves };
+    if layout.leaves.is_empty() {
+        return Err(refusal("holds no numbers".into()));
+    }
+    // Every number is aligned in a Rust value; what can fail is coverage.
+    layout.validate().map_err(|_| refusal("has padding".into()))?;
+    Ok(Slice { param, layout, paths })
+}
+
+/// What a `for` loop's iterator yields: an element of a slice the loop
+/// writes, a value of a read-only input slice, or a pair of those, from
+/// `zip`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Lane {
-    /// `&mut` to the current element of the slice parameter.
-    Element,
+    /// `&mut` to the current element of this `&mut` slice parameter.
+    Output(Local),
     /// `&` to the current element of this input slice parameter.
     Input(Local),
     Pair(Box<Lane>, Box<Lane>),
@@ -292,7 +403,7 @@ impl Lane {
     /// The input slices, in the order the tuple names them.
     pub(crate) fn inputs(&self, out: &mut Vec<Local>) {
         match self {
-            Lane::Element => {}
+            Lane::Output(_) => {}
             Lane::Input(local) => out.push(*local),
             Lane::Pair(a, b) => {
                 a.inputs(out);
@@ -301,11 +412,15 @@ impl Lane {
         }
     }
 
-    pub(crate) fn elements(&self) -> usize {
+    /// The slices written, in the order the tuple names them.
+    pub(crate) fn outputs(&self, out: &mut Vec<Local>) {
         match self {
-            Lane::Element => 1,
-            Lane::Input(_) => 0,
-            Lane::Pair(a, b) => a.elements() + b.elements(),
+            Lane::Output(local) => out.push(*local),
+            Lane::Input(_) => {}
+            Lane::Pair(a, b) => {
+                a.outputs(out);
+                b.outputs(out);
+            }
         }
     }
 }
@@ -574,8 +689,10 @@ pub(crate) struct Loop<'a, 'tcx> {
     pub(crate) iteration: Iteration<'a, 'tcx>,
     /// What the iterator yields.
     pub(crate) lane: &'a Lane,
-    /// The input slices `lane` reads, in order, and their element types.
-    pub(crate) inputs: &'a [(Local, KTy)],
+    /// The slices `lane` writes, the function's first parameter first.
+    pub(crate) outputs: &'a [Slice],
+    /// The input slices `lane` reads, in order.
+    pub(crate) inputs: &'a [Slice],
     /// The read-only slices the code indexes, and their element types.
     pub(crate) tables: &'a [(Local, KTy)],
     /// The numbers the kernel receives from the other parameters.
@@ -643,7 +760,6 @@ pub(crate) fn translate<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     name: &str,
-    element: KTy,
     shape: &Loop<'_, 'tcx>,
 ) -> Result<Translated> {
     let (loop_blocks, setup) = match &shape.iteration {
@@ -663,18 +779,20 @@ pub(crate) fn translate<'tcx>(
         }
     };
 
-    let mut params = vec![element];
-    params.extend(shape.inputs.iter().map(|&(_, ty)| ty));
+    // Each written and read slice's element numbers, then the tables, then
+    // the other parameters' numbers.
+    let iterated: Vec<&Slice> = shape.outputs.iter().chain(shape.inputs).collect();
+    let mut params: Vec<KTy> = iterated.iter().flat_map(|slice| slice.layout.types()).collect();
+    let numbers = params.len();
     for _ in shape.tables {
         params.extend([KTy::Ptr, KTy::U64]);
     }
     params.extend(shape.leaves.iter().map(Leaf::passed));
-    let (mut b, kernel_params) = Builder::new(name, &params);
-    let value = b.copy(kernel_params[0]);
+    let (b, kernel_params) = Builder::new(name, &params);
     let mut translator = Translator {
         tcx,
         b,
-        element: value,
+        elements: HashSet::new(),
         stores: false,
         stack: Vec::new(),
         written: HashSet::new(),
@@ -686,17 +804,38 @@ pub(crate) fn translate<'tcx>(
     for &local in shape.opaque {
         slots.insert(local, Slot::Opaque);
     }
-    // The values of the input slices this iteration reads.
-    let inputs: HashMap<Local, KLocal> =
-        shape.inputs.iter().zip(&kernel_params[1..]).map(|(&(local, _), &param)| (local, param)).collect();
-    // The other parameters, rebuilt from their numbers.
+    // This iteration's element of each iterated slice, as a value of its
+    // type, its numbers copied from the parameters. The written slices'
+    // numbers are the function's results.
+    let mut elements: HashMap<Local, Slot> = HashMap::new();
+    let mut results = Vec::new();
+    let mut next_param = kernel_params[..numbers].iter();
+    for (position, slice) in iterated.iter().enumerate() {
+        let element = slice_element(body.local_decls[slice.param].ty).expect("an iterated slice");
+        let tree = translator.fresh(element)?;
+        for path in &slice.paths {
+            let mut slot = &tree;
+            for &index in path {
+                let Slot::Fields(fields) = slot else { unreachable!("paths follow the type") };
+                slot = &fields[index];
+            }
+            let Slot::Scalar(local) = slot else { unreachable!("paths end at numbers") };
+            translator.b.set(*local, KRvalue::Use((*next_param.next().expect("a parameter per number")).into()));
+            if position < shape.outputs.len() {
+                results.push(*local);
+            }
+        }
+        elements.insert(slice.param, tree);
+    }
+    translator.elements = results.iter().copied().collect();
     // The tables, as their address and length.
-    let table_params = &kernel_params[1 + shape.inputs.len()..1 + shape.inputs.len() + 2 * shape.tables.len()];
+    let table_params = &kernel_params[numbers..numbers + 2 * shape.tables.len()];
     for (&(local, element), pair) in shape.tables.iter().zip(table_params.as_chunks::<2>().0) {
         let slice = Slot::Slice { pointer: pair[0], len: pair[1], element };
         slots.insert(local, Slot::Ref(Box::new(slice)));
     }
-    let leaf_params = &kernel_params[1 + shape.inputs.len() + 2 * shape.tables.len()..];
+    // The other parameters, rebuilt from their numbers.
+    let leaf_params = &kernel_params[numbers + 2 * shape.tables.len()..];
     let mut by_param: Vec<(Local, Vec<(&Leaf, KLocal)>)> = Vec::new();
     for (leaf, &param) in shape.leaves.iter().zip(leaf_params) {
         if let Some(feature) = leaf.feature {
@@ -737,7 +876,7 @@ pub(crate) fn translate<'tcx>(
         let slot = if is_ref(ty) { Slot::Ref(Box::new(tree)) } else { tree };
         slots.insert(param, slot);
     }
-    let item = lane_slot(shape.lane, value, &inputs);
+    let item = lane_slot(shape.lane, &elements);
     if let Iteration::For { option, .. } = &shape.iteration {
         slots.insert(option.local, Slot::Some(Box::new(item.clone())));
     }
@@ -761,7 +900,7 @@ pub(crate) fn translate<'tcx>(
     let features = std::mem::take(&mut translator.wanted);
     let function = translator
         .b
-        .finish_function(Some(value))
+        .finish_function(results)
         .map_err(|invalid| format!("translated into an invalid kernel ({invalid})"))?;
     blocks.retain(|block| !shape.chain.contains(block));
     Ok(Translated { function, blocks, stores, leaves: shape.leaves.to_vec(), features })
@@ -804,9 +943,8 @@ pub(crate) fn element_data<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, depth: usize) 
 /// handles everything it does (with every call inlined), else the first
 /// refusal.
 pub(crate) fn check_function<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, body: &Body<'tcx>) -> Result<()> {
-    let (mut b, _) = Builder::new("coverage", &[]);
-    let element = b.local(KTy::U32);
-    let mut translator = Translator { tcx, b, element, stores: false, stack: vec![def_id], written: HashSet::new(), features: Vec::new(), wanted: Vec::new() };
+    let (b, _) = Builder::new("coverage", &[]);
+    let mut translator = Translator { tcx, b, elements: HashSet::new(), stores: false, stack: vec![def_id], written: HashSet::new(), features: Vec::new(), wanted: Vec::new() };
     let mut slots = HashMap::new();
     for param in (1..=body.arg_count).map(Local::from_usize) {
         let ty = body.local_decls[param].ty;
@@ -824,13 +962,12 @@ pub(crate) fn check_function<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, body: &Body
         .map_err(|invalid| format!("translated into an invalid kernel ({invalid})"))
 }
 
-/// The slot for what the iterator yields: references to the element and
-/// to this iteration's input values, paired as `zip` pairs them.
-fn lane_slot(lane: &Lane, element: KLocal, inputs: &HashMap<Local, KLocal>) -> Slot {
+/// The slot for what the iterator yields: references to this iteration's
+/// element of each slice, paired as `zip` pairs them.
+fn lane_slot(lane: &Lane, elements: &HashMap<Local, Slot>) -> Slot {
     match lane {
-        Lane::Element => Slot::Ref(Box::new(Slot::Scalar(element))),
-        Lane::Input(local) => Slot::Ref(Box::new(Slot::Scalar(inputs[local]))),
-        Lane::Pair(a, b) => Slot::Fields(vec![lane_slot(a, element, inputs), lane_slot(b, element, inputs)]),
+        Lane::Output(local) | Lane::Input(local) => Slot::Ref(Box::new(elements[local].clone())),
+        Lane::Pair(a, b) => Slot::Fields(vec![lane_slot(a, elements), lane_slot(b, elements)]),
     }
 }
 
@@ -1060,8 +1197,8 @@ struct Frame<'a, 'tcx> {
 struct Translator<'tcx> {
     tcx: TyCtxt<'tcx>,
     b: Builder,
-    /// The element's current value.
-    element: KLocal,
+    /// The numbers of the elements the loop writes, as they are now.
+    elements: HashSet<KLocal>,
     stores: bool,
     /// The functions being inlined, innermost last.
     stack: Vec<DefId>,
@@ -1142,7 +1279,7 @@ impl<'tcx> Translator<'tcx> {
     }
 
     fn set(&mut self, local: KLocal, rvalue: KRvalue) {
-        if local == self.element {
+        if self.elements.contains(&local) {
             self.stores = true;
         }
         self.written.insert(local);
@@ -3271,7 +3408,7 @@ impl<'tcx> Translator<'tcx> {
                 self.b.cast(value, to).into()
             }
             ("integer_min" | "integer_max", &[a, b]) => {
-                let op = if name == "integer_min" { KBinOp::Gt } else { KBinOp::Lt };
+                let op = if name == "integer_min" { KBinOp::Lt } else { KBinOp::Gt };
                 let first = self.b.binary(op, a, b);
                 self.b.select(first, a, b).into()
             }

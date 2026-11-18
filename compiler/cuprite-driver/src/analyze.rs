@@ -1,16 +1,19 @@
 //! Recognizer: decides from built MIR whether a function is an in-place map
-//! over a slice of numbers (M2), or a counted loop that repeats such maps
-//! (M3), and translates what the map does to each element into a kernel
-//! element function (`translate`).
+//! over slices (M2), or a counted loop that repeats such maps (M3), and
+//! translates what the map does to each element into a kernel element
+//! function (`translate`).
 //!
-//! - **Maps.** A function `fn(&mut [T], scalars...)`, with `T` a primitive
-//!   number and each scalar an `i32`, `u32`, `i64`, `u64`, `usize`,
-//!   `isize`, `f32` or `f64`, whose body is a single `for` loop over the
-//!   slice (directly or through `iter_mut()`), or a single `for_each` call
-//!   on such an iterator, sequential or Rayon's (`par_iter_mut()`), whose
-//!   closure is the loop body. The loop body may compute anything
-//!   `translate` supports from the element, the scalars and constants, and
-//!   write the element. It may not leave the loop early, and a `for_each`
+//! - **Maps.** A function `fn(&mut [T], params...)` whose body is a single
+//!   `for` loop over the slice (directly or through `iter_mut()`), or a
+//!   single `for_each` call on such an iterator, sequential or Rayon's
+//!   (`par_iter_mut()`), whose closure is the loop body. `T` is a number,
+//!   or a struct, tuple or array of numbers with no padding
+//!   (`translate::slice`), so its bytes can move to the GPU as they are.
+//!   The loop may `zip` the slice with other `&mut` slices, which it then
+//!   writes too, and with read-only slices; it may index read-only slices
+//!   of numbers; and other parameters are plain data. The loop body may
+//!   compute anything `translate` supports from those and constants, and
+//!   write the elements. It may not leave the loop early, and a `for_each`
 //!   closure may not change what it captures.
 //! - **Repeated maps.** A function `fn(&mut [T])` or `fn(&mut [T], u32)`
 //!   whose body is a single `for _ in 0..n` loop, with `n` a constant or the
@@ -49,15 +52,17 @@ use rustc_span::def_id::{LocalDefId, LOCAL_CRATE};
 
 use crate::{
     replace::Passes,
-    translate::{self, Lane, Leaf},
+    translate::{self, Lane, Leaf, Slice},
 };
 
-/// A map's parameters after the slice it changes.
-#[derive(Default)]
+/// A map's parameters.
 struct Params {
-    /// Read-only slices of numbers, which the loop may zip with, and their
-    /// element types.
-    slices: HashMap<Local, KTy>,
+    /// The first parameter, the slice it changes.
+    first: Slice,
+    /// The other `&mut` slices, which the loop may zip with and write.
+    outputs: HashMap<Local, Slice>,
+    /// Read-only slices, which the loop may zip with or index.
+    slices: HashMap<Local, Slice>,
     /// The numbers in every other parameter.
     leaves: Vec<Leaf>,
 }
@@ -70,16 +75,18 @@ const COUNT: Local = Local::from_u32(2);
 pub(crate) const REPORT_VAR: &str = "CUPRITE_REPORT";
 pub(crate) const AUTO_VAR: &str = "CUPRITE_AUTO";
 
-/// One map: what it does to each element of its slice.
+/// One map: what it does to each element of its slices.
 #[derive(Clone, Debug)]
 pub(crate) struct Map {
-    pub(crate) element: KTy,
-    /// Takes the element, then one value of each input, then the numbers
-    /// `scalars` reads (as `Leaf::passed`).
+    /// The slices it writes: the first parameter, then any other `&mut`
+    /// slices zipped with it.
+    pub(crate) outputs: Vec<Slice>,
+    /// Takes the numbers of each output's element, then of each input's,
+    /// then the numbers `scalars` reads (as `Leaf::passed`), and returns
+    /// the outputs' new numbers.
     pub(crate) function: Function,
-    /// Read-only slice parameters zipped with the slice, and their element
-    /// types.
-    pub(crate) inputs: Vec<(Local, KTy)>,
+    /// Read-only slice parameters zipped with the slice.
+    pub(crate) inputs: Vec<Slice>,
     /// Read-only slice parameters the code indexes, and their element types.
     pub(crate) tables: Vec<(Local, KTy)>,
     /// Numbers read from the function's other parameters, in order.
@@ -142,9 +149,9 @@ pub(crate) fn record<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &Body<'t
     if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
         return;
     }
-    // Only functions over a slice of numbers can be candidates; refuse the
-    // rest now, with the signature's reason.
-    let takes_slice = body.arg_count >= 1 && Recognizer::mut_slice_element(body.local_decls[SLICE].ty).is_some();
+    // Only functions over a `&mut` slice can be candidates; refuse the rest
+    // now, with the signature's reason.
+    let takes_slice = body.arg_count >= 1 && Recognizer::is_mut_slice(body.local_decls[SLICE].ty);
     let recorded = if takes_slice {
         Recorded::Saved(SavedBody::save(tcx, body))
     } else {
@@ -194,12 +201,15 @@ pub(crate) fn verdict(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<Verdict> {
 /// Composes a region's callees, each a map over the same slice called with
 /// just the slice: a callee that is itself a region would need its own
 /// pass count.
-fn compose(tcx: TyCtxt<'_>, element: KTy, calls: &[LocalDefId], passes: Passes) -> Verdict {
+fn compose(tcx: TyCtxt<'_>, slice: &Slice, calls: &[LocalDefId], passes: Passes) -> Verdict {
     let mut stages = Vec::new();
     for &callee in calls {
         match verdict(tcx, callee) {
             Some(Verdict::Candidate(map))
-                if map.element == element && map.scalars.is_empty() && map.inputs.is_empty() && map.tables.is_empty() =>
+                if matches!(&map.outputs[..], [output] if output.layout == slice.layout)
+                    && map.scalars.is_empty()
+                    && map.inputs.is_empty()
+                    && map.tables.is_empty() =>
             {
                 stages.push(map)
             }
@@ -218,10 +228,17 @@ fn compose(tcx: TyCtxt<'_>, element: KTy, calls: &[LocalDefId], passes: Passes) 
     }
 }
 
+/// The element type of a function's first parameter, a slice, as Rust
+/// prints it.
+fn element_name(tcx: TyCtxt<'_>, def_id: LocalDefId) -> String {
+    let sig = tcx.fn_sig(def_id).instantiate_identity().skip_binder();
+    sig.inputs().first().and_then(|&ty| translate::slice_element(ty)).map_or_else(String::new, |ty| ty.to_string())
+}
+
 /// Describes a map for the report, such as "map over `[f32]` zipped with
-/// `weights` reading `scale`".
+/// `weights` reading `scale`", or "map over `[f64]` also writing `ys`".
 fn describe_map(tcx: TyCtxt<'_>, def_id: LocalDefId, map: &Map) -> String {
-    let mut text = format!("map over `[{}]`", map.element.name());
+    let mut text = format!("map over `[{}]`", element_name(tcx, def_id));
     let names = |locals: Vec<Local>| -> String {
         let mut seen = Vec::new();
         for local in locals {
@@ -231,8 +248,11 @@ fn describe_map(tcx: TyCtxt<'_>, def_id: LocalDefId, map: &Map) -> String {
         }
         seen.iter().map(|&local| parameter(tcx, def_id, local)).collect::<Vec<_>>().join(", ")
     };
+    if map.outputs.len() > 1 {
+        text += &format!(" also writing {}", names(map.outputs[1..].iter().map(|slice| slice.param).collect()));
+    }
     if !map.inputs.is_empty() {
-        text += &format!(" zipped with {}", names(map.inputs.iter().map(|&(local, _)| local).collect()));
+        text += &format!(" zipped with {}", names(map.inputs.iter().map(|slice| slice.param).collect()));
     }
     if !map.tables.is_empty() {
         text += &format!(" indexing {}", names(map.tables.iter().map(|&(local, _)| local).collect()));
@@ -276,7 +296,7 @@ pub(crate) fn write_report(tcx: TyCtxt<'_>, dir: &Path) {
                     format!(
                         "candidate: {} over `[{}]`, repeated {passes} times",
                         names.join(" then "),
-                        stages[0].element.name()
+                        element_name(tcx, def_id)
                     )
                 }
                 Verdict::Rejected(reason) => format!("rejected: {reason}"),
@@ -359,21 +379,21 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
 
     /// A map: a `for` loop over the slice, or a `for_each` call on it.
     fn recognize_map(&self) -> Result<Map> {
-        let (element, params) = self.check_signature(false)?;
+        let params = self.check_signature(false)?;
         self.check_parameters_unchanged()?;
         let calls = self.check_effects(false)?;
         let has_next = calls.iter().any(|(_, known)| *known == Known::Next);
         let eaches: Vec<BasicBlock> =
             calls.iter().filter(|(_, known)| *known == Known::ForEach).map(|&(block, _)| block).collect();
         if !has_next && !eaches.is_empty() {
-            return self.recognize_each(element, params, &calls, &eaches);
+            return self.recognize_each(params, &calls, &eaches);
         }
         let (header, traced) = self.outer_loop(&calls, &params)?;
         let is_header = |block| self.is_header(block, header.next_block);
         let iteration = translate::Iteration::For { option: header.option, start: header.some, is_header: &is_header };
-        let translated = self.translate_map(element, &params, &traced, iteration)?;
+        let translated = self.translate_map(&params, &traced, iteration)?;
         self.check_rest(&calls, &translated.blocks, &traced.chain, &header)?;
-        self.finish_map(element, traced, translated)
+        self.finish_map(traced, translated)
     }
 
     /// `iterator.for_each(function)`: the iteration calls `function` with
@@ -381,7 +401,6 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
     /// `ParallelIterator::for_each` does. Nothing may follow it.
     fn recognize_each(
         &self,
-        element: KTy,
         params: Params,
         calls: &[(BasicBlock, Known)],
         eaches: &[BasicBlock],
@@ -399,7 +418,7 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         let receiver = Self::operand_local(&iterator.node).ok_or_else(Self::not_slice)?;
         let traced = self.trace(receiver, &params)?;
         let iteration = translate::Iteration::ForEach { block, function: &function.node };
-        let translated = self.translate_map(element, &params, &traced, iteration)?;
+        let translated = self.translate_map(&params, &traced, iteration)?;
         // Every other call builds the iterator, or is in the setup.
         for &(call, known) in calls {
             if call == block || traced.chain.contains(&call) {
@@ -413,35 +432,59 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
             }
         }
         self.check_exit(*after)?;
-        self.finish_map(element, traced, translated)
+        self.finish_map(traced, translated)
     }
 
     fn not_slice() -> String {
         "iterates over something other than the slice parameter".to_string()
     }
 
-    /// What the loop's iterator yields, and the slices it and the code read.
+    /// What the loop's iterator yields, and the slices it and the code read
+    /// and write.
     fn trace(&self, receiver: Local, params: &Params) -> Result<Traced> {
         let mut chain = HashSet::new();
         let mut plumbing = HashSet::from([receiver]);
-        let lane = self.lanes(receiver, &params.slices, &mut chain, &mut plumbing)?;
-        if lane.elements() != 1 {
+        let lane = self.lanes(receiver, params, &mut chain, &mut plumbing)?;
+        let mut output_locals = Vec::new();
+        lane.outputs(&mut output_locals);
+        if output_locals.iter().filter(|&&local| local == SLICE).count() != 1 {
             return Err(Self::not_slice());
         }
+        // Every other `&mut` slice is written element by element, alongside
+        // the first.
+        let mut others: Vec<Local> = params.outputs.keys().copied().collect();
+        others.sort();
+        if let Some(&unused) = others.iter().find(|local| !output_locals.contains(local)) {
+            return Err(format!(
+                "takes {} as a `&mut` slice without iterating it alongside the first",
+                parameter(self.tcx, self.def_id, unused)
+            ));
+        }
+        let outputs: Vec<Slice> = std::iter::once(params.first.clone())
+            .chain(output_locals.iter().filter(|&&local| local != SLICE).map(|local| params.outputs[local].clone()))
+            .collect();
         let mut input_locals = Vec::new();
         lane.inputs(&mut input_locals);
-        let inputs: Vec<(Local, KTy)> = input_locals.iter().map(|local| (*local, params.slices[local])).collect();
+        let inputs: Vec<Slice> = input_locals.iter().map(|local| params.slices[local].clone()).collect();
         // The other slices can be indexed, with bounds checks.
-        let mut tables: Vec<(Local, KTy)> =
-            params.slices.iter().filter(|(local, _)| !input_locals.contains(local)).map(|(&l, &t)| (l, t)).collect();
+        let mut tables = Vec::new();
+        for (&local, slice) in params.slices.iter().filter(|(local, _)| !input_locals.contains(local)) {
+            let Some(element) = slice.layout.as_number() else {
+                return Err(format!(
+                    "takes {}, a slice of `{}`, without zipping it; only slices of numbers can be indexed",
+                    parameter(self.tcx, self.def_id, local),
+                    translate::slice_element(self.body.local_decls[local].ty).expect("a slice parameter")
+                ));
+            };
+            tables.push((local, element));
+        }
         tables.sort_by_key(|&(local, _)| local);
-        let opaque: Vec<Local> = std::iter::once(SLICE).chain(input_locals.iter().copied()).collect();
-        Ok(Traced { lane, chain, plumbing, inputs, tables, opaque })
+        let opaque: Vec<Local> = output_locals.iter().chain(&input_locals).copied().collect();
+        Ok(Traced { lane, chain, plumbing, outputs, inputs, tables, opaque })
     }
 
     fn translate_map(
         &self,
-        element: KTy,
         params: &Params,
         traced: &Traced,
         iteration: translate::Iteration<'_, 'tcx>,
@@ -454,6 +497,7 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
             let shape = translate::Loop {
                 iteration,
                 lane: &traced.lane,
+                outputs: &traced.outputs,
                 inputs: &traced.inputs,
                 tables: &traced.tables,
                 leaves: &leaves,
@@ -461,7 +505,7 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
                 chain: &traced.chain,
                 plumbing: &traced.plumbing,
             };
-            let translated = translate::translate(self.tcx, self.body, &name, element, &shape)?;
+            let translated = translate::translate(self.tcx, self.body, &name, &shape)?;
             let missing: Vec<translate::Feature> = translated
                 .features
                 .iter()
@@ -476,12 +520,12 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         Err("tests different CPU features each time it is translated".into())
     }
 
-    fn finish_map(&self, element: KTy, traced: Traced, translated: translate::Translated) -> Result<Map> {
+    fn finish_map(&self, traced: Traced, translated: translate::Translated) -> Result<Map> {
         if !translated.stores {
             return Err("does not change the slice".into());
         }
         Ok(Map {
-            element,
+            outputs: traced.outputs,
             function: translated.function,
             inputs: traced.inputs,
             tables: traced.tables,
@@ -491,7 +535,7 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
 
     /// A counted loop whose body calls maps of this crate on the slice.
     fn recognize_region(&self) -> Result<Verdict> {
-        let (element, _) = self.check_signature(true)?;
+        let params = self.check_signature(true)?;
         self.check_parameters_unchanged()?;
         let calls = self.check_effects(true)?;
         let header = self.single_loop(&calls, "is not a single counted loop")?;
@@ -500,14 +544,14 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         let mut walked = HashSet::new();
         let callees = self.region_calls(header.some, header.next_block, &mut walked)?;
         self.check_region_rest(&calls, &walked, &[range_setup], &header)?;
-        Ok(compose(self.tcx, element, &callees, passes))
+        Ok(compose(self.tcx, &params.first, &callees, passes))
     }
 
     /// True if the function loops over an integer `Range`, which makes it a
     /// candidate for the repeated-map rule.
     /// Whether a `for` loop iterates over the slice parameter.
     fn iterates_slice(&self) -> bool {
-        let (Ok((_, params)), Ok(calls)) = (self.check_signature(false), self.check_effects(false)) else {
+        let (Ok(params), Ok(calls)) = (self.check_signature(false), self.check_effects(false)) else {
             return false;
         };
         self.outer_loop(&calls, &params).is_ok()
@@ -640,17 +684,18 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         self.check_outside_loop(walked, header.after_next, header.next_block, header.none)
     }
 
-    /// `fn(&mut [T], params...) -> ()` with `T` a primitive number, each
-    /// other parameter a read-only slice of numbers or plain data; or with
-    /// `counted`, `fn(&mut [T])` or `fn(&mut [T], u32)`, the second being the
-    /// pass count. Returns `T` and the other parameters.
-    fn check_signature(&self, counted: bool) -> Result<(KTy, Params)> {
+    /// `fn(&mut [T], params...) -> ()` with `T` a number or a struct, tuple
+    /// or array of numbers with no padding (`translate::slice`), each other
+    /// parameter a slice of such elements or plain data; or with `counted`,
+    /// `fn(&mut [T])` or `fn(&mut [T], u32)`, the second being the pass
+    /// count.
+    fn check_signature(&self, counted: bool) -> Result<Params> {
         if self.tcx.generics_of(self.def_id).count() != 0 {
             return Err("is generic".into());
         }
         let params = self.body.arg_count;
         if params == 0 {
-            return Err("takes no parameters; the first must be a `&mut` slice of numbers".into());
+            return Err("takes no parameters; the first must be a `&mut` slice".into());
         }
         if counted && params > 2 {
             return Err(format!(
@@ -658,25 +703,30 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
             ));
         }
         let param = self.body.local_decls[SLICE].ty;
-        let element = Self::mut_slice_element(param)
-            .ok_or_else(|| format!("takes `{param}`, not a `&mut` slice of numbers"))?;
+        if !Self::is_mut_slice(param) {
+            return Err(format!("takes `{param}`, not a `&mut` slice"));
+        }
+        let first = translate::slice(self.tcx, SLICE, translate::slice_element(param).expect("a slice"))?;
         if counted && params == 2 {
             let count = self.body.local_decls[COUNT].ty;
             if count != self.tcx.types.u32 {
                 return Err(format!("takes `{count}` as its pass count, not `u32`"));
             }
         }
-        let mut found = Params::default();
+        let mut found = Params { first, outputs: HashMap::new(), slices: HashMap::new(), leaves: Vec::new() };
         if !counted {
             for local in (2..=params).map(Local::from_usize) {
                 let ty = self.body.local_decls[local].ty;
-                if let Some(element) = Self::slice_element(ty) {
-                    found.slices.insert(local, element);
+                let cannot = || format!("takes `{ty}` as {}, which a kernel can't take", parameter(self.tcx, self.def_id, local));
+                if let Some(element) = translate::slice_element(ty) {
+                    let slice = translate::slice(self.tcx, local, element).map_err(|_| cannot())?;
+                    match Self::is_mut_slice(ty) {
+                        true => found.outputs.insert(local, slice),
+                        false => found.slices.insert(local, slice),
+                    };
                     continue;
                 }
-                let leaves = translate::leaves(self.tcx, local, ty).map_err(|_| {
-                    format!("takes `{ty}` as {}, which a kernel can't take", parameter(self.tcx, self.def_id, local))
-                })?;
+                let leaves = translate::leaves(self.tcx, local, ty).map_err(|_| cannot())?;
                 found.leaves.extend(leaves);
             }
         }
@@ -684,29 +734,12 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
         if !output.is_unit() {
             return Err(format!("returns `{output}`"));
         }
-        Ok((element, found))
+        Ok(found)
     }
 
-    /// `T` for `&[T]` with `T` a number.
-    fn slice_element(ty: Ty<'tcx>) -> Option<KTy> {
-        match ty.kind() {
-            ty::Ref(_, inner, ty::Mutability::Not) => match inner.kind() {
-                ty::Slice(element) => translate::kernel_ty(*element).filter(|ty| *ty != KTy::Bool),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    /// `T` for `&mut [T]` with `T` a number.
-    fn mut_slice_element(ty: Ty<'tcx>) -> Option<KTy> {
-        match ty.kind() {
-            ty::Ref(_, inner, ty::Mutability::Mut) => match inner.kind() {
-                ty::Slice(element) => translate::kernel_ty(*element).filter(|ty| *ty != KTy::Bool),
-                _ => None,
-            },
-            _ => None,
-        }
+    /// Whether `ty` is `&mut [T]`.
+    fn is_mut_slice(ty: Ty<'tcx>) -> bool {
+        matches!(ty.kind(), ty::Ref(_, inner, ty::Mutability::Mut) if matches!(inner.kind(), ty::Slice(_)))
     }
 
     fn is_parameter(&self, local: Local) -> bool {
@@ -937,16 +970,18 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
     }
 
     /// What an iterator yields, from the calls that built it: `into_iter`
-    /// or `iter_mut` on the slice parameter, `iter` or a plain `&[T]` on an
-    /// input slice parameter, and `zip`. Records the calls' blocks in
+    /// or `iter_mut` on a `&mut` slice parameter, `iter` or a plain `&[T]`
+    /// on an input slice parameter, and `zip`. Records the calls' blocks in
     /// `chain` and every local the iterator passes through in `plumbing`.
     fn lanes(
         &self,
         iterator: Local,
-        slices: &HashMap<Local, KTy>,
+        params: &Params,
         chain: &mut HashSet<BasicBlock>,
         plumbing: &mut HashSet<Local>,
     ) -> Result<Lane> {
+        let slices = &params.slices;
+        let written = |param: Local| param == SLICE || params.outputs.contains_key(&param);
         let not_slice = || "iterates over something other than the slice parameter".to_string();
         let Some(Origin::Call(block)) = self.origin_through(iterator, plumbing) else {
             return Err(not_slice());
@@ -962,9 +997,9 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
             known @ (Known::IntoIter | Known::SliceIterMut) => {
                 let source = argument(0)?;
                 match self.origin_through(source, plumbing) {
-                    Some(Origin::Param(SLICE)) => Ok(Lane::Element),
+                    Some(Origin::Param(param)) if written(param) => Ok(Lane::Output(param)),
                     // The `for` loop's identity `into_iter` on an iterator.
-                    Some(Origin::Call(_)) if known == Known::IntoIter => self.lanes(source, slices, chain, plumbing),
+                    Some(Origin::Call(_)) if known == Known::IntoIter => self.lanes(source, params, chain, plumbing),
                     _ => Err(not_slice()),
                 }
             }
@@ -974,25 +1009,28 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
                 _ => Err(not_slice()),
             },
             Known::Zip => {
-                let first = self.lanes(argument(0)?, slices, chain, plumbing)?;
-                let second = self.zipped(argument(1)?, slices, chain, plumbing)?;
+                let first = self.lanes(argument(0)?, params, chain, plumbing)?;
+                let second = self.zipped(argument(1)?, params, chain, plumbing)?;
                 Ok(Lane::Pair(Box::new(first), Box::new(second)))
             }
             _ => Err(not_slice()),
         }
     }
 
-    /// What `zip` pairs with: an input slice, as `&[T]` or `.iter()`, or
-    /// another iterator.
+    /// What `zip` pairs with: an input slice, as `&[T]` or `.iter()`,
+    /// another `&mut` slice, as `&mut [T]` or `.iter_mut()`, or another
+    /// iterator.
     fn zipped(
         &self,
         source: Local,
-        slices: &HashMap<Local, KTy>,
+        params: &Params,
         chain: &mut HashSet<BasicBlock>,
         plumbing: &mut HashSet<Local>,
     ) -> Result<Lane> {
+        let slices = &params.slices;
         match self.origin_through(source, plumbing) {
             Some(Origin::Param(param)) if slices.contains_key(&param) => Ok(Lane::Input(param)),
+            Some(Origin::Param(param)) if params.outputs.contains_key(&param) => Ok(Lane::Output(param)),
             Some(Origin::Call(block)) => {
                 let TerminatorKind::Call { func, args, destination, .. } =
                     &self.body.basic_blocks[block].terminator().kind
@@ -1009,9 +1047,9 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
                         }
                     }
                 }
-                self.lanes(source, slices, chain, plumbing)
+                self.lanes(source, params, chain, plumbing)
             }
-            _ => Err("zips with something other than a read-only slice parameter".into()),
+            _ => Err("zips with something other than a slice parameter".into()),
         }
     }
 
@@ -1260,8 +1298,10 @@ struct Traced {
     chain: HashSet<BasicBlock>,
     /// The locals the iterator passes through.
     plumbing: HashSet<Local>,
+    /// The slices the iterator writes, the first parameter first.
+    outputs: Vec<Slice>,
     /// The input slices the iterator zips with, in order.
-    inputs: Vec<(Local, KTy)>,
+    inputs: Vec<Slice>,
     /// The other slices, which the code may index.
     tables: Vec<(Local, KTy)>,
     /// The slices only the iterator may use.

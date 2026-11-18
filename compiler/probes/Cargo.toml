@@ -31,3 +31,10 @@ libm = "=0.2.16"
 # Development code for the grid structure: procedural noise, whose
 # generators the grid measurement (`measure/`) ported.
 noise = "=0.9.0"
+# Held out after the five census steps: audio samples, hashing, 2D geometry
+# and seeded random numbers, by four more authors, chosen and used before
+# reading their source.
+dasp_sample = "=0.11.0"
+xxhash-rust = { version = "=0.8.21", features = ["xxh32", "xxh64", "xxh3"] }
+kurbo = "=0.13.1"
+oorandom = "=11.1.5"

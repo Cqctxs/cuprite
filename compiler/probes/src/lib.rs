@@ -963,6 +963,146 @@ pub fn libm_cbrt(values: &mut [f64]) {
     }
 }
 
+// Held-out round after the five census steps: audio samples (`dasp_sample`),
+// hashing (`xxhash-rust`), 2D geometry (`kurbo`) and seeded random numbers
+// (`oorandom`), by four more authors. Chosen and written before reading
+// their source, from their public APIs, as a user of each would.
+
+/// Converts 16-bit audio samples to floats.
+pub fn dasp_to_float(out: &mut [f32], samples: &[i16]) {
+    use dasp_sample::Sample;
+    for (out, sample) in out.iter_mut().zip(samples) {
+        *out = sample.to_sample::<f32>();
+    }
+}
+
+/// Converts float audio samples to 16 bits.
+pub fn dasp_to_i16(out: &mut [i16], samples: &[f32]) {
+    use dasp_sample::Sample;
+    for (out, sample) in out.iter_mut().zip(samples) {
+        *out = sample.to_sample::<i16>();
+    }
+}
+
+/// Applies a gain to 16-bit samples.
+pub fn dasp_gain(samples: &mut [i16], gain: f32) {
+    use dasp_sample::Sample;
+    for sample in samples {
+        *sample = sample.mul_amp(gain);
+    }
+}
+
+/// Converts unsigned 8-bit samples to signed 16 bits.
+pub fn dasp_u8_to_i16(out: &mut [i16], samples: &[u8]) {
+    use dasp_sample::Sample;
+    out.iter_mut().zip(samples).for_each(|(out, sample)| *out = sample.to_sample());
+}
+
+/// Hashes each key with XXH64.
+pub fn xxh64_keys(hashes: &mut [u64], keys: &[u64], seed: u64) {
+    for (hash, key) in hashes.iter_mut().zip(keys) {
+        *hash = xxhash_rust::xxh64::xxh64(&key.to_le_bytes(), seed);
+    }
+}
+
+/// Hashes each key with XXH3.
+pub fn xxh3_keys(hashes: &mut [u64], keys: &[u64]) {
+    for (hash, key) in hashes.iter_mut().zip(keys) {
+        *hash = xxhash_rust::xxh3::xxh3_64(&key.to_le_bytes());
+    }
+}
+
+/// Hashes each key with XXH32.
+pub fn xxh32_keys(hashes: &mut [u32], keys: &[u32], seed: u32) {
+    for (hash, key) in hashes.iter_mut().zip(keys) {
+        *hash = xxhash_rust::xxh32::xxh32(&key.to_le_bytes(), seed);
+    }
+}
+
+/// Points along a cubic Bézier curve, at the parameters in `xs`.
+pub fn kurbo_cubic(xs: &mut [f64], ys: &mut [f64]) {
+    use kurbo::ParamCurve;
+    let curve = kurbo::CubicBez::new((0.0, 0.0), (1.0, 3.0), (4.0, -1.0), (5.0, 2.0));
+    for (x, y) in xs.iter_mut().zip(ys.iter_mut()) {
+        let point = curve.eval(*x);
+        *x = point.x;
+        *y = point.y;
+    }
+}
+
+/// Transforms points by an affine map.
+pub fn kurbo_affine(xs: &mut [f64], ys: &mut [f64]) {
+    let transform = kurbo::Affine::new([2.0, 0.5, -1.0, 1.5, 3.0, -4.0]);
+    for (x, y) in xs.iter_mut().zip(ys.iter_mut()) {
+        let point = transform * kurbo::Point::new(*x, *y);
+        *x = point.x;
+        *y = point.y;
+    }
+}
+
+/// Transforms points stored as `Point`s, as a user of `kurbo` would hold them.
+pub fn kurbo_affine_points(points: &mut [kurbo::Point]) {
+    let transform = kurbo::Affine::new([2.0, 0.5, -1.0, 1.5, 3.0, -4.0]);
+    for point in points {
+        *point = transform * *point;
+    }
+}
+
+/// Moves each point a quarter of the way to a target.
+pub fn kurbo_lerp_points(points: &mut [kurbo::Point]) {
+    let target = kurbo::Point::new(10.0, -3.0);
+    for point in points {
+        *point = point.lerp(target, 0.25);
+    }
+}
+
+/// The length of each vector.
+pub fn kurbo_length(lengths: &mut [f64], ys: &[f64]) {
+    for (length, y) in lengths.iter_mut().zip(ys) {
+        *length = kurbo::Vec2::new(*length, *y).length();
+    }
+}
+
+/// Marks the points inside a rectangle.
+pub fn kurbo_inside(inside: &mut [u8], xs: &[f64], ys: &[f64]) {
+    let rect = kurbo::Rect::new(-1.0, -2.0, 3.0, 4.0);
+    for ((inside, x), y) in inside.iter_mut().zip(xs).zip(ys) {
+        *inside = u8::from(rect.contains(kurbo::Point::new(*x, *y)));
+    }
+}
+
+/// The fourth draw from a generator seeded by each value.
+pub fn oorandom_draws(values: &mut [u32]) {
+    for value in values {
+        let mut rng = oorandom::Rand32::new(u64::from(*value));
+        rng.rand_u32();
+        rng.rand_u32();
+        rng.rand_u32();
+        *value = rng.rand_u32();
+    }
+}
+
+/// A float in [0, 1) from a generator seeded by each value.
+pub fn oorandom_float(out: &mut [f32], seeds: &[u64]) {
+    for (out, seed) in out.iter_mut().zip(seeds) {
+        *out = oorandom::Rand32::new(*seed).rand_float();
+    }
+}
+
+/// A die roll from a generator seeded by each value.
+pub fn oorandom_range(values: &mut [u32]) {
+    for value in values {
+        *value = oorandom::Rand32::new(u64::from(*value)).rand_range(1..7);
+    }
+}
+
+/// A 64-bit draw from a 128-bit-seeded generator.
+pub fn oorandom_64(values: &mut [u64]) {
+    for value in values {
+        *value = oorandom::Rand64::new(u128::from(*value) << 3 | 1).rand_u64();
+    }
+}
+
 // Arrays and bit reinterpretation (code generation): arrays as parameters,
 // locals and constants, indexed by constants and at run time, `[x; N]`,
 // slice patterns, `to_bits`, `from_bits`, byte conversions and transmutes.
@@ -1537,7 +1677,8 @@ pub fn exact_minimum(values: &mut [u32]) {
     }
 }
 
-/// `Ord::max` and `min` of integers.
+/// `Ord::max` and `min` of integers. (`clamp` would test something else.)
+#[allow(clippy::manual_clamp)]
 pub fn exact_int_minmax(values: &mut [i32]) {
     for value in values {
         let wide = i64::from(*value).max(-1_000_000).min(i64::from(*value >> 3 ^ 77));
@@ -1596,7 +1737,7 @@ pub fn exact_funnel(values: &mut [u32]) {
 /// `carryless_mul` and `carrying_mul_add`.
 pub fn exact_products(values: &mut [u64]) {
     for value in values {
-        let carryless = value.carryless_mul(0x87 | *value >> 50) ^ u64::from((*value as u16).carryless_mul(0x1021));
+        let carryless = value.carryless_mul(value.rotate_left(29) | 0x87) ^ u64::from((*value as u16).carryless_mul((*value >> 48) as u16 | 0x1021));
         let (low, high) = value.carrying_mul_add(0x9E37_79B9_7F4A_7C15, *value >> 7, 12_345);
         *value = carryless ^ low ^ high.rotate_left(17);
     }
@@ -1669,6 +1810,222 @@ pub fn noise_fbm(values: &mut [f64], fbm: &noise::Fbm<noise::Perlin>) {
 /// Number of calls `counted` has made, for tests.
 pub fn counted_calls() -> u32 {
     CALLS.load(Ordering::Relaxed)
+}
+
+// Slices of structs and several outputs (development code): elements that
+// are structs, tuples and arrays of numbers, written and read in place;
+// `&mut` slices zipped together; and the refusals around them.
+
+/// A small vector.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vec3 {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+/// A particle: nested structs, an array and two number types, 32 bytes
+/// with no padding.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Particle {
+    pub position: Vec3,
+    pub velocity: [f32; 3],
+    pub mass: f32,
+    pub id: u32,
+}
+
+/// Fields declared out of their memory order, of four widths. Rust
+/// reorders them (`u32`, `u16`, `u8`, `i8` here), with no padding.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Widths {
+    pub small: u8,
+    pub wide: u32,
+    pub signed: i8,
+    pub half: u16,
+}
+
+/// A field that leaves padding after it (`u8` then `u32`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Padded {
+    pub flag: u8,
+    pub value: u32,
+}
+
+/// A `bool` field, which not every byte is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Flagged {
+    pub value: f32,
+    pub on: bool,
+}
+
+/// Moves each particle by its velocity, then slows it by its mass. (Indexed:
+/// a loop over the array by reference is `struct_array_loop`.)
+#[allow(clippy::needless_range_loop)]
+pub fn struct_particles(particles: &mut [Particle], dt: f32) {
+    for p in particles {
+        p.position.x += p.velocity[0] * dt;
+        p.position.y += p.velocity[1] * dt;
+        p.position.z += p.velocity[2] * dt;
+        let drag = 1.0 / (1.0 + p.mass * dt);
+        for i in 0..3 {
+            p.velocity[i] *= drag;
+        }
+    }
+}
+
+/// Refused for now: a loop over an array field by reference goes through
+/// a slice iterator, whose pointer the translator can't follow yet.
+pub fn struct_array_loop(particles: &mut [Particle]) {
+    for p in particles {
+        for v in &mut p.velocity {
+            *v *= 0.5;
+        }
+    }
+}
+
+/// Changes one field and leaves the others as they are.
+pub fn struct_one_field(particles: &mut [Particle]) {
+    for p in particles {
+        p.id = p.id.wrapping_mul(2_654_435_761).rotate_left(5);
+    }
+}
+
+/// Whole values: each element replaced by a new one built from it.
+pub fn struct_replace(values: &mut [Vec3]) {
+    for v in values {
+        *v = Vec3 { x: v.y - v.z, y: v.z * 2.0, z: -v.x };
+    }
+}
+
+/// Fields of four widths at the offsets Rust gives them.
+pub fn struct_mixed(values: &mut [Widths]) {
+    for m in values {
+        m.small = m.small.wrapping_add(m.signed as u8);
+        m.wide = m.wide.rotate_left(3) ^ u32::from(m.half);
+        m.signed = m.signed.wrapping_neg();
+        m.half = m.half.wrapping_mul(3).wrapping_add(u16::from(m.small));
+    }
+}
+
+/// Tuples as elements.
+pub fn struct_tuples(pairs: &mut [(u32, f32)]) {
+    for (count, mean) in pairs {
+        *count += 1;
+        *mean = *mean * 0.5 + *count as f32;
+    }
+}
+
+/// Arrays as elements: RGBA pixels, brightened with saturation, alpha kept.
+#[allow(clippy::needless_range_loop)]
+pub fn struct_pixels(pixels: &mut [[u8; 4]], amount: u8) {
+    for pixel in pixels {
+        for i in 0..3 {
+            pixel[i] = pixel[i].saturating_add(amount);
+        }
+    }
+}
+
+/// A read-only slice of structs zipped with the output.
+pub fn struct_lengths(lengths: &mut [f32], vectors: &[Vec3]) {
+    for (length, v) in lengths.iter_mut().zip(vectors) {
+        *length = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
+    }
+}
+
+/// Two outputs from one input of structs.
+pub fn struct_split(xs: &mut [f32], ys: &mut [f32], vectors: &[Vec3]) {
+    for ((x, y), v) in xs.iter_mut().zip(ys.iter_mut()).zip(vectors) {
+        *x = v.x + v.z;
+        *y = v.y - v.z;
+    }
+}
+
+/// Three outputs, the second and third passed straight to `zip`.
+pub fn struct_three(a: &mut [u32], b: &mut [u32], c: &mut [u64]) {
+    for ((a, b), c) in a.iter_mut().zip(b).zip(c) {
+        let sum = u64::from(*a) + u64::from(*b);
+        *c ^= sum;
+        *a = (sum >> 1) as u32;
+        *b ^= *a;
+    }
+}
+
+/// A second output only read, never written.
+pub fn struct_read_second(values: &mut [f64], other: &mut [f64]) {
+    for (value, other) in values.iter_mut().zip(other.iter_mut()) {
+        *value += *other;
+    }
+}
+
+/// `for_each` over structs.
+pub fn struct_each(values: &mut [Vec3], scale: f32) {
+    values.iter_mut().for_each(|v| {
+        v.x *= scale;
+        v.z -= v.y;
+    });
+}
+
+/// Rayon over structs, zipped with a second output.
+pub fn struct_par(values: &mut [Vec3], norms: &mut [f32]) {
+    values.par_iter_mut().zip(norms.par_iter_mut()).for_each(|(v, norm)| {
+        *norm = v.x.abs() + v.y.abs() + v.z.abs();
+        v.y = *norm;
+    });
+}
+
+/// One step of a simulation over particles, which `struct_simulate`
+/// repeats.
+pub fn struct_step(particles: &mut [Particle]) {
+    for p in particles {
+        p.position.y += p.velocity[1] * 0.125;
+        p.velocity[1] -= 0.25;
+    }
+}
+
+/// A repeated map over structs.
+pub fn struct_simulate(particles: &mut [Particle], steps: u32) {
+    for _ in 0..steps {
+        struct_step(particles);
+    }
+}
+
+/// Pairs divided by a second output's counts, which may hold a zero: the
+/// first field is written before the division can panic.
+pub fn struct_checked(pairs: &mut [(u32, u32)], counts: &mut [u32]) {
+    for (pair, count) in pairs.iter_mut().zip(counts.iter_mut()) {
+        pair.0 = pair.0.wrapping_add(1);
+        pair.1 /= *count;
+        *count += 1;
+    }
+}
+
+/// Refused: the element has padding, which can't be copied as bytes.
+pub fn struct_padded(values: &mut [Padded]) {
+    for p in values {
+        p.value += u32::from(p.flag);
+    }
+}
+
+/// Refused: the element holds a `bool`.
+pub fn struct_flagged(values: &mut [Flagged]) {
+    for f in values {
+        f.value = if f.on { f.value * 2.0 } else { f.value };
+    }
+}
+
+/// Refused: a slice of structs indexed rather than zipped.
+pub fn struct_table(values: &mut [f32], table: &[Vec3]) {
+    for value in values {
+        *value *= table[0].x;
+    }
+}
+
+/// Refused: a second `&mut` slice that the loop doesn't iterate.
+pub fn struct_unused_output(values: &mut [u32], other: &mut [u32]) {
+    for value in values.iter_mut() {
+        *value += 1;
+    }
+    other[0] = 1;
 }
 
 #[cfg(test)]

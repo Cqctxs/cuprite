@@ -1,71 +1,79 @@
 //! Kernels for iteration shapes, around element functions translated from
 //! the program.
 
-use crate::{builder::Builder, BinOp, Const, Function, Invalid, Kernel, Operand, Rvalue, Special, Ty};
+use crate::{builder::Builder, layout::Layout, BinOp, Const, Function, Invalid, Kernel, Local, Operand, Rvalue, Special, Ty};
 
 /// An in-place map kernel's parameters before its stages' scalars: the
-/// data, its length, the failure flag, a pointer per input slice, and with
-/// `repeated` the pass count.
-pub fn in_place_map_prefix(inputs: usize, repeated: bool) -> Vec<Ty> {
+/// first output slice, its length, the failure flag, a pointer per other
+/// output slice and per input slice, and with `repeated` the pass count.
+pub fn in_place_map_prefix(outputs: usize, inputs: usize, repeated: bool) -> Vec<Ty> {
     let mut prefix = vec![Ty::Ptr, Ty::U64, Ty::Ptr];
-    prefix.extend(std::iter::repeat_n(Ty::Ptr, inputs));
+    prefix.extend(std::iter::repeat_n(Ty::Ptr, outputs - 1 + inputs));
     if repeated {
         prefix.push(Ty::U32);
     }
     prefix
 }
 
-/// `data[i] = stages(data[i], inputs[..][i])` for every `i < len`,
-/// applying the stages in order, and with `repeated` doing all of that
-/// `passes` times. Each element is independent, so passes can run per
-/// element: `passes` launches over the slice and one launch looping per
-/// element compute the same.
+/// `outputs[..][i] = stages(outputs[..][i], inputs[..][i])` for every
+/// `i < len`, applying the stages in order, and with `repeated` doing all
+/// of that `passes` times. Each element is independent, so passes can run
+/// per element: `passes` launches over the slices and one launch looping
+/// per element compute the same.
 ///
-/// Each stage takes the element, then one value from each input slice, in
-/// order, then scalars of its own, and returns the new element. The inputs
-/// are read-only and hold at least `len` elements. The kernel's parameters
-/// are [`in_place_map_prefix`], then every stage's scalars in order. One
-/// thread handles one element, in a `Grid::Linear` launch of at most
-/// `u32::MAX` threads.
+/// Each slice's element holds the numbers its [`Layout`] lists. Each stage
+/// takes every output's numbers, in order, then every input's, then
+/// scalars of its own, and returns the outputs' new numbers in the same
+/// order. The inputs are read-only, and every slice holds at least `len`
+/// elements. The kernel's parameters are [`in_place_map_prefix`], then
+/// every stage's scalars in order. One thread handles one element, in a
+/// `Grid::Linear` launch of at most `u32::MAX` threads.
 ///
 /// Where a stage fails (`Terminator::Fail`), the thread writes 1 to the
-/// `u32` failure flag and stops without storing its element. The CPU would
+/// `u32` failure flag and stops. Earlier stores are harmless: the CPU would
 /// have panicked there, so the caller discards every result and runs the
 /// original code instead.
 pub fn in_place_map(
     name: &str,
-    element: Ty,
-    inputs: &[Ty],
+    outputs: &[Layout],
+    inputs: &[Layout],
     stages: &[&Function],
     repeated: bool,
 ) -> Result<Kernel, Invalid> {
+    if outputs.is_empty() {
+        return Err(Invalid("a map writes at least one slice".into()));
+    }
+    for layout in outputs.iter().chain(inputs) {
+        layout.validate()?;
+    }
+    let written: Vec<Ty> = outputs.iter().flat_map(Layout::types).collect();
+    let read: Vec<Ty> = inputs.iter().flat_map(Layout::types).collect();
+    let taken = written.len() + read.len();
     for stage in stages {
         let params = stage.params();
-        if params.first() != Some(&element) || stage.result_ty() != Some(element) {
-            return Err(Invalid(format!(
-                "stage `{}` doesn't map one {element:?} to another",
-                stage.kernel.name
-            )));
+        if params.get(..written.len()) != Some(&written[..]) || stage.result_types() != written {
+            return Err(Invalid(format!("stage `{}` doesn't map {written:?} to new values", stage.kernel.name)));
         }
-        if params.get(1..=inputs.len()) != Some(inputs) {
-            return Err(Invalid(format!("stage `{}` doesn't take the inputs {inputs:?}", stage.kernel.name)));
+        if params.get(written.len()..taken) != Some(&read[..]) {
+            return Err(Invalid(format!("stage `{}` doesn't take the inputs {read:?}", stage.kernel.name)));
         }
-        if let Some(ty) = params[1 + inputs.len()..].iter().find(|ty| !ty.is_passable()) {
+        if let Some(ty) = params[taken..].iter().find(|ty| !ty.is_passable()) {
             return Err(Invalid(format!("stage `{}` takes a {ty:?}, which can't be passed", stage.kernel.name)));
         }
     }
-    let prefix = in_place_map_prefix(inputs.len(), repeated);
+    let prefix = in_place_map_prefix(outputs.len(), inputs.len(), repeated);
     let mut types = prefix.clone();
     for stage in stages {
-        types.extend_from_slice(&stage.params()[1 + inputs.len()..]);
+        types.extend_from_slice(&stage.params()[taken..]);
     }
     let (mut b, params) = Builder::new(name, &types);
-    let (data, len, flag) = (params[0], params[1], params[2]);
-    let input_pointers = &params[3..3 + inputs.len()];
+    let (len, flag) = (params[1], params[2]);
+    let output_pointers: Vec<Local> = std::iter::once(params[0]).chain(params[3..2 + outputs.len()].iter().copied()).collect();
+    let input_pointers = &params[2 + outputs.len()..2 + outputs.len() + inputs.len()];
     let mut scalars = params[prefix.len()..].iter().copied();
     let stage_scalars: Vec<Vec<Operand>> = stages
         .iter()
-        .map(|stage| (1 + inputs.len()..stage.params().len()).map(|_| scalars.next().unwrap().into()).collect())
+        .map(|stage| (taken..stage.params().len()).map(|_| scalars.next().unwrap().into()).collect())
         .collect();
 
     let i = b.special(Special::X);
@@ -79,17 +87,31 @@ pub fn in_place_map(
     b.ret();
 
     b.switch_to(work);
-    let address = b.offset(data, wide, element);
-    let value = b.load(address, element);
+    // Each number's address in this thread's element, and its value.
+    let addresses = |b: &mut Builder, pointers: &[Local], layouts: &[Layout]| -> Vec<(Local, Local)> {
+        let mut numbers = Vec::new();
+        for (&pointer, layout) in pointers.iter().zip(layouts) {
+            let element = b.assign(Rvalue::Offset(pointer.into(), wide.into(), layout.size));
+            for &(offset, ty) in &layout.leaves {
+                let address = b.assign(Rvalue::Offset(element.into(), Const::int(Ty::U64, offset.into()).into(), 1));
+                let value = b.load(address, ty);
+                numbers.push((address, value));
+            }
+        }
+        numbers
+    };
+    let values = addresses(&mut b, &output_pointers, outputs);
     let input_values: Vec<Operand> =
-        input_pointers.iter().zip(inputs).map(|(&pointer, &ty)| b.index(pointer, wide, ty).into()).collect();
+        addresses(&mut b, input_pointers, inputs).into_iter().map(|(_, value)| value.into()).collect();
     let apply = |b: &mut Builder| {
         for (stage, scalars) in stages.iter().zip(&stage_scalars) {
-            let mut args = vec![value.into()];
+            let mut args: Vec<Operand> = values.iter().map(|&(_, value)| value.into()).collect();
             args.extend_from_slice(&input_values);
             args.extend_from_slice(scalars);
-            let result = b.inline(stage, &args, Some(failed)).expect("checked above");
-            b.set(value, Rvalue::Use(result.into()));
+            let results = b.inline(stage, &args, Some(failed));
+            for (&(_, value), result) in values.iter().zip(results) {
+                b.set(value, Rvalue::Use(result.into()));
+            }
         }
     };
     if repeated {
@@ -108,7 +130,9 @@ pub fn in_place_map(
     } else {
         apply(&mut b);
     }
-    b.store(address, value);
+    for &(address, value) in &values {
+        b.store(address, value);
+    }
     b.goto(done);
     b.switch_to(done);
     b.ret();

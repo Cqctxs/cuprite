@@ -109,9 +109,9 @@ fn capped_double() -> cuprite_kernel::Function {
 
 #[test]
 fn element_functions_inline_into_map_kernels() {
-    use cuprite_kernel::shapes::in_place_map;
+    use cuprite_kernel::{layout::Layout, shapes::in_place_map};
     let stage = capped_double();
-    let kernel = in_place_map("twice", Ty::U32, &[], &[&stage, &stage], true).unwrap();
+    let kernel = in_place_map("twice", &[Layout::number(Ty::U32)], &[], &[&stage, &stage], true).unwrap();
     // The data, its length, the failure flag, the pass count, then each
     // stage's scalar.
     assert_eq!(&kernel.locals[..kernel.params], [Ty::Ptr, Ty::U64, Ty::Ptr, Ty::U32, Ty::U32, Ty::U32]);
@@ -120,5 +120,47 @@ fn element_functions_inline_into_map_kernels() {
     assert_eq!(text.matches("setp.lt.u32").count(), 3, "{text}"); // 2 stages + the pass loop
     assert!(llvm::emit(&kernel).contains("define ptx_kernel void @twice("));
     // A stage must map the element type to itself.
-    assert!(in_place_map("wrong", Ty::F32, &[], &[&stage], false).is_err());
+    assert!(in_place_map("wrong", &[Layout::number(Ty::F32)], &[], &[&stage], false).is_err());
+}
+
+/// A stage over a struct of two `f64`s and a second `u16` output, reading
+/// an input of `u8`s: it swaps the struct's numbers and adds the input to
+/// the second output.
+fn swap_and_count() -> cuprite_kernel::Function {
+    let (mut b, p) = Builder::new("swap", &[Ty::F64, Ty::F64, Ty::U16, Ty::U8]);
+    let wide = b.cast(p[3], Ty::U16);
+    let count = b.binary(BinOp::Add, p[2], wide);
+    b.finish_function([p[1], p[0], count]).unwrap()
+}
+
+#[test]
+fn map_kernels_load_and_store_every_number_of_every_slice() {
+    use cuprite_kernel::{layout::Layout, shapes::in_place_map};
+    let point = Layout { size: 16, leaves: vec![(0, Ty::F64), (8, Ty::F64)] };
+    let outputs = [point.clone(), Layout::number(Ty::U16)];
+    let stage = swap_and_count();
+    let kernel = in_place_map("swap", &outputs, &[Layout::number(Ty::U8)], &[&stage], false).unwrap();
+    // The first output, its length, the flag, the second output, the input.
+    assert_eq!(&kernel.locals[..kernel.params], [Ty::Ptr, Ty::U64, Ty::Ptr, Ty::Ptr, Ty::Ptr]);
+    let stores: Vec<&Statement> =
+        kernel.blocks.iter().flat_map(|block| &block.statements).filter(|s| matches!(s, Statement::Store(..))).collect();
+    // Three numbers written back, and the flag.
+    assert_eq!(stores.len(), 4, "{stores:?}");
+    // Elements 16 bytes apart, and the second number 8 bytes in.
+    let offsets: Vec<(u128, u32)> = kernel
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .filter_map(|s| match s {
+            Statement::Assign(_, Rvalue::Offset(_, Operand::Const(c), scale)) => Some((c.bits, *scale)),
+            _ => None,
+        })
+        .collect();
+    assert!(offsets.contains(&(8, 1)) && offsets.contains(&(0, 1)), "{offsets:?}");
+    let text = ptx::emit(&kernel);
+    assert!(text.contains("ld.global.f64") && text.contains("st.global.u16") && text.contains("ld.global.u8"), "{text}");
+    // Results that don't match the outputs, in number or type, are refused.
+    assert!(in_place_map("short", std::slice::from_ref(&point), &[Layout::number(Ty::U8)], &[&stage], false).is_err());
+    let swapped = [Layout::number(Ty::U16), point];
+    assert!(in_place_map("swapped", &swapped, &[Layout::number(Ty::U8)], &[&stage], false).is_err());
 }

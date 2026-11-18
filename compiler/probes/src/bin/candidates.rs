@@ -796,7 +796,7 @@ fn general_cases(state: &mut u64) -> usize {
         left ^ right.rotate_left(3)
     });
     checked += general("exact_products", state, probes::exact_products, |v: u64| {
-        let carryless = carryless(v, 0x87 | v >> 50) ^ carryless(v & 0xFFFF, 0x1021) & 0xFFFF;
+        let carryless = carryless(v, v.rotate_left(29) | 0x87) ^ carryless(v & 0xFFFF, v >> 48 | 0x1021) & 0xFFFF;
         let full = u128::from(v) * 0x9E37_79B9_7F4A_7C15 + u128::from(v >> 7) + 12_345;
         carryless ^ full as u64 ^ ((full >> 64) as u64).rotate_left(17)
     });
@@ -837,7 +837,289 @@ fn general_cases(state: &mut u64) -> usize {
         let d = (x >> 32) & 0x7FFF_FFFF;
         (x >> 8) & 0xFF | (x & 0xFF) << 8 | c << 16 | d << 32
     });
+    checked += held_out(state, &xs, &weights);
     checked
+}
+
+/// The held-out round after the five census steps. The reference is each
+/// crate's own function, called element by element on the CPU.
+fn held_out(state: &mut u64, xs: &[f32], weights: &[u8]) -> usize {
+    use dasp_sample::Sample;
+    let largest = LENGTHS[LENGTHS.len() - 1];
+    let samples: Vec<i16> = (0..largest).map(|_| i16::random(state)).collect();
+    // Points around the rectangle, and every kind of float for lengths.
+    let px: Vec<f64> = (0..largest).map(|_| f64::random(state) % 6.0).collect();
+    let py: Vec<f64> = (0..largest).map(|_| f64::random(state) % 6.0).collect();
+    let ys: Vec<f64> = (0..largest).map(|_| f64::random(state)).collect();
+    let seeds: Vec<u64> = (0..largest).map(|_| u64::random(state)).collect();
+    let mut checked = 0;
+    checked += general_indexed(
+        "dasp_to_float",
+        state,
+        |v: &mut [f32]| probes::dasp_to_float(v, &samples[..v.len()]),
+        |i, _, _| samples[i].to_sample::<f32>(),
+    );
+    checked += general_indexed(
+        "dasp_to_i16",
+        state,
+        |v: &mut [i16]| probes::dasp_to_i16(v, &xs[..v.len()]),
+        |i, _, _| xs[i].to_sample::<i16>(),
+    );
+    checked += general("dasp_gain", state, |v: &mut [i16]| probes::dasp_gain(v, 1.5), |x| x.mul_amp(1.5));
+    checked += general_indexed(
+        "dasp_u8_to_i16",
+        state,
+        |v: &mut [i16]| probes::dasp_u8_to_i16(v, &weights[..v.len()]),
+        |i, _, _| weights[i].to_sample::<i16>(),
+    );
+    let rect = kurbo::Rect::new(-1.0, -2.0, 3.0, 4.0);
+    checked += general_indexed(
+        "kurbo_inside",
+        state,
+        |v: &mut [u8]| probes::kurbo_inside(v, &px[..v.len()], &py[..v.len()]),
+        |i, _, _| u8::from(rect.contains(kurbo::Point::new(px[i], py[i]))),
+    );
+    checked += general_indexed(
+        "kurbo_length",
+        state,
+        |v: &mut [f64]| probes::kurbo_length(v, &ys[..v.len()]),
+        |i, _, x| kurbo::Vec2::new(x, ys[i]).length(),
+    );
+    checked += general("oorandom_draws", state, probes::oorandom_draws, |x: u32| {
+        let mut rng = oorandom::Rand32::new(u64::from(x));
+        rng.rand_u32();
+        rng.rand_u32();
+        rng.rand_u32();
+        rng.rand_u32()
+    });
+    checked += general_indexed(
+        "oorandom_float",
+        state,
+        |v: &mut [f32]| probes::oorandom_float(v, &seeds[..v.len()]),
+        |i, _, _| oorandom::Rand32::new(seeds[i]).rand_float(),
+    );
+    checked += general("oorandom_range", state, probes::oorandom_range, |x: u32| {
+        oorandom::Rand32::new(u64::from(x)).rand_range(1..7)
+    });
+    checked += general("oorandom_64", state, probes::oorandom_64, |x: u64| {
+        oorandom::Rand64::new(u128::from(x) << 3 | 1).rand_u64()
+    });
+    checked + points(state) + structs(state)
+}
+
+/// A float's bits for comparison, with every NaN the same.
+fn float_bits(x: f64) -> u64 {
+    if x.is_nan() { u64::MAX } else { x.to_bits() }
+}
+
+/// Compares slices of structs through their numbers, as `flat` lists them.
+fn same_structs<T: Copy + std::fmt::Debug>(case: &str, values: &[T], expected: &[T], flat: impl Fn(&T) -> Vec<u64>) {
+    assert_eq!(values.len(), expected.len(), "{case}");
+    if let Some(index) = values.iter().zip(expected).position(|(a, b)| flat(a) != flat(b)) {
+        panic!("{case}: index {index} is {:?} but should be {:?}", values[index], expected[index]);
+    }
+}
+
+/// Maps over slices of structs, tuples and arrays, and over several
+/// `&mut` slices, each against a reference that applies the source's
+/// operations to one element.
+fn structs(state: &mut u64) -> usize {
+    use probes::{Particle, Vec3, Widths};
+    let f = |x: f32| float_bits(x.into());
+    let vec3 = |state: &mut u64| Vec3 { x: f32::random(state), y: f32::random(state), z: f32::random(state) };
+    let vec3_bits = move |v: &Vec3| vec![f(v.x), f(v.y), f(v.z)];
+    let particle = |state: &mut u64| Particle {
+        position: vec3(state),
+        velocity: [f32::random(state), f32::random(state), f32::random(state)],
+        mass: f32::random(state),
+        id: u32::random(state),
+    };
+    let particle_bits = move |p: &Particle| {
+        let mut bits = vec3_bits(&p.position);
+        bits.extend(p.velocity.map(f));
+        bits.extend([f(p.mass), p.id.into()]);
+        bits
+    };
+    let step = |mut p: Particle| {
+        p.position.y += p.velocity[1] * 0.125;
+        p.velocity[1] -= 0.25;
+        p
+    };
+    for len in LENGTHS {
+        let case = |name: &str| format!("{name}, {len} elements");
+        let particles: Vec<Particle> = (0..len).map(|_| particle(state)).collect();
+        let vectors: Vec<Vec3> = (0..len).map(|_| vec3(state)).collect();
+
+        let mut out = particles.clone();
+        probes::struct_particles(&mut out, 0.75);
+        let expected: Vec<Particle> = particles
+            .iter()
+            .map(|&p| {
+                let mut p = p;
+                p.position.x += p.velocity[0] * 0.75;
+                p.position.y += p.velocity[1] * 0.75;
+                p.position.z += p.velocity[2] * 0.75;
+                let drag = 1.0 / (1.0 + p.mass * 0.75);
+                for v in &mut p.velocity {
+                    *v *= drag;
+                }
+                p
+            })
+            .collect();
+        same_structs(&case("struct_particles"), &out, &expected, particle_bits);
+
+        let mut out = particles.clone();
+        probes::struct_one_field(&mut out);
+        let expected: Vec<Particle> =
+            particles.iter().map(|&p| Particle { id: p.id.wrapping_mul(2_654_435_761).rotate_left(5), ..p }).collect();
+        same_structs(&case("struct_one_field"), &out, &expected, particle_bits);
+
+        let mut out = particles.clone();
+        probes::struct_step(&mut out);
+        let expected: Vec<Particle> = particles.iter().map(|&p| step(p)).collect();
+        same_structs(&case("struct_step"), &out, &expected, particle_bits);
+
+        let mut out = particles.clone();
+        probes::struct_simulate(&mut out, 13);
+        let expected: Vec<Particle> = particles.iter().map(|&p| (0..13).fold(p, |p, _| step(p))).collect();
+        same_structs(&case("struct_simulate"), &out, &expected, particle_bits);
+
+        let mut out = vectors.clone();
+        probes::struct_replace(&mut out);
+        let expected: Vec<Vec3> = vectors.iter().map(|v| Vec3 { x: v.y - v.z, y: v.z * 2.0, z: -v.x }).collect();
+        same_structs(&case("struct_replace"), &out, &expected, vec3_bits);
+
+        let mut out = vectors.clone();
+        probes::struct_each(&mut out, -1.5);
+        let expected: Vec<Vec3> = vectors.iter().map(|v| Vec3 { x: v.x * -1.5, z: v.z - v.y, ..*v }).collect();
+        same_structs(&case("struct_each"), &out, &expected, vec3_bits);
+
+        let widths: Vec<Widths> = (0..len)
+            .map(|_| Widths { small: u8::random(state), wide: u32::random(state), signed: i16::random(state) as i8, half: u16::random(state) })
+            .collect();
+        let mut out = widths.clone();
+        probes::struct_mixed(&mut out);
+        let expected: Vec<Widths> = widths
+            .iter()
+            .map(|&m| {
+                let small = m.small.wrapping_add(m.signed as u8);
+                let wide = m.wide.rotate_left(3) ^ u32::from(m.half);
+                Widths { small, wide, signed: m.signed.wrapping_neg(), half: m.half.wrapping_mul(3).wrapping_add(u16::from(small)) }
+            })
+            .collect();
+        same_structs(&case("struct_mixed"), &out, &expected, |m| {
+            vec![m.small.into(), m.wide.into(), m.signed as u8 as u64, m.half.into()]
+        });
+
+        let pairs: Vec<(u32, f32)> = (0..len).map(|_| (u32::random(state), f32::random(state))).collect();
+        let mut out = pairs.clone();
+        probes::struct_tuples(&mut out);
+        let expected: Vec<(u32, f32)> = pairs
+            .iter()
+            .map(|&(count, mean)| {
+                let count = count.wrapping_add(1);
+                (count, mean * 0.5 + count as f32)
+            })
+            .collect();
+        same_structs(&case("struct_tuples"), &out, &expected, |&(count, mean)| vec![count.into(), f(mean)]);
+
+        let pixels: Vec<[u8; 4]> = (0..len).map(|_| u32::random(state).to_le_bytes()).collect();
+        let mut out = pixels.clone();
+        probes::struct_pixels(&mut out, 40);
+        let expected: Vec<[u8; 4]> =
+            pixels.iter().map(|p| [p[0].saturating_add(40), p[1].saturating_add(40), p[2].saturating_add(40), p[3]]).collect();
+        same_structs(&case("struct_pixels"), &out, &expected, |p| p.map(u64::from).to_vec());
+
+        let starts: Vec<f32> = (0..len).map(|_| f32::random(state)).collect();
+        let mut out = starts.clone();
+        probes::struct_lengths(&mut out, &vectors);
+        let expected: Vec<f32> = vectors.iter().map(|v| (v.x * v.x + v.y * v.y + v.z * v.z).sqrt()).collect();
+        same_structs(&case("struct_lengths"), &out, &expected, |&x| vec![f(x)]);
+
+        let (mut xs, mut ys) = (starts.clone(), starts.clone());
+        probes::struct_split(&mut xs, &mut ys, &vectors);
+        let expected_x: Vec<f32> = vectors.iter().map(|v| v.x + v.z).collect();
+        let expected_y: Vec<f32> = vectors.iter().map(|v| v.y - v.z).collect();
+        same_structs(&case("struct_split x"), &xs, &expected_x, |&x| vec![f(x)]);
+        same_structs(&case("struct_split y"), &ys, &expected_y, |&x| vec![f(x)]);
+
+        let a: Vec<u32> = (0..len).map(|_| u32::random(state)).collect();
+        let b: Vec<u32> = (0..len).map(|_| u32::random(state)).collect();
+        let c: Vec<u64> = (0..len).map(|_| u64::random(state)).collect();
+        let (mut a_out, mut b_out, mut c_out) = (a.clone(), b.clone(), c.clone());
+        probes::struct_three(&mut a_out, &mut b_out, &mut c_out);
+        let sums: Vec<u64> = a.iter().zip(&b).map(|(&a, &b)| u64::from(a) + u64::from(b)).collect();
+        let expected_a: Vec<u32> = sums.iter().map(|&sum| (sum >> 1) as u32).collect();
+        let expected_b: Vec<u32> = b.iter().zip(&expected_a).map(|(&b, &a)| b ^ a).collect();
+        let expected_c: Vec<u64> = sums.iter().zip(&c).map(|(&sum, &c)| sum ^ c).collect();
+        same_structs(&case("struct_three a"), &a_out, &expected_a, |&x| vec![x.into()]);
+        same_structs(&case("struct_three b"), &b_out, &expected_b, |&x| vec![x.into()]);
+        same_structs(&case("struct_three c"), &c_out, &expected_c, |&x| vec![x]);
+
+        let values: Vec<f64> = (0..len).map(|_| f64::random(state)).collect();
+        let other: Vec<f64> = (0..len).map(|_| f64::random(state)).collect();
+        let (mut out, mut other_out) = (values.clone(), other.clone());
+        probes::struct_read_second(&mut out, &mut other_out);
+        let expected: Vec<f64> = values.iter().zip(&other).map(|(v, o)| v + o).collect();
+        same_structs(&case("struct_read_second"), &out, &expected, |&x| vec![float_bits(x)]);
+        same_structs(&case("struct_read_second other"), &other_out, &other, |&x| vec![float_bits(x)]);
+
+        let (mut out, mut norms) = (vectors.clone(), starts.clone());
+        probes::struct_par(&mut out, &mut norms);
+        let expected_norms: Vec<f32> = vectors.iter().map(|v| v.x.abs() + v.y.abs() + v.z.abs()).collect();
+        let expected: Vec<Vec3> = vectors.iter().zip(&expected_norms).map(|(v, &norm)| Vec3 { y: norm, ..*v }).collect();
+        same_structs(&case("struct_par"), &out, &expected, vec3_bits);
+        same_structs(&case("struct_par norms"), &norms, &expected_norms, |&x| vec![f(x)]);
+    }
+    14 * LENGTHS.len()
+}
+
+/// Compares two slices of floats bit for bit, any NaN matching any NaN.
+fn same_floats(case: &str, values: &[f64], expected: &[f64]) {
+    if let Some(index) = values.iter().zip(expected).position(|(a, b)| !a.same(*b)) {
+        panic!("{case}: index {index} is {:?} but should be {:?}", values[index], expected[index]);
+    }
+}
+
+/// Maps that write two slices, or slices of `kurbo::Point`, held out
+/// before slices of structs were built.
+fn points(state: &mut u64) -> usize {
+    use kurbo::{Affine, CubicBez, ParamCurve, Point};
+    let transform = Affine::new([2.0, 0.5, -1.0, 1.5, 3.0, -4.0]);
+    let curve = CubicBez::new((0.0, 0.0), (1.0, 3.0), (4.0, -1.0), (5.0, 2.0));
+    let target = Point::new(10.0, -3.0);
+    for len in LENGTHS {
+        let xs: Vec<f64> = (0..len).map(|_| f64::random(state)).collect();
+        let ys: Vec<f64> = (0..len).map(|_| f64::random(state)).collect();
+        // `xs` and `ys` written together.
+        let moved: Vec<Point> = xs.iter().zip(&ys).map(|(&x, &y)| transform * Point::new(x, y)).collect();
+        let (mut x_out, mut y_out) = (xs.clone(), ys.clone());
+        probes::kurbo_affine(&mut x_out, &mut y_out);
+        same_floats(&format!("kurbo_affine x, {len} elements"), &x_out, &moved.iter().map(|p| p.x).collect::<Vec<_>>());
+        same_floats(&format!("kurbo_affine y, {len} elements"), &y_out, &moved.iter().map(|p| p.y).collect::<Vec<_>>());
+        // `ys` 3 shorter: like `zip`, the rest of `xs` stays as it is.
+        let short = len.saturating_sub(3);
+        let ts: Vec<f64> = xs.iter().map(|x| x % 1.5).collect();
+        let (mut x_out, mut y_out) = (ts.clone(), ys[..short].to_vec());
+        probes::kurbo_cubic(&mut x_out, &mut y_out);
+        let on_curve: Vec<Point> = ts[..short].iter().map(|&t| curve.eval(t)).collect();
+        let mut expected_x: Vec<f64> = on_curve.iter().map(|p| p.x).collect();
+        expected_x.extend_from_slice(&ts[short..]);
+        same_floats(&format!("kurbo_cubic x, {len} elements"), &x_out, &expected_x);
+        same_floats(&format!("kurbo_cubic y, {len} elements"), &y_out, &on_curve.iter().map(|p| p.y).collect::<Vec<_>>());
+        // Slices of `Point`.
+        let points: Vec<Point> = xs.iter().zip(&ys).map(|(&x, &y)| Point::new(x, y)).collect();
+        let coordinates = |points: &[Point]| points.iter().flat_map(|p| [p.x, p.y]).collect::<Vec<_>>();
+        let mut out = points.clone();
+        probes::kurbo_affine_points(&mut out);
+        let expected: Vec<Point> = points.iter().map(|&p| transform * p).collect();
+        same_floats(&format!("kurbo_affine_points, {len} elements"), &coordinates(&out), &coordinates(&expected));
+        let mut out = points.clone();
+        probes::kurbo_lerp_points(&mut out);
+        let expected: Vec<Point> = points.iter().map(|p| p.lerp(target, 0.25)).collect();
+        same_floats(&format!("kurbo_lerp_points, {len} elements"), &coordinates(&out), &coordinates(&expected));
+    }
+    4 * LENGTHS.len()
 }
 
 fn main() {

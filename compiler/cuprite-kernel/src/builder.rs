@@ -179,12 +179,12 @@ impl Builder {
     /// Runs `function` here: binds its parameters to `args`, copies its
     /// blocks with fresh locals, and continues in a new block where it
     /// returns. Where it fails, it jumps to `on_fail`, if given, and fails
-    /// otherwise. Returns the local holding its result.
+    /// otherwise. Returns the locals holding its results.
     ///
     /// # Panics
     /// If the number of arguments isn't the number of parameters. Argument
     /// types are checked by [`Builder::finish`].
-    pub fn inline(&mut self, function: &Function, args: &[Operand], on_fail: Option<BlockId>) -> Option<Local> {
+    pub fn inline(&mut self, function: &Function, args: &[Operand], on_fail: Option<BlockId>) -> Vec<Local> {
         let callee = &function.kernel;
         assert_eq!(args.len(), callee.params, "inlining `{}`", callee.name);
         let locals: Vec<Local> = callee.locals.iter().map(|ty| self.local(*ty)).collect();
@@ -221,12 +221,13 @@ impl Builder {
             self.kernel.blocks[blocks[i].0 as usize] = Block { statements, terminator };
         }
         self.switch_to(after);
-        function.result.map(|result| locals[result.0 as usize])
+        function.results.iter().map(|result| locals[result.0 as usize]).collect()
     }
 
-    /// The kernel so far, as an element function returning `result`.
-    pub fn finish_function(self, result: Option<Local>) -> Result<Function, Invalid> {
-        let function = Function { kernel: self.kernel, result };
+    /// The kernel so far, as an element function returning `results`, in
+    /// order (`None` or `Some(local)` for at most one).
+    pub fn finish_function(self, results: impl IntoIterator<Item = Local>) -> Result<Function, Invalid> {
+        let function = Function { kernel: self.kernel, results: results.into_iter().collect() };
         function.validate()?;
         Ok(function)
     }

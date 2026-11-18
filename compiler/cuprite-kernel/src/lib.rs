@@ -35,6 +35,7 @@
 
 pub mod builder;
 pub mod description;
+pub mod layout;
 pub mod llvm;
 pub mod ptx;
 pub mod shapes;
@@ -551,11 +552,11 @@ impl Rvalue {
 
 /// A piece of code to inline into kernels, such as what one loop body does
 /// to its element. Its kernel's parameters are the function's inputs, of
-/// any type; `Return` ends it, with the result, if any, in `result`.
+/// any type; `Return` ends it, with its results, if any, in `results`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Function {
     pub kernel: Kernel,
-    pub result: Option<Local>,
+    pub results: Vec<Local>,
 }
 
 impl Function {
@@ -563,18 +564,16 @@ impl Function {
         &self.kernel.locals[..self.kernel.params]
     }
 
-    pub fn result_ty(&self) -> Option<Ty> {
-        self.result.map(|local| self.kernel.locals[local.0 as usize])
+    pub fn result_types(&self) -> Vec<Ty> {
+        self.results.iter().map(|local| self.kernel.locals[local.0 as usize]).collect()
     }
 
     pub fn validate(&self) -> Result<(), Invalid> {
         self.kernel.validate_body()?;
-        match self.result {
-            Some(local) if local.0 as usize >= self.kernel.locals.len() => {
-                Err(Invalid("the result is not a local".into()))
-            }
-            _ => Ok(()),
+        if self.results.iter().any(|local| local.0 as usize >= self.kernel.locals.len()) {
+            return Err(Invalid("a result is not a local".into()));
         }
+        Ok(())
     }
 
     /// Statements, not counting copies: a rough size for reports.
