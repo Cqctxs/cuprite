@@ -2028,6 +2028,264 @@ pub fn struct_unused_output(values: &mut [u32], other: &mut [u32]) {
     other[0] = 1;
 }
 
+// Unions (development code): built through one field and read through
+// another, `MaybeUninit`, `mem::zeroed`, partial writes that keep the other
+// bytes, unions inside values, and writes through pointer casts.
+
+/// Floats and their bits, as `glam`'s `UnionCast` and `safe_arch` pun them.
+#[derive(Clone, Copy)]
+pub union Cast {
+    pub floats: [f32; 4],
+    pub words: [u32; 4],
+}
+
+/// A wide number, its low half, and its bytes.
+#[derive(Clone, Copy)]
+pub union Parts {
+    pub wide: u64,
+    pub half: u16,
+    pub bytes: [u8; 8],
+}
+
+/// `rand_chacha`'s vector storage: the same 16 bytes as words, halves of
+/// 64 bits and one 128-bit number.
+#[derive(Clone, Copy)]
+pub union Storage {
+    pub words: [u32; 4],
+    pub halves: [u64; 2],
+    pub whole: [u128; 1],
+}
+
+/// A union inside a struct, 8 bytes in.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct Tagged {
+    pub tag: u32,
+    pub value: Parts,
+}
+
+/// A float's bits through a union, and back with the sign flipped.
+pub fn union_cast(values: &mut [f32]) {
+    for value in values {
+        let cast = Cast { floats: [*value, -*value, 1.5, *value * 2.0] };
+        let words = unsafe { cast.words };
+        let back = Cast { words: [words[0] ^ 0x8000_0000, words[1], words[3], words[2]] };
+        *value = unsafe { back.floats[0] + back.floats[3] };
+    }
+}
+
+/// A partial write: the low half replaced, the other six bytes kept.
+pub fn union_partial(values: &mut [u64]) {
+    for value in values {
+        let mut parts = Parts { wide: *value };
+        parts.half = (*value >> 48) as u16;
+        let bytes = unsafe { parts.bytes };
+        *value = unsafe { parts.wide } ^ u64::from(bytes[7]) << 8;
+    }
+}
+
+/// 128-bit storage, written as words and read as halves and whole.
+pub fn union_storage(values: &mut [u64]) {
+    for value in values {
+        let low = *value as u32;
+        let storage = Storage { words: [low, (*value >> 32) as u32, !low, low.rotate_left(7)] };
+        let halves = unsafe { storage.halves };
+        let whole = unsafe { storage.whole[0] };
+        *value = halves[0].wrapping_add(halves[1]) ^ (whole >> 61) as u64;
+    }
+}
+
+/// Words transmuted into a struct holding a union 8 bytes in.
+pub fn union_transmute(values: &mut [u64]) {
+    for value in values {
+        let words = [*value as u32, 0, (*value >> 32) as u32, value.rotate_left(16) as u32];
+        let tagged: Tagged = unsafe { std::mem::transmute(words) };
+        *value = unsafe { tagged.value.wide } ^ u64::from(tagged.tag);
+    }
+}
+
+/// `MaybeUninit`: written, then read.
+pub fn union_maybe_uninit(values: &mut [u32]) {
+    for value in values {
+        let mut slot = std::mem::MaybeUninit::<[u32; 2]>::uninit();
+        slot.write([*value, value.wrapping_mul(3)]);
+        let pair = unsafe { slot.assume_init() };
+        *value = pair[0] ^ pair[1];
+    }
+}
+
+/// `mem::zeroed`, then a field set.
+pub fn union_zeroed(values: &mut [u32]) {
+    for value in values {
+        let mut pair: (u32, f32) = unsafe { std::mem::zeroed() };
+        pair.0 ^= *value;
+        *value = pair.0.wrapping_add(pair.1.to_bits());
+    }
+}
+
+/// A union written in one branch only, then read through the field last
+/// written (the others' bytes aren't all initialized).
+pub fn union_branch(values: &mut [u64]) {
+    for value in values {
+        let mut tagged = Tagged { tag: 0, value: Parts { wide: *value } };
+        if *value & 1 == 1 {
+            tagged.tag = 1;
+            tagged.value = Parts { half: 0xBEEF };
+        }
+        *value = if tagged.tag == 1 { u64::from(unsafe { tagged.value.half }) } else { unsafe { tagged.value.wide } };
+    }
+}
+
+/// A union written through a pointer to one of its fields.
+pub fn union_pointer(values: &mut [u32]) {
+    for value in values {
+        let mut cast = Cast { words: [*value, 0, 0, 0] };
+        let floats = unsafe { &mut cast.floats } as *mut [f32; 4] as *mut f32;
+        unsafe { *floats.cast::<u32>() ^= 0xFF };
+        *value = unsafe { cast.words[0] };
+    }
+}
+
+/// Writes through a pointer cast to data of another type: a byte of a
+/// number, through a view of its bytes.
+pub fn union_view_write(values: &mut [u32]) {
+    for value in values {
+        let mut number = *value;
+        let bytes = &mut number as *mut u32 as *mut [u8; 4];
+        unsafe { (*bytes)[1] = 0xA5 };
+        *value = number;
+    }
+}
+
+/// `ultraviolet`'s wide vectors, which `wide` and `safe_arch` build on
+/// `MaybeUninit` and SSE: four lengths at once, lanes summed.
+pub fn union_wide(values: &mut [f32]) {
+    for value in values {
+        let v = ultraviolet::Vec3x4::splat(ultraviolet::Vec3::new(*value, 1.0, -2.0));
+        let lengths: [f32; 4] = v.mag().into();
+        *value = lengths[0] + lengths[3];
+    }
+}
+
+// Pointers (development code): slice iterators over arrays and read-only
+// slices, element pointers moved along an array, pointer comparisons and
+// differences, byte pointers moved along a buffer, and references chosen at
+// run time among an array's elements.
+
+/// An array's elements summed through its iterator.
+pub fn ptr_iter_sum(values: &mut [u32]) {
+    for value in values {
+        let parts = [*value, *value >> 8, *value >> 16, value.rotate_left(5)];
+        *value = parts.iter().fold(0u32, |sum, part| sum.wrapping_add(*part));
+    }
+}
+
+/// Each element of an array changed through its mutable iterator.
+pub fn ptr_iter_mut(values: &mut [u32]) {
+    for value in values {
+        let mut parts = [*value, *value ^ 0xFF, value.wrapping_mul(3)];
+        for part in &mut parts {
+            *part = part.rotate_left(3);
+        }
+        *value = parts[0] ^ parts[1] ^ parts[2];
+    }
+}
+
+/// Backwards through a mutable iterator.
+pub fn ptr_iter_rev(values: &mut [u64]) {
+    for value in values {
+        let mut parts = [*value, *value >> 1, *value >> 2];
+        let mut carry = 1u64;
+        for part in parts.iter_mut().rev() {
+            *part = part.wrapping_add(carry);
+            carry = *part & 1;
+        }
+        *value = parts[0] ^ parts[1].rotate_left(7) ^ parts[2].rotate_left(13);
+    }
+}
+
+/// A read-only slice parameter walked by its iterator inside each element.
+pub fn ptr_table_fold(values: &mut [u32], table: &[u32]) {
+    for value in values {
+        *value = table.iter().fold(*value, |acc, &t| acc.rotate_left(1) ^ t);
+    }
+}
+
+/// `as_ptr`, `add` and reads.
+pub fn ptr_add(values: &mut [u32]) {
+    for value in values {
+        let parts = [*value, *value >> 4, *value >> 8, *value >> 12];
+        let p = parts.as_ptr();
+        *value = unsafe { *p.add(1) ^ *p.add(3) };
+    }
+}
+
+/// Writes through `as_mut_ptr` and `add`, and the distance between two
+/// pointers.
+pub fn ptr_write_distance(values: &mut [u32]) {
+    for value in values {
+        let mut parts = [*value; 4];
+        let start = parts.as_mut_ptr();
+        let at = unsafe { start.add((*value & 3) as usize) };
+        unsafe { *at = 0 };
+        let distance = unsafe { at.offset_from(start) } as u32;
+        *value = parts[0] ^ parts[1] ^ parts[2] ^ parts[3] ^ distance << 28;
+    }
+}
+
+/// Pointers compared.
+pub fn ptr_compare(values: &mut [u32]) {
+    for value in values {
+        let parts = [*value, 1, 2];
+        let a = parts.as_ptr();
+        let b = unsafe { a.add((*value % 2) as usize) };
+        *value = u32::from(a == b) | u32::from(a < b) << 1 | u32::from(b == unsafe { a.add(1) }) << 2;
+    }
+}
+
+/// Unaligned reads from a byte buffer at constant offsets, as hash
+/// functions read their input.
+pub fn ptr_bytes(values: &mut [u64]) {
+    for value in values {
+        let bytes = value.to_le_bytes();
+        let p = bytes.as_ptr();
+        let low = unsafe { p.cast::<u32>().read_unaligned() };
+        let middle = unsafe { p.add(2).cast::<u32>().read_unaligned() };
+        *value = u64::from(low) << 32 | u64::from(middle);
+    }
+}
+
+/// A `u32` read at a byte offset known only at run time (0, 4, 1 or 3, from
+/// the top bits): on the GPU where it falls on a group of four bytes;
+/// elsewhere the GPU's check fails and the CPU reads it.
+pub fn ptr_runtime_offset(values: &mut [u64]) {
+    for value in values {
+        let bytes = value.to_le_bytes();
+        let at = [0usize, 4, 1, 3][(*value >> 62) as usize];
+        let word = unsafe { bytes.as_ptr().add(at).cast::<u32>().read_unaligned() };
+        *value = u64::from(word);
+    }
+}
+
+/// An array split in two (`split_at`, a slice from a pointer and a length).
+pub fn ptr_split(values: &mut [u32]) {
+    for value in values {
+        let parts = [*value, *value >> 3, *value >> 6, *value >> 9, *value >> 12];
+        let (head, tail) = parts.split_at(2);
+        *value = head[1] ^ tail[0] ^ tail[2].rotate_left(tail.len() as u32);
+    }
+}
+
+/// A reference chosen at run time among an array's elements.
+pub fn ptr_choose(values: &mut [u32]) {
+    for value in values {
+        let mut parts = [*value, 7, 9];
+        let chosen = if *value & 1 == 0 { &mut parts[0] } else { &mut parts[2] };
+        *chosen = chosen.wrapping_add(100);
+        *value = parts[0] ^ parts[1] ^ parts[2];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

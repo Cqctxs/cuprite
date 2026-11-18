@@ -904,7 +904,108 @@ fn held_out(state: &mut u64, xs: &[f32], weights: &[u8]) -> usize {
     checked += general("oorandom_64", state, probes::oorandom_64, |x: u64| {
         oorandom::Rand64::new(u128::from(x) << 3 | 1).rand_u64()
     });
-    checked + points(state) + structs(state)
+    checked + points(state) + structs(state) + unions(state) + pointers(state)
+}
+
+/// Pointers and slice iterators, against references written with indices
+/// rather than the iterators they test.
+#[allow(clippy::needless_range_loop)]
+fn pointers(state: &mut u64) -> usize {
+    let mut checked = 0;
+    checked += general("ptr_iter_sum", state, probes::ptr_iter_sum, |v: u32| {
+        let parts = [v, v >> 8, v >> 16, v.rotate_left(5)];
+        let mut sum = 0u32;
+        for i in 0..4 {
+            sum = sum.wrapping_add(parts[i]);
+        }
+        sum
+    });
+    checked += general("ptr_iter_mut", state, probes::ptr_iter_mut, |v: u32| {
+        (v.rotate_left(3)) ^ (v ^ 0xFF).rotate_left(3) ^ v.wrapping_mul(3).rotate_left(3)
+    });
+    checked += general("ptr_iter_rev", state, probes::ptr_iter_rev, |v: u64| {
+        let mut parts = [v, v >> 1, v >> 2];
+        let mut carry = 1u64;
+        for i in (0..3).rev() {
+            parts[i] = parts[i].wrapping_add(carry);
+            carry = parts[i] & 1;
+        }
+        parts[0] ^ parts[1].rotate_left(7) ^ parts[2].rotate_left(13)
+    });
+    for table in [vec![3u32, 0xFFFF_0000, 7, 12_345, 1], Vec::new()] {
+        checked += general("ptr_table_fold", state, |v: &mut [u32]| probes::ptr_table_fold(v, &table), |v: u32| {
+            let mut acc = v;
+            for i in 0..table.len() {
+                acc = acc.rotate_left(1) ^ table[i];
+            }
+            acc
+        });
+    }
+    checked += general("ptr_add", state, probes::ptr_add, |v: u32| (v >> 4) ^ (v >> 12));
+    checked += general("ptr_split", state, probes::ptr_split, |v: u32| (v >> 3) ^ (v >> 6) ^ (v >> 12).rotate_left(3));
+    checked += general("ptr_bytes", state, probes::ptr_bytes, |v: u64| (v << 32) | (v >> 16) & 0xFFFF_FFFF);
+    checked += general("ptr_write_distance", state, probes::ptr_write_distance, |v: u32| v ^ (v & 3) << 28);
+    checked += general("ptr_compare", state, probes::ptr_compare, |v: u32| {
+        let odd = v % 2 == 1;
+        u32::from(!odd) | u32::from(odd) << 1 | u32::from(odd) << 2
+    });
+    checked += general("ptr_choose", state, probes::ptr_choose, |v: u32| {
+        let mut parts = [v, 7, 9];
+        let at = if v & 1 == 0 { 0 } else { 2 };
+        parts[at] = parts[at].wrapping_add(100);
+        parts[0] ^ parts[1] ^ parts[2]
+    });
+    // A loop over an array field by reference, in a slice of structs.
+    for len in LENGTHS {
+        let particles: Vec<probes::Particle> = (0..len)
+            .map(|_| probes::Particle {
+                position: probes::Vec3 { x: f32::random(state), y: f32::random(state), z: f32::random(state) },
+                velocity: [f32::random(state), f32::random(state), f32::random(state)],
+                mass: f32::random(state),
+                id: u32::random(state),
+            })
+            .collect();
+        let mut out = particles.clone();
+        probes::struct_array_loop(&mut out);
+        let expected: Vec<probes::Particle> =
+            particles.iter().map(|p| probes::Particle { velocity: p.velocity.map(|v| v * 0.5), ..*p }).collect();
+        let bits = |p: &probes::Particle| {
+            let f = |x: f32| float_bits(x.into());
+            vec![f(p.position.x), f(p.position.y), f(p.position.z), f(p.velocity[0]), f(p.velocity[1]), f(p.velocity[2]), f(p.mass), p.id.into()]
+        };
+        same_structs(&format!("struct_array_loop, {len} elements"), &out, &expected, bits);
+    }
+    checked + LENGTHS.len()
+}
+
+/// Unions, each against a reference written with bit operations.
+fn unions(state: &mut u64) -> usize {
+    let mut checked = 0;
+    checked += general("union_cast", state, probes::union_cast, |v: f32| f32::from_bits(v.to_bits() ^ 0x8000_0000) + 1.5);
+    checked += general("union_partial", state, probes::union_partial, |v: u64| {
+        let wide = (v & !0xFFFF) | (v >> 48);
+        wide ^ (wide >> 56) << 8
+    });
+    checked += general("union_storage", state, probes::union_storage, |v: u64| {
+        let low = v as u32;
+        let high_half = u64::from(!low) | u64::from(low.rotate_left(7)) << 32;
+        let whole = u128::from(v) | u128::from(high_half) << 64;
+        v.wrapping_add(high_half) ^ (whole >> 61) as u64
+    });
+    checked += general("union_transmute", state, probes::union_transmute, |v: u64| {
+        let wide = (v >> 32) | u64::from(v.rotate_left(16) as u32) << 32;
+        wide ^ u64::from(v as u32)
+    });
+    checked += general("union_maybe_uninit", state, probes::union_maybe_uninit, |v: u32| v ^ v.wrapping_mul(3));
+    checked += general("union_zeroed", state, probes::union_zeroed, |v: u32| v);
+    checked += general("union_branch", state, probes::union_branch, |v: u64| if v & 1 == 1 { 0xBEEF } else { v });
+    checked += general("union_pointer", state, probes::union_pointer, |v: u32| v ^ 0xFF);
+    checked += general("union_view_write", state, probes::union_view_write, |v: u32| (v & !0xFF00) | 0xA500);
+    checked += general("union_wide", state, probes::union_wide, |v: f32| {
+        let length = ultraviolet::Vec3::new(v, 1.0, -2.0).mag();
+        length + length
+    });
+    checked
 }
 
 /// A float's bits for comparison, with every NaN the same.

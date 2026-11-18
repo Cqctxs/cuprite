@@ -29,7 +29,8 @@
 //!   backend sees them.
 //! - **Reinterpreting** keeps the bits and changes the type, between
 //!   integers and floats of one width, like `f32::to_bits`; NaN payloads
-//!   are kept.
+//!   are kept. A pointer and a `u64` reinterpret as each other, to order
+//!   and subtract addresses.
 //! - **Pointers** are 64-bit addresses of global memory. A buffer argument
 //!   is one; [`Rvalue::Offset`] steps through it.
 
@@ -401,7 +402,9 @@ impl Kernel {
             Rvalue::Reinterpret(a, to) => {
                 let from = ty(a);
                 let plain = |t: Ty| t.is_int() || t.is_float();
-                if plain(from) && plain(*to) && from.bits() == to.bits() {
+                // An address as a number, and back, to order and subtract.
+                let address = matches!((from, *to), (Ty::Ptr, Ty::U64) | (Ty::U64, Ty::Ptr));
+                if plain(from) && plain(*to) && from.bits() == to.bits() || address {
                     Ok(*to)
                 } else {
                     fail(format!("reinterpreting {from:?} as {to:?}"))

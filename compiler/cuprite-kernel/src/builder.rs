@@ -50,6 +50,49 @@ impl Builder {
         self.kernel.ty(operand.into())
     }
 
+    /// The value of an integer operand, if it is a constant or a local
+    /// assigned exactly once so far from constants by copies, casts,
+    /// addition, subtraction and multiplication, through no local in
+    /// `moving`: those the caller knows may be assigned again later.
+    pub fn constant(&self, operand: impl Into<Operand>, moving: &std::collections::HashSet<Local>) -> Option<i128> {
+        self.fold(operand.into(), moving, 0)
+    }
+
+    fn fold(&self, operand: Operand, moving: &std::collections::HashSet<Local>, depth: usize) -> Option<i128> {
+        let local = match operand {
+            Operand::Const(constant) if constant.ty.is_int() => return Some(constant.signed()),
+            Operand::Const(_) => return None,
+            Operand::Local(local) => local,
+        };
+        if depth > 32 || local.0 < self.kernel.params as u32 || moving.contains(&local) {
+            return None;
+        }
+        let mut assigned = self.kernel.blocks.iter().flat_map(|block| &block.statements).filter_map(|statement| match statement {
+            Statement::Assign(target, rvalue) if *target == local => Some(rvalue),
+            _ => None,
+        });
+        let rvalue = assigned.next()?;
+        if assigned.next().is_some() {
+            return None;
+        }
+        let wrap = |value: i128| {
+            let ty = self.kernel.ty(local.into());
+            ty.is_int().then(|| Const::int(ty, value).signed())
+        };
+        match rvalue {
+            Rvalue::Use(a) | Rvalue::Cast(a, _) => wrap(self.fold(*a, moving, depth + 1)?),
+            Rvalue::Binary(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), a, b) => {
+                let (a, b) = (self.fold(*a, moving, depth + 1)?, self.fold(*b, moving, depth + 1)?);
+                wrap(match op {
+                    BinOp::Add => a.wrapping_add(b),
+                    BinOp::Sub => a.wrapping_sub(b),
+                    _ => a.wrapping_mul(b),
+                })
+            }
+            _ => None,
+        }
+    }
+
     pub fn local(&mut self, ty: Ty) -> Local {
         self.kernel.locals.push(ty);
         Local(self.kernel.locals.len() as u32 - 1)

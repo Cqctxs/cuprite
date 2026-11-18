@@ -309,5 +309,19 @@ fn main() {
         }
     }
 
+    // A `u32` read at a run-time byte offset from the top bits: offsets 0
+    // and 4 stay on the GPU; 1 and 3 fail the GPU's check, and the CPU
+    // reads them. Neither panics.
+    let aligned: Vec<u64> = longs.iter().map(|v| v & !(1 << 63)).collect();
+    for (name, input) in [("ptr_runtime_offset, aligned", &aligned), ("ptr_runtime_offset, unaligned", &longs)] {
+        count(check(name, input, probes::ptr_runtime_offset, |v| {
+            for value in v {
+                let bytes = value.to_le_bytes();
+                let at = [0usize, 4, 1, 3][(*value >> 62) as usize];
+                *value = u64::from(u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]));
+            }
+        }));
+    }
+
     println!("{} outcomes match ({passed} returned, {panicked} panicked)", passed + panicked);
 }

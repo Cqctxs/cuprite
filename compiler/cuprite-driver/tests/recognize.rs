@@ -9,6 +9,31 @@ use support::{run, text, Probes, NO_PROFILE};
 
 /// Verdicts that do not depend on the build profile.
 const COMMON: &[(&str, &str)] = &[
+    ("union_transmute", "candidate: map over `[u64]`"),
+    ("ptr_runtime_offset", "candidate: map over `[u64]`"),
+    ("ptr_bytes", "candidate: map over `[u64]`"),
+    ("ptr_add", "candidate: map over `[u32]`"),
+    ("ptr_choose", "candidate: map over `[u32]`"),
+    ("ptr_compare", "candidate: map over `[u32]`"),
+    ("ptr_iter_mut", "candidate: map over `[u32]`"),
+    ("ptr_iter_rev", "candidate: map over `[u64]`"),
+    ("ptr_iter_sum", "candidate: map over `[u32]`"),
+    ("ptr_table_fold", "candidate: map over `[u32]` indexing `table`"),
+    ("ptr_write_distance", "candidate: map over `[u32]`"),
+    ("struct_array_loop", "candidate: map over `[Particle]`"),
+    ("<Cast as std::clone::Clone>::clone", "rejected: takes `&Cast`, not a `&mut` slice"),
+    ("<Parts as std::clone::Clone>::clone", "rejected: takes `&Parts`, not a `&mut` slice"),
+    ("<Storage as std::clone::Clone>::clone", "rejected: takes `&Storage`, not a `&mut` slice"),
+    ("<Tagged as std::clone::Clone>::clone", "rejected: takes `&Tagged`, not a `&mut` slice"),
+    ("pointer_write", "candidate: map over `[u64]`"),
+    ("union_branch", "candidate: map over `[u64]`"),
+    ("union_cast", "candidate: map over `[f32]`"),
+    ("union_maybe_uninit", "candidate: map over `[u32]`"),
+    ("union_partial", "candidate: map over `[u64]`"),
+    ("union_pointer", "candidate: map over `[u32]`"),
+    ("union_storage", "candidate: map over `[u64]`"),
+    ("union_view_write", "candidate: map over `[u32]`"),
+    ("union_wide", "candidate: map over `[f32]`"),
     ("struct_checked", "candidate: map over `[(u32, u32)]` also writing `counts`"),
     ("<Flagged as std::clone::Clone>::clone", "rejected: takes `&Flagged`, not a `&mut` slice"),
     ("<Flagged as std::cmp::PartialEq>::eq", "rejected: takes `&Flagged`, not a `&mut` slice"),
@@ -25,7 +50,6 @@ const COMMON: &[(&str, &str)] = &[
     ("<Widths as std::clone::Clone>::clone", "rejected: takes `&Widths`, not a `&mut` slice"),
     ("<Widths as std::cmp::PartialEq>::eq", "rejected: takes `&Widths`, not a `&mut` slice"),
     ("<Widths as std::fmt::Debug>::fmt", "rejected: takes `&Widths`, not a `&mut` slice"),
-    ("struct_array_loop", "rejected: calls `<&mut [f32; 3] as std::iter::IntoIterator>::into_iter`, which reinterprets bits as `std::ptr::NonNull<[f32]>` (a transmute)"),
     ("struct_each", "candidate: map over `[Vec3]` reading `scale`"),
     ("struct_flagged", "rejected: iterates over `[Flagged]`, whose element holds `bool`"),
     ("struct_lengths", "candidate: map over `[f32]` zipped with `vectors`"),
@@ -145,7 +169,6 @@ const COMMON: &[(&str, &str)] = &[
     ("sse_min_mask", "candidate: map over `[u32]`"),
     ("sse_mix", "candidate: map over `[u32]`"),
     ("pointer_views", "candidate: map over `[u64]`"),
-    ("pointer_write", "rejected: calls `std::ptr::write_unaligned::<u64>`, which writes through a pointer to data of another type"),
     // 128-bit integers.
     ("wide_bits", "candidate: map over `[u64]`"),
     ("wide_divide", "candidate: map over `[u64]` reading `divisor`"),
@@ -239,10 +262,12 @@ const COMMON: &[(&str, &str)] = &[
 /// rustc inlines differently in debug and release builds, which changes
 /// where some refusals are found.
 const DEBUG: &[(&str, &str)] = &[
+    ("ptr_split", "rejected: calls `core::slice::<impl [u32]>::split_at`, which calls `core::slice::<impl [u32]>::split_at_unchecked`, which converts a pointer to `*mut ()`"),
+    ("xxh32_keys", "rejected: calls `xxhash_rust::xxh32::xxh32`, which chooses between references at run time"),
+    ("xxh64_keys", "rejected: calls `xxhash_rust::xxh64::xxh64`, which chooses between references at run time"),
+    ("noise_row", "rejected: calls `noise::Perlin::new`, which calls `noise::permutationtable::PermutationTable::new`, which calls `<rand_xorshift::XorShiftRng as rand_core::SeedableRng>::from_seed`, which calls `rand_core::le::read_u32_into`, which calls `core::slice::<impl [u8]>::chunks_exact`, which calls `core::slice::<impl [u8]>::split_at_unchecked`, which converts a pointer to `*mut ()`"),
+    ("union_zeroed", "rejected: calls `std::mem::zeroed::<(u32, f32)>`, which calls `std::ptr::write_bytes::precondition_check`, which calls `std::ptr::const_ptr::<impl *const ()>::is_aligned_to`, which reinterprets bits as `usize` (a transmute)"),
     ("sr_div_rem", "candidate: map over `[u64]` reading `divisor`"),
-    ("xxh32_keys", "rejected: calls `xxhash_rust::xxh32::xxh32`, which calls `xxhash_rust::utils::get_unaligned_chunk::<u32>`, which calls `core::slice::<impl [u8]>::as_ptr`, which converts a pointer to `*const u8`"),
-    ("xxh64_keys", "rejected: calls `xxhash_rust::xxh64::xxh64`, which calls `xxhash_rust::utils::get_unaligned_chunk::<u64>`, which calls `core::slice::<impl [u8]>::as_ptr`, which converts a pointer to `*const u8`"),
-    ("noise_row", "rejected: calls `noise::Perlin::new`, which calls `noise::permutationtable::PermutationTable::new`, which calls `<rand_xorshift::XorShiftRng as rand_core::SeedableRng>::from_seed`, which calls `rand_core::le::read_u32_into`, which calls `core::slice::<impl [u32]>::iter_mut`, which calls `std::slice::IterMut::<'_, u32>::new`, which reinterprets bits as `std::ptr::NonNull<[u32]>` (a transmute)"),
     ("half_decode", "rejected: calls `<{closure} as std::ops::FnMut<((&mut f32, &u16),)>>::call_mut`, which calls `half::f16::to_f32`, which calls `half::binary16::arch::f16_to_f32`, which calls `half::binary16::arch::x86::f16_to_f32_x86_f16c`, which calls `std::arch::x86_64::_mm_cvtph_ps`, which uses `f16`, a number the kernel doesn't have"),
     ("half_encode", "candidate: map over `[u16]` zipped with `values` with the host's CPU features"),
     ("half_round_trip", "rejected: calls `half::f16::to_f32`, which calls `half::binary16::arch::f16_to_f32`, which calls `half::binary16::arch::x86::f16_to_f32_x86_f16c`, which calls `std::arch::x86_64::_mm_cvtph_ps`, which uses `f16`, a number the kernel doesn't have"),
@@ -257,10 +282,12 @@ const DEBUG: &[(&str, &str)] = &[
     ("palette_saturation", "rejected: calls `<palette::Hsv as palette::FromColor<palette::rgb::Rgb>>::from_color`, which calls `<palette::Hsv as palette::convert::FromColorUnclamped<palette::rgb::Rgb>>::from_color_unclamped`, which calls `std::any::TypeId::of::<bool>`, which uses a constant holding a reference"),
 ];
 const RELEASE: &[(&str, &str)] = &[
+    ("ptr_split", "candidate: map over `[u32]`"),
+    ("noise_row", "rejected: calls `noise::Perlin::new`, which calls `noise::permutationtable::PermutationTable::new`, which calls `<rand_xorshift::XorShiftRng as rand_core::SeedableRng>::from_seed`, which calls `rand_core::le::read_u32_into`, which calls `core::slice::<impl [u8]>::chunks_exact`, which calls `core::slice::<impl [u8]>::split_at_unchecked`, which takes a slice of an array at a position known only at run time"),
+    ("union_zeroed", "candidate: map over `[u32]`"),
     ("sr_div_rem", "candidate: map over `[u64]` reading `divisor`"),
     ("xxh32_keys", "rejected: calls `xxhash_rust::xxh32::xxh32`, which converts a pointer to `*const std::ptr::Unaligned<u32>`"),
     ("xxh64_keys", "rejected: calls `xxhash_rust::xxh64::xxh64`, which converts a pointer to `*const std::ptr::Unaligned<u64>`"),
-    ("noise_row", "rejected: calls `noise::Perlin::new`, which calls `noise::permutationtable::PermutationTable::new`, which calls `<rand_xorshift::XorShiftRng as rand_core::SeedableRng>::from_seed`, which calls `rand_core::le::read_u32_into`, which reinterprets bits as `std::ptr::NonNull<[u32]>` (a transmute)"),
     ("half_decode", "rejected: calls `<{closure} as std::ops::FnMut<((&mut f32, &u16),)>>::call_mut`, which calls `half::binary16::arch::x86::f16_to_f32_x86_f16c`, which uses `f16`, a number the kernel doesn't have"),
     ("half_encode", "candidate: map over `[u16]` zipped with `values` with the host's CPU features"),
     ("half_round_trip", "rejected: calls `half::f16::to_f32`, which calls `half::binary16::arch::f16_to_f32`, which calls `half::binary16::arch::x86::f16_to_f32_x86_f16c`, which uses `f16`, a number the kernel doesn't have"),
@@ -355,7 +382,7 @@ fn checks(name: &'static str, release: bool) -> std::path::PathBuf {
 const FAILED_CHECK: &str = "-> cpu (a check failed on the GPU)";
 
 /// Runtime calls the checks program makes.
-const CHECK_CALLS: usize = 37;
+const CHECK_CALLS: usize = 39;
 
 /// Calls whose checks pass keep the GPU's results; calls where one fails
 /// fall back to the CPU, which panics with the same message and leaves the
@@ -372,7 +399,7 @@ const CHECK_CALLS: usize = 37;
     ignore = "needs an NVIDIA GPU; enable the gpu-tests feature"
 )]
 fn failed_checks_on_the_gpu_behave_like_the_cpu() {
-    for (name, release, failed) in [("checks-debug", false, 17), ("checks-release", true, 14)] {
+    for (name, release, failed) in [("checks-debug", false, 18), ("checks-release", true, 15)] {
         let trace = run(&checks(name, release), true, &[]);
         let calls = trace.lines().filter(|line| line.starts_with("cuprite: ")).count();
         assert_eq!(calls, CHECK_CALLS, "{name}:\n{trace}");
@@ -450,7 +477,10 @@ fn rewritten_candidates_match_the_cpu_on_the_gpu() {
     // Then `kurbo`'s maps over two slices (one zipped with a slice 3
     // shorter) and over slices of `Point`. Then 14 maps over slices of
     // structs, tuples and arrays, and over several `&mut` slices, one of
-    // them `struct_simulate` with 13 passes.
+    // them `struct_simulate` with 13 passes. Then 10 maps through unions, and
+    // `pointer_write`, which writes through a pointer cast. Then 10 maps with
+    // pointers and slice iterators, one of them twice (with an empty table),
+    // and `struct_array_loop`.
     let with_work = LENGTHS - 3;
     let gpu_calls = 9 * non_empty + 3 * 2 * non_empty + non_empty + (7 + 5 + 8 + 3) * non_empty
         + 2 * 2 * non_empty
@@ -468,7 +498,9 @@ fn rewritten_candidates_match_the_cpu_on_the_gpu() {
         + 10 * non_empty
         + 3 * non_empty
         + with_work
-        + 14 * non_empty;
+        + 14 * non_empty
+        + 11 * non_empty
+        + 12 * non_empty;
     assert_eq!(trace.matches("-> gpu").count(), gpu_calls, "{trace}");
     for (passes, functions) in REGIONS {
         let calls = trace.matches(&format!("passes={passes} -> gpu")).count();

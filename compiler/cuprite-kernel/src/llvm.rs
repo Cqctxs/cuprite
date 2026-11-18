@@ -158,6 +158,10 @@ impl Emitter<'_> {
                 let x = self.operand(*a);
                 if lt(from) == lt(*to) {
                     x
+                } else if from == Ty::Ptr {
+                    self.value(format!("ptrtoint {} {x} to i64", lt(from)))
+                } else if *to == Ty::Ptr {
+                    self.value(format!("inttoptr i64 {x} to {}", lt(*to)))
                 } else {
                     self.value(format!("bitcast {} {x} to {}", lt(from), lt(*to)))
                 }
