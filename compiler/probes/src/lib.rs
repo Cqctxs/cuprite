@@ -1767,8 +1767,31 @@ pub fn exact_swap_eq(values: &mut [u32]) {
     }
 }
 
+/// Pack a point's row and column into separate halves of the result.
+pub fn indexed_grid(values: &mut [u64], width: usize) {
+    for (index, value) in values.iter_mut().enumerate() {
+        let column = index % width;
+        let row = index / width;
+        *value = (row as u64) << 32 | column as u64;
+    }
+}
+
+/// A parallel zip numbers the common prefix from zero.
+pub fn indexed_zip_rayon(values: &mut [u64], offsets: &[u64]) {
+    values.par_iter_mut().zip(offsets).enumerate().for_each(|(index, (value, offset))| {
+        *value = offset.wrapping_add(index as u64);
+    });
+}
+
+/// Reversing the slice breaks the forward index-to-address relationship.
+pub fn indexed_reverse(values: &mut [u64]) {
+    for (index, value) in values.iter_mut().rev().enumerate() {
+        *value = index as u64;
+    }
+}
+
 // Development code for the grid structure: `noise`, whose generators the
-// grid measurement ported. Run before the grid shape exists, as a baseline.
+// grid measurement ported.
 
 /// A grid of Perlin noise, row-major, `width` values per row.
 pub fn noise_grid(values: &mut [f32], width: usize, scale: f64) {

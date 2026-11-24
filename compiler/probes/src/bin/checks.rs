@@ -323,5 +323,15 @@ fn main() {
         }));
     }
 
+    // A zero width fails the first remainder before any output is written.
+    for width in [0, 17] {
+        count(check("indexed grid", &longs, |values| probes::indexed_grid(values, width), |values| {
+            for (index, value) in values.iter_mut().enumerate() {
+                let column = index % width;
+                *value = ((index / width) as u64) << 32 | column as u64;
+            }
+        }));
+    }
+
     println!("{} outcomes match ({passed} returned, {panicked} panicked)", passed + panicked);
 }

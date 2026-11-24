@@ -9,6 +9,7 @@
 //!   (`par_iter_mut()`), whose closure is the loop body. `T` is a number,
 //!   or a struct, tuple or array of numbers with no padding
 //!   (`translate::slice`), so its bytes can move to the GPU as they are.
+//!   `enumerate()` pairs a supported iterator's item with its zero-based index.
 //!   The loop may `zip` the slice with other `&mut` slices, which it then
 //!   writes too, and with read-only slices; it may index read-only slices
 //!   of numbers; and other parameters are plain data. The loop body may
@@ -322,6 +323,8 @@ enum Known {
     SliceIter,
     /// `Iterator::zip`.
     Zip,
+    /// `Iterator::enumerate` or Rayon's `IndexedParallelIterator::enumerate`.
+    Enumerate,
     /// `Iterator::next`.
     Next,
     /// `Iterator::for_each`.
@@ -339,18 +342,18 @@ impl Known {
     fn iterates(self) -> bool {
         matches!(
             self,
-            Known::IntoIter | Known::SliceIterMut | Known::SliceIter | Known::Zip | Known::Next | Known::ForEach
+            Known::IntoIter | Known::SliceIterMut | Known::SliceIter | Known::Zip | Known::Enumerate | Known::Next | Known::ForEach
         )
     }
 }
 
 /// Rayon's methods that mean the same as the sequential ones, by trait and
-/// method name: a parallel iterator over a slice, `zip` (which also stops
-/// at the shorter side) and `for_each` (whose function must be `Fn`).
-const RAYON: [(&str, &str, Known); 4] = [
+/// method name. Indexed parallel slices preserve order through zip and enumerate.
+const RAYON: [(&str, &str, Known); 5] = [
     ("IntoParallelRefMutIterator", "par_iter_mut", Known::SliceIterMut),
     ("IntoParallelRefIterator", "par_iter", Known::SliceIter),
     ("IndexedParallelIterator", "zip", Known::Zip),
+    ("IndexedParallelIterator", "enumerate", Known::Enumerate),
     ("ParallelIterator", "for_each", Known::ForEach),
 ];
 
@@ -857,6 +860,7 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
             if tcx.is_lang_item(trait_id, LangItem::Iterator) {
                 match method.as_str() {
                     "zip" => return Ok(Known::Zip),
+                    "enumerate" => return Ok(Known::Enumerate),
                     "for_each" => return Ok(Known::ForEach),
                     _ => {}
                 }
@@ -971,7 +975,7 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
 
     /// What an iterator yields, from the calls that built it: `into_iter`
     /// or `iter_mut` on a `&mut` slice parameter, `iter` or a plain `&[T]`
-    /// on an input slice parameter, and `zip`. Records the calls' blocks in
+    /// on an input slice parameter, `zip`, and `enumerate`. Records the calls' blocks in
     /// `chain` and every local the iterator passes through in `plumbing`.
     fn lanes(
         &self,
@@ -1012,6 +1016,10 @@ impl<'a, 'tcx> Recognizer<'a, 'tcx> {
                 let first = self.lanes(argument(0)?, params, chain, plumbing)?;
                 let second = self.zipped(argument(1)?, params, chain, plumbing)?;
                 Ok(Lane::Pair(Box::new(first), Box::new(second)))
+            }
+            Known::Enumerate => {
+                let item = self.lanes(argument(0)?, params, chain, plumbing)?;
+                Ok(Lane::Pair(Box::new(Lane::Index), Box::new(item)))
             }
             _ => Err(not_slice()),
         }

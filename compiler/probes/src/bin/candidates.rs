@@ -1223,6 +1223,31 @@ fn points(state: &mut u64) -> usize {
     4 * LENGTHS.len()
 }
 
+fn indexed_maps() -> usize {
+    for len in LENGTHS {
+        for width in [1, 17, 257] {
+            let mut output = vec![u64::MAX; len];
+            probes::indexed_grid(&mut output, width);
+            // Check with a nested row/column walk, independent of the kernel's
+            // division and remainder. The last row can be short.
+            for (row, values) in output.chunks(width).enumerate() {
+                for (column, &value) in values.iter().enumerate() {
+                    assert_eq!(value, (row as u64) << 32 | column as u64);
+                }
+            }
+        }
+
+        let offsets: Vec<u64> = (0..len.saturating_sub(3)).map(|i| !(i as u64 * 7)).collect();
+        let mut output = vec![42; len];
+        probes::indexed_zip_rayon(&mut output, &offsets);
+        for (index, &value) in output.iter().enumerate() {
+            let expected = offsets.get(index).map_or(42, |base| base.wrapping_add(index as u64));
+            assert_eq!(value, expected, "parallel zip at {index} of {len}");
+        }
+    }
+    4 * LENGTHS.len()
+}
+
 fn main() {
     let mut state = 0x9E37_79B9_7F4A_7C15;
     let mut checked = 0;
@@ -1255,5 +1280,6 @@ fn main() {
         }
     }
     checked += general_cases(&mut state);
+    checked += indexed_maps();
     println!("{checked} cases match");
 }

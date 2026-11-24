@@ -66,15 +66,15 @@ use slots::Slot;
 
 type Result<T> = std::result::Result<T, String>;
 
-/// What a `for` loop's iterator yields: an element of a slice the loop
-/// writes, a value of a read-only input slice, or a pair of those, from
-/// `zip`.
+/// A supported iterator's item, including nested pairs from `zip` and `enumerate`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Lane {
     /// `&mut` to the current element of this `&mut` slice parameter.
     Output(Local),
     /// `&` to the current element of this input slice parameter.
     Input(Local),
+    /// The zero-based `usize` from enumerating a forward slice iterator.
+    Index,
     Pair(Box<Lane>, Box<Lane>),
 }
 
@@ -82,7 +82,7 @@ impl Lane {
     /// The input slices, in the order the tuple names them.
     pub(crate) fn inputs(&self, out: &mut Vec<Local>) {
         match self {
-            Lane::Output(_) => {}
+            Lane::Output(_) | Lane::Index => {}
             Lane::Input(local) => out.push(*local),
             Lane::Pair(a, b) => {
                 a.inputs(out);
@@ -95,7 +95,7 @@ impl Lane {
     pub(crate) fn outputs(&self, out: &mut Vec<Local>) {
         match self {
             Lane::Output(local) => out.push(*local),
-            Lane::Input(_) => {}
+            Lane::Input(_) | Lane::Index => {}
             Lane::Pair(a, b) => {
                 a.outputs(out);
                 b.outputs(out);
@@ -244,7 +244,7 @@ pub(crate) fn translate<'tcx>(
         slots.insert(local, Slot::Ref(Box::new(slice)));
     }
     translator.bind_scalar_parameters(body, shape.leaves, leaf_params, &mut slots)?;
-    let item = lane_slot(shape.lane, &elements);
+    let item = lane_slot(shape.lane, &elements, &mut translator.b);
     if let Iteration::For { option, .. } = &shape.iteration {
         slots.insert(option.local, Slot::Some(Box::new(item.clone())));
     }
@@ -329,12 +329,17 @@ pub(crate) fn check_function<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, body: &Body
         .map_err(|invalid| format!("translated into an invalid kernel ({invalid})"))
 }
 
-/// The slot for what the iterator yields: references to this iteration's
-/// element of each slice, paired as `zip` pairs them.
-fn lane_slot(lane: &Lane, elements: &HashMap<Local, Slot>) -> Slot {
+/// Rebuild the iterator item, including the nested tuples from zip and enumerate.
+fn lane_slot(lane: &Lane, elements: &HashMap<Local, Slot>, builder: &mut Builder) -> Slot {
     match lane {
         Lane::Output(local) | Lane::Input(local) => Slot::Ref(Box::new(elements[local].clone())),
-        Lane::Pair(a, b) => Slot::Fields(vec![lane_slot(a, elements), lane_slot(b, elements)]),
+        Lane::Index => {
+            // A linear map assigns one thread to each element, in slice order.
+            // The kernel's bounds check excludes threads past the final element.
+            let index = builder.special(cuprite_kernel::Special::X);
+            Slot::Scalar(builder.cast(index, KTy::U64))
+        }
+        Lane::Pair(a, b) => Slot::Fields(vec![lane_slot(a, elements, builder), lane_slot(b, elements, builder)]),
     }
 }
 

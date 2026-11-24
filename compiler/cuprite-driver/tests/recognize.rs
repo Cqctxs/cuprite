@@ -9,6 +9,9 @@ use support::{run, text, Probes, NO_PROFILE};
 
 /// Verdicts that do not depend on the build profile.
 const COMMON: &[(&str, &str)] = &[
+    ("indexed_grid", "candidate: map over `[u64]` reading `width`"),
+    ("indexed_zip_rayon", "candidate: map over `[u64]` zipped with `offsets`"),
+    ("indexed_reverse", "rejected: iterates over something other than the slice parameter"),
     ("union_transmute", "candidate: map over `[u64]`"),
     ("ptr_runtime_offset", "candidate: map over `[u64]`"),
     ("ptr_bytes", "candidate: map over `[u64]`"),
@@ -69,8 +72,6 @@ const COMMON: &[(&str, &str)] = &[
     ("struct_tuples", "candidate: map over `[(u32, f32)]`"),
     ("struct_unused_output", "rejected: takes `other` as a `&mut` slice without iterating it alongside the first"),
     ("noise_fbm", "rejected: takes `&noise::Fbm<noise::Perlin>` as `fbm`, which a kernel can't take"),
-    ("noise_grid", "rejected: iterates over something other than the slice parameter"),
-    ("noise_grid_rayon", "rejected: iterates over something other than the slice parameter"),
     ("bf16_round_trip", "candidate: map over `[f32]`"),
     ("clamp_unit", "rejected: takes `&mut f32`, not a `&mut` slice"),
     ("each_affine", "candidate: map over `[u32]`"),
@@ -259,13 +260,18 @@ const COMMON: &[(&str, &str)] = &[
     ("xxh3_keys", "rejected: calls `xxhash_rust::xxh3::xxh3_64`, which makes a function pointer (`for<'a, 'b> fn(&'a [u8], u64, &'b [u8]) -> u64`)"),
 ];
 
+const PERLIN_SETUP_DEBUG: &str = "rejected: calls `noise::Perlin::new`, which calls `noise::permutationtable::PermutationTable::new`, which calls `<rand_xorshift::XorShiftRng as rand_core::SeedableRng>::from_seed`, which calls `rand_core::le::read_u32_into`, which calls `core::slice::<impl [u8]>::chunks_exact`, which calls `core::slice::<impl [u8]>::split_at_unchecked`, which converts a pointer to `*mut ()`";
+const PERLIN_SETUP_RELEASE: &str = "rejected: calls `noise::Perlin::new`, which calls `noise::permutationtable::PermutationTable::new`, which calls `<rand_xorshift::XorShiftRng as rand_core::SeedableRng>::from_seed`, which calls `rand_core::le::read_u32_into`, which calls `core::slice::<impl [u8]>::chunks_exact`, which calls `core::slice::<impl [u8]>::split_at_unchecked`, which takes a slice of an array at a position known only at run time";
+
 /// rustc inlines differently in debug and release builds, which changes
 /// where some refusals are found.
 const DEBUG: &[(&str, &str)] = &[
     ("ptr_split", "rejected: calls `core::slice::<impl [u32]>::split_at`, which calls `core::slice::<impl [u32]>::split_at_unchecked`, which converts a pointer to `*mut ()`"),
     ("xxh32_keys", "rejected: calls `xxhash_rust::xxh32::xxh32`, which chooses between references at run time"),
     ("xxh64_keys", "rejected: calls `xxhash_rust::xxh64::xxh64`, which chooses between references at run time"),
-    ("noise_row", "rejected: calls `noise::Perlin::new`, which calls `noise::permutationtable::PermutationTable::new`, which calls `<rand_xorshift::XorShiftRng as rand_core::SeedableRng>::from_seed`, which calls `rand_core::le::read_u32_into`, which calls `core::slice::<impl [u8]>::chunks_exact`, which calls `core::slice::<impl [u8]>::split_at_unchecked`, which converts a pointer to `*mut ()`"),
+    ("noise_grid", PERLIN_SETUP_DEBUG),
+    ("noise_grid_rayon", PERLIN_SETUP_DEBUG),
+    ("noise_row", PERLIN_SETUP_DEBUG),
     ("union_zeroed", "rejected: calls `std::mem::zeroed::<(u32, f32)>`, which calls `std::ptr::write_bytes::precondition_check`, which calls `std::ptr::const_ptr::<impl *const ()>::is_aligned_to`, which reinterprets bits as `usize` (a transmute)"),
     ("sr_div_rem", "candidate: map over `[u64]` reading `divisor`"),
     ("half_decode", "rejected: calls `<{closure} as std::ops::FnMut<((&mut f32, &u16),)>>::call_mut`, which calls `half::f16::to_f32`, which calls `half::binary16::arch::f16_to_f32`, which calls `half::binary16::arch::x86::f16_to_f32_x86_f16c`, which calls `std::arch::x86_64::_mm_cvtph_ps`, which uses `f16`, a number the kernel doesn't have"),
@@ -283,7 +289,9 @@ const DEBUG: &[(&str, &str)] = &[
 ];
 const RELEASE: &[(&str, &str)] = &[
     ("ptr_split", "candidate: map over `[u32]`"),
-    ("noise_row", "rejected: calls `noise::Perlin::new`, which calls `noise::permutationtable::PermutationTable::new`, which calls `<rand_xorshift::XorShiftRng as rand_core::SeedableRng>::from_seed`, which calls `rand_core::le::read_u32_into`, which calls `core::slice::<impl [u8]>::chunks_exact`, which calls `core::slice::<impl [u8]>::split_at_unchecked`, which takes a slice of an array at a position known only at run time"),
+    ("noise_grid", PERLIN_SETUP_RELEASE),
+    ("noise_grid_rayon", PERLIN_SETUP_RELEASE),
+    ("noise_row", PERLIN_SETUP_RELEASE),
     ("union_zeroed", "candidate: map over `[u32]`"),
     ("sr_div_rem", "candidate: map over `[u64]` reading `divisor`"),
     ("xxh32_keys", "rejected: calls `xxhash_rust::xxh32::xxh32`, which converts a pointer to `*const std::ptr::Unaligned<u32>`"),
@@ -382,7 +390,7 @@ fn checks(name: &'static str, release: bool) -> std::path::PathBuf {
 const FAILED_CHECK: &str = "-> cpu (a check failed on the GPU)";
 
 /// Runtime calls the checks program makes.
-const CHECK_CALLS: usize = 39;
+const CHECK_CALLS: usize = 41;
 
 /// Calls whose checks pass keep the GPU's results; calls where one fails
 /// fall back to the CPU, which panics with the same message and leaves the
@@ -399,7 +407,7 @@ const CHECK_CALLS: usize = 39;
     ignore = "needs an NVIDIA GPU; enable the gpu-tests feature"
 )]
 fn failed_checks_on_the_gpu_behave_like_the_cpu() {
-    for (name, release, failed) in [("checks-debug", false, 18), ("checks-release", true, 15)] {
+    for (name, release, failed) in [("checks-debug", false, 19), ("checks-release", true, 16)] {
         let trace = run(&checks(name, release), true, &[]);
         let calls = trace.lines().filter(|line| line.starts_with("cuprite: ")).count();
         assert_eq!(calls, CHECK_CALLS, "{name}:\n{trace}");
@@ -500,7 +508,8 @@ fn rewritten_candidates_match_the_cpu_on_the_gpu() {
         + with_work
         + 14 * non_empty
         + 11 * non_empty
-        + 12 * non_empty;
+        + 12 * non_empty
+        + 3 * non_empty + with_work; // indexed grids at three widths and the shorter parallel zip
     assert_eq!(trace.matches("-> gpu").count(), gpu_calls, "{trace}");
     for (passes, functions) in REGIONS {
         let calls = trace.matches(&format!("passes={passes} -> gpu")).count();
