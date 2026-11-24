@@ -3,8 +3,8 @@
 //! functions were translated, refused and skipped, and the refusals' root
 //! causes ranked by how many functions each blocks.
 //!
-//! A refusal reads "calls `a`, which calls `b`, which <cause>"; the root
-//! cause is the last part. Causes are grouped with the text between
+//! A refusal lists the calls leading to it, followed by the root cause.
+//! Causes are grouped with the text between
 //! backticks masked (`[u8; 256]` and `[f32; 3]` are both arrays), except an
 //! intrinsic's name, and listed exactly too.
 
